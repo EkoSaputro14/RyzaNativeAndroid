@@ -1312,6 +1312,7 @@ NVN(nvnProgramSetSampleShading) { (void)c; }
 NVN(nvnProgramSetSubroutineLinkage) { RET(1); }
 static void set_shaders(Cpu *c, int stride) {
     NvnProgram *p = HOST(NvnProgram, A(0));
+    if (!p) return;
     int n = (int)A(1);
     const uint8_t *data = AP(2);  // NVNshaderData[n] = {u64 data (GPU addr), const void* control}
     memset(p->stages, 0, sizeof p->stages);
@@ -1322,22 +1323,32 @@ static void set_shaders(Cpu *c, int stride) {
         const uint8_t *control = (const uint8_t *)(uintptr_t) * (uint64_t *)(data + i * stride + 8);
         // stage from the Maxwell shader program header (after the 0x30-byte NVN header)
         uint32_t sph0 = *(uint32_t *)(uintptr_t)(code + 0x30);
-        uint32_t stage;
-        switch ((sph0 >> 10) & 0xF) {
-        case 1: stage = 0; break;  // vertex
-        case 5: stage = 1; break;  // fragment
-        case 4: stage = 2; break;  // geometry
-        case 2: stage = 3; break;  // tess control
-        case 3: stage = 4; break;  // tess eval
-        default: stage = 5; break; // compute (no SPH)
-        }
-        if (*(uint32_t *)(uintptr_t)code != 0x12345678) stage = 5;
+        uint32_t h0 = *(uint32_t *)(uintptr_t)code;
+        uint32_t stage = 5;
+        uint32_t s30 = (sph0 >> 10) & 0xF;
+        uint32_t s00 = (h0 >> 10) & 0xF;
+
+        if (s30 == 1) stage = 0;       // vertex (standard SPH at +0x30)
+        else if (s30 == 5) stage = 1;  // fragment (standard SPH at +0x30)
+        else if (s30 == 4) stage = 2;  // geometry
+        else if (s30 == 2) stage = 3;  // tess control
+        else if (s30 == 3) stage = 4;  // tess eval
+        else if (s00 == 1) stage = 0;  // vertex (SPH at +0x00)
+        else if (s00 == 5) stage = 1;  // fragment (SPH at +0x00)
+        else if (s00 == 4) stage = 2;  // geometry
+        else if (s00 == 2) stage = 3;  // tess control
+        else if (s00 == 3) stage = 4;  // tess eval
+        else if (n >= 2) stage = (i == 0) ? 0 : 1; // 2-stage graphics fallback (VS, FS)
+        else stage = 5;                // compute
+
         p->stages[stage].stage = stage;
         p->stages[stage].code_addr = code;
         p->stages[stage].control = control;
         p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
         p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
         p->stage_mask |= 1u << stage;
+        LOG("[nvn] set_shaders[%d/%d]: prog=%p stage=%u code=%llx h0=%08x sph0=%08x mask=%#x\n",
+            i, n, (void *)p, stage, (unsigned long long)code, h0, sph0, p->stage_mask);
     }
     RET(1);
 }
@@ -1448,10 +1459,21 @@ NVN(nvnQueueAcquireTexture) {
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
-    {   // (which guest thread presents: LARECOMP_PROF_SVC_TID, kernel.c)
+    static uint64_t s_frame_cnt = 0;
+    static uint64_t s_last_log_ns = 0;
+    {
         static uint64_t last_id = ~0ull;
         KThread *kt = kernel_current_thread();
         if (kt && kt->id != last_id) LOG("[pace] presenting thread t%llu\n", (unsigned long long)(last_id = kt->id));
+        s_frame_cnt++;
+        uint64_t now_ns = plat_now_ns();
+        if (s_last_log_ns == 0) s_last_log_ns = now_ns;
+        if (now_ns - s_last_log_ns >= 3000000000ull) {
+            double elapsed_s = (double)(now_ns - s_last_log_ns) / 1e9;
+            double fps = (double)s_frame_cnt / elapsed_s;
+            LOG("[render-heartbeat] total frames: %llu (%.1f fps)\n", (unsigned long long)s_frame_cnt, fps);
+            s_last_log_ns = now_ns;
+        }
     }
     {   // Frame limiter: a present waits until N vsyncs have gone by since the previous one, as NVN does on the Switch -
         // N is the larger of the window's interval (BOTW asks for 2: its world steps 1/30 s a frame) and the Video
@@ -1459,7 +1481,11 @@ NVN(nvnQueuePresentTexture) {
         // ran fast whenever a frame came in under 33 ms. LARECOMP_PRESENT_WAIT=0: off.
         static int on = -1;
         static uint64_t last_vs;
+#ifdef __ANDROID__
+        if (on < 0) on = getenv("LARECOMP_PRESENT_WAIT") ? atoi(getenv("LARECOMP_PRESENT_WAIT")) : 0;
+#else
         if (on < 0) on = !getenv("LARECOMP_PRESENT_WAIT") || atoi(getenv("LARECOMP_PRESENT_WAIT"));
+#endif
         extern volatile uint64_t g_vsync_count;
         extern __thread uint64_t g_blocked_ns;  // (kernel.c: the pacer counts this as idle, not frame work)
         int cap = g_settings.fps_mode == 2 || g_settings.fps_mode == 4 ? 1 : g_settings.fps_mode == 3 ? 3 : 2;  // (20: 3; 45: 60's)
@@ -1508,12 +1534,22 @@ NVN(nvnQueuePresentTexture) {
             }
         } else if (on) {
             uint64_t want = last_vs + (uint64_t)n, t0 = plat_now_ns();
-            while (__atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED) < want) usleep(500);
+            while (__atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED) < want) {
+                if (plat_now_ns() - t0 > 100000000ull) { // 100ms safety timeout
+                    break;
+                }
+                usleep(500);
+            }
             g_blocked_ns += plat_now_ns() - t0;
             last_vs = __atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED);
         }
     }
-    if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    if (i >= 0 && i < w->num) {
+        if (s_frame_cnt <= 10 || s_frame_cnt % 60 == 0) {
+            LOG("[pace] present frame %llu texture index %d\n", (unsigned long long)s_frame_cnt, i);
+        }
+        backend_present(HOST(NvnTexture, w->textures[i]));
+    }
 }
 
 // ================================================================== small state objects

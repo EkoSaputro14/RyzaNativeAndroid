@@ -12,8 +12,12 @@
 #define AF(i) (*(float *)&c->v[(i)])
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define RETF(f) do { c->v[0] = 0; *(float *)&c->v[0] = (f); } while (0)
-#define HOST(T, guest) ((T *)(uintptr_t)(*(uint64_t *)(uintptr_t)(guest)))
-#define SET_HOST(guest, p) (*(uint64_t *)(uintptr_t)(guest) = (uint64_t)(uintptr_t)(p))
+static inline void *host_from_guest(uint64_t guest) {
+    if (!guest || guest < GUEST_LO || guest >= GUEST_HI) return NULL;
+    return (void *)(uintptr_t)(*(uint64_t *)(uintptr_t)guest);
+}
+#define HOST(T, guest) ((T *)host_from_guest((uint64_t)(uintptr_t)(guest)))
+#define SET_HOST(guest, p) do {     uint64_t _g = (uint64_t)(uintptr_t)(guest);     if (_g >= GUEST_LO && _g < GUEST_HI) *(uint64_t *)(uintptr_t)_g = (uint64_t)(uintptr_t)(p); } while (0)
 #define G(T, base, off) (*(T *)((uint8_t *)(uintptr_t)(base) + (off)))
 
 typedef struct NvnPool {

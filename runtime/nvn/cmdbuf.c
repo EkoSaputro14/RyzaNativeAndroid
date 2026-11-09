@@ -276,6 +276,7 @@ NVN(nvnCommandBufferBindProgram) {
     Snap s = snap(c);
     CmdRec *r = record(c, CMD_BIND_PROGRAM, 0, &s);
     r->x[0] = (uint64_t)(uintptr_t)HOST(NvnProgram, s.x[1]);  // host program
+    r->x[1] = s.x[2];  // stages mask (NVNshaderStageBits)
 }
 NVN(nvnCommandBufferBindBlendState) { record_copy(c, CMD_BIND_BLEND, 1, 8); }
 NVN(nvnCommandBufferBindChannelMaskState) { record_copy(c, CMD_BIND_CHANNEL_MASK, 1, 4); }

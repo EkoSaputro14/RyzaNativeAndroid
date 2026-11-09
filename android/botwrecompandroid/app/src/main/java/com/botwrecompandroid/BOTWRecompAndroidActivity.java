@@ -78,6 +78,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
     private static native boolean nativeCheckRomfsImage(int version, int fd);  // (fd: closed by the native side)
     private static native String nativeImageLoose(int fd);
     private static native void nativeDriverPicked(String name);
+    private static native void nativeGamelibPicked(String name);
     private static native void nativeModImportDone(String message);
     private static native void nativeLogFolderPicked(String name);
 
@@ -85,7 +86,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
     private static native void nativeSaveDone(int result, String detail);
     private static final int REQ_GAME = 0x4c41, REQ_DRIVER = 0x4c42, REQ_MOD = 0x4c46, REQ_LOG = 0x4c47,
             REQ_DRIVER_RECOVER = 0x4c48, REQ_SAVE_IN = 0x4c49, REQ_SAVE_OUT = 0x4c4a, REQ_SAVE_IN_TREE = 0x4c4c,
-            REQ_DLC = 0x4c4d;
+            REQ_DLC = 0x4c4d, REQ_GAMELIB = 0x4c4e;
     private native String nativeBuildDlc(String[] paths, long[] sizes);
     private static native void nativeDlcDone(int result, String detail);
     private static BOTWRecompAndroidActivity self;
@@ -94,6 +95,28 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
     @Override
     protected String[] getLibraries() {
         return new String[] {"SDL3", "shaderc_shared", "main"};
+    }
+
+    @Override
+    public void loadLibraries() {
+        super.loadLibraries();
+        // 1. Coba load dari native library directory jika botwgame di-bundle di APK
+        try {
+            System.loadLibrary("botwgame");
+            android.util.Log.i("BOTWRecomp", "Preloaded bundled libbotwgame.so via System.loadLibrary");
+            return;
+        } catch (Throwable ignored) {}
+
+        // 2. Load botwgame.so via System.load() jika ada di files directory internal
+        try {
+            File internal = new File(getFilesDir(), "v100/botwgame.so");
+            if (internal.exists()) {
+                System.load(internal.getAbsolutePath());
+                android.util.Log.i("BOTWRecomp", "Preloaded botwgame.so via System.load: " + internal.getAbsolutePath());
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("BOTWRecomp", "Preload botwgame.so failed: " + t.getMessage());
+        }
     }
 
     @Override
@@ -272,7 +295,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
                     self.startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
                 }
             });
-            nativeImportDetail("Allow BOTWRecompAndroid to access all files (the page Android just opened), then choose the folder again");
+            nativeImportDetail("Allow Atelier Ryza to access all files (the page Android just opened), then choose the folder again");
             nativeImportDone(5);
             return;
         }
@@ -305,6 +328,19 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
                 self.startActivityForResult(i, REQ_DRIVER);
             } catch (Exception e) {
                 Log.e(TAG, "file picker: " + e);
+            }
+        });
+    }
+
+    public static void pickGamelib() {
+        self.runOnUiThread(() -> {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            try {
+                self.startActivityForResult(i, REQ_GAMELIB);
+            } catch (Exception e) {
+                Log.e(TAG, "gamelib picker: " + e);
             }
         });
     }
@@ -371,6 +407,11 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
         if (req == REQ_DRIVER) {
             Uri f = result == Activity.RESULT_OK && data != null ? data.getData() : null;
             if (f != null) new Thread(() -> importDriver(f), "driver").start();
+            return;
+        }
+        if (req == REQ_GAMELIB) {
+            Uri f = result == Activity.RESULT_OK && data != null ? data.getData() : null;
+            if (f != null) new Thread(() -> importGamelib(f), "gamelib").start();
             return;
         }
         if (req == REQ_DRIVER_RECOVER) {
@@ -863,25 +904,27 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             preId = named(kids, "botwgame.so.id");
             preGame = named(kids, "botwgame.so.game");
         }
-        if (exefs == null && named(kids, "main") != null && named(kids, "main.npdm") != null) exefs = dir;
+        Doc mainFile = named(kids, "main");
+        if (mainFile == null) mainFile = named(kids, "main.bin");
+        if (exefs == null && mainFile != null && named(kids, "main.npdm") != null) exefs = dir;
         Doc rc = named(kids, "Pack");
+        if (rc == null) rc = named(kids, "Data");
         boolean anyRomfs = rc != null && rc.dir;
-        if (romfs == null && anyRomfs) {  // (the game's has System/Version.txt; the DLC's, also with Pack, has
-            Doc sys = named(kids, "System");  //  AocVersion.txt there instead - taken for the game's: issue #87)
+        if (romfs == null && anyRomfs) {  // (the game's has System/Version.txt or Data/ for Atelier Ryza)
+            Doc sys = named(kids, "System");
             if (sys != null && sys.dir && named(children(tree, sys.id), "Version.txt") != null) romfs = dir;
+            else if (named(kids, "Data") != null) romfs = dir;
         }
         Doc ri = named(kids, "romfs.bin");
         if (romfsImage == null && ri != null && !ri.dir) {
             romfsImage = ri;
             romfsImageDir = dir;
         }
-        // (romfs/'s own folders hold no exefs: through the file provider, listing their ~40000 files took long enough
-        // for the setup to look stuck - issue #17)
         if (anyRomfs || dir == exefs) return;
         for (Doc k : kids) {
             String n = k.name == null ? "" : k.name.toLowerCase();
             if (n.endsWith(".nsp") || n.endsWith(".xci") || n.endsWith(".nca") || n.endsWith(".nsz") || n.endsWith(".xcz")) packages = true;
-            if (k.dir && !"Pack".equals(k.name)) find(tree, k, depth + 1);
+            if (k.dir && !"Pack".equals(k.name) && !"Data".equals(k.name)) find(tree, k, depth + 1);
         }
     }
 
@@ -1004,6 +1047,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
                 return;
             }
             Doc main = named(children(tree, exefs.id), "main");
+            if (main == null) main = named(children(tree, exefs.id), "main.bin");
             byte[] head = new byte[0x48];
             try (InputStream in = getContentResolver().openInputStream(DocumentsContract.buildDocumentUriUsingTree(tree, main.id))) {
                 int got = 0;
@@ -1049,7 +1093,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
                 String at = documentPath(romfs.id);
                 romfsFiles.clear();
                 romfsPaths.clear();
-                if (at == null || !new File(at, "System/Version.txt").canRead()) {
+                if (at == null || (!new File(at, "System/Version.txt").canRead() && !new File(at, "Data").exists())) {
                     nativeImportDetail("this folder can't be used in place (" + (at == null ? romfs.id : at) +
                             "): choose Copy them, or a folder on the phone's storage");
                     nativeImportDone(5);
@@ -1165,6 +1209,46 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
 
     private void importDriver(Uri f) {
         nativeDriverPicked(installDriver(this, f));
+    }
+
+    private void importGamelib(Uri f) {
+        String name = "";
+        try (Cursor c = getContentResolver().query(f, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) name = c.getString(0);
+        } catch (Exception ignored) {}
+        try {
+            File extDst = new File(getExternalFilesDir(null), "botwgame.so");
+            try (InputStream in = getContentResolver().openInputStream(f)) {
+                copy(in, extDst);
+            }
+            // Buat file dev id bila belum ada di external
+            File extIdFile = new File(getExternalFilesDir(null), "botwgame.so.id");
+            try (FileOutputStream fos = new FileOutputStream(extIdFile)) {
+                fos.write("dev\n".getBytes());
+            }
+
+            // Copy juga langsung ke internal files directory (/data/user/0/.../files/v100/botwgame.so)
+            // agar dlopen() langsung bisa memuat library tanpa terkena SELinux / noexec sandbox
+            File intDir = new File(getFilesDir(), "v100");
+            intDir.mkdirs();
+            File intDst = new File(intDir, "botwgame.so");
+            try (InputStream in2 = getContentResolver().openInputStream(f)) {
+                copy(in2, intDst);
+            }
+            File intIdFile = new File(intDir, "botwgame.so.id");
+            try (FileOutputStream fos2 = new FileOutputStream(intIdFile)) {
+                fos2.write("dev\n".getBytes());
+            }
+
+            if ((extDst.exists() && extDst.length() > 1024) || (intDst.exists() && intDst.length() > 1024)) {
+                nativeGamelibPicked(name.isEmpty() ? "botwgame.so" : name);
+            } else {
+                nativeGamelibPicked("");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "import gamelib error: " + e);
+            nativeGamelibPicked("");
+        }
     }
 
     // A driver package (.zip or .adpkg - a zip too -, or a bare .so) into <external files>/drivers, in place of any

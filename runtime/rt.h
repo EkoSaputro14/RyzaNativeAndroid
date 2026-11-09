@@ -26,6 +26,7 @@ extern uint64_t g_guest_lo;
 #define GUEST_LO     g_guest_lo
 #define GUEST_HI     (GUEST_LO + 0x320000000ull)
 #define MAIN_BASE    (GUEST_LO + 0x0000000000ull)
+#define SUBSDK0_BASE (GUEST_LO + 0x0002000000ull)
 #define SDK_BASE     (GUEST_LO + 0x0004000000ull)
 #define HLE_BASE     (GUEST_LO + 0x0080000000ull)
 #define HLE_SIZE     0x0000100000ull
@@ -41,6 +42,7 @@ extern uint64_t g_guest_lo;
 #define GUEST_LO     0x7000000000ull
 #define GUEST_HI     0x7320000000ull
 #define MAIN_BASE    0x7000000000ull
+#define SUBSDK0_BASE 0x7002000000ull
 #define SDK_BASE     0x7004000000ull
 #define HLE_BASE     0x7080000000ull   // fake addresses for host-implemented functions
 #define HLE_SIZE     0x0000100000ull
@@ -75,8 +77,16 @@ uint64_t loader_find_symbol(const char *name);
 const char *loader_symbol_at(uint64_t addr, uint64_t *offset);
 
 // ---- dispatch.c
+enum { EXEC_NATIVE = 0, EXEC_RECOMP = 1, EXEC_HYBRID = 2 };
 typedef void (*HostFn)(Cpu *c);
 void dispatch_init(void);
+extern int g_exec_mode;
+extern uint64_t g_bench_native_calls, g_bench_recomp_calls;
+extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
+extern uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache_misses;
+extern uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
+extern uint64_t g_forensic_dispatch_overhead_ns;
+void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws);
 GuestFn dispatch_lookup(uint64_t addr);
 uint64_t hle_register(const char *name, HostFn fn);  // returns fake guest address
 HostFn hle_lookup_impl(const char *name);

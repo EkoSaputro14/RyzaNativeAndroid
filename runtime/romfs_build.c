@@ -144,6 +144,11 @@ static const char *const k_key_files[] = {"Actor/ActorInfo.product.sbyml", "Pack
                                          "System/Version.txt"};
 
 int romfs_check_set(int version, const char *const *paths, int n, const char *version_txt, char *why, size_t why_size) {
+    for (int i = 0; i < n; i++) {
+        if (!strncmp(paths[i], "Data/", 5) || !strncmp(paths[i], "Data\\", 5)) {
+            return ROMFS_SET_OK;  // Atelier Ryza (RomFS contains Data/ folder)
+        }
+    }
     const char *name = NULL;
     int whole = 0;
     for (size_t i = 0; i < sizeof k_whole / sizeof *k_whole; i++)

@@ -22,7 +22,7 @@ typedef struct {
 static __thread JmpSlot slots[SLOTS];
 static __thread unsigned slot_next;
 
-jmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf) {
+__attribute__((visibility("default"))) jmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf) {
     JmpSlot *s = NULL;
     for (int i = 0; i < SLOTS && !s; i++)
         if (slots[i].gbuf == gbuf) s = &slots[i];
@@ -37,7 +37,7 @@ jmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf) {
 
 static uint64_t g_longjmps;  // (stats)
 
-void hle_longjmp(Cpu *c) {
+__attribute__((visibility("default"))) void hle_longjmp(Cpu *c) {
     uint64_t gbuf = c->x[0];
     uint32_t val = (uint32_t)c->x[1];
     JmpSlot *s = NULL;

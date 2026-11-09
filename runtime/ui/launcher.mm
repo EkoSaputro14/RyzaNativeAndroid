@@ -37,6 +37,7 @@
 #include "imgui_impl_sdl3.h"
 
 extern "C" {
+extern int g_exec_mode;
 #ifndef LARECOMP_NO_FFMPEG  // (Android, for now: docs/las/ANDROID-PORT.md, Fase 2)
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -186,7 +187,7 @@ static int main_version(const std::string &main_path) {
     return n == 8 ? game_version_of_build(id) : 0;
 }
 
-static const char *version_name(int v) { return v == 190 ? "1.9.0" : v == 182 ? "1.8.2" : v == 160 ? "1.6.0" : "1.0.0"; }
+static const char *version_name(int v) { return v == 200 ? "Atelier Ryza 1.0.0" : v == 190 ? "1.9.0" : v == 182 ? "1.8.2" : v == 160 ? "1.6.0" : "1.0.0"; }
 
 // The player's romfs/ the files of root use in place (root/romfs.link: main.c reads it too), "" when they're copied
 static std::string romfs_link_target(const std::string &root) {
@@ -204,7 +205,7 @@ static std::string romfs_link_target(const std::string &root) {
 static std::string check_copied_files(const std::string &root) {
     int v = main_version(root + "/exefs/main"), want = rt_game_dir_version(root.c_str());
     if (v < 0) return "No game files";
-    if (!v || (want && v != want)) return "Wrong game version (needs v1.0.0, v1.6.0, v1.8.2 or v1.9.0)";
+    if (!v || (want && v != want)) return "Wrong game version (needs Atelier Ryza v1.0.0, v1.6.0, v1.8.2 or v1.9.0)";
     // (the game reads its data through romfs.bin alone: on Android it's built straight from the picked folder, and romfs/
     // holds only the movies, opened by path)
     std::string linked = romfs_link_target(root);
@@ -214,7 +215,7 @@ static std::string check_copied_files(const std::string &root) {
         return romfs_image_ok(linked.c_str(), bad, sizeof bad) ? "" : "The game files folder was moved or can't be read";
     }
     if (!linked.empty())  // (used in place: the player's own romfs/, runtime/services/fs.c)
-        return file_exists(linked + "/System/Version.txt") ? "" : "The game files folder was moved or can't be read";
+        return (file_exists(linked + "/System/Version.txt") || file_exists(linked + "/Data")) ? "" : "The game files folder was moved or can't be read";
     if (!file_exists(root + "/romfs.bin")) return "Game data missing";
     char why[128];  // (a copy cut short: the game would abort at start, runtime/romfs_build.c)
     if (!romfs_image_ok((root + "/romfs.bin").c_str(), why, sizeof why)) return "Game data incomplete: set up the game files again";
@@ -231,8 +232,8 @@ static std::string check_game_files(const std::string &root) {
 }
 
 // The game versions this app runs, and which of them are set up (their copied files there; checked again once a second)
-static const int k_versions[] = {100, 160, 182, 190};
-enum { N_VERSIONS = 4 };
+static const int k_versions[] = {100};
+enum { N_VERSIONS = 1 };
 static bool version_set_up(int i) {
     static bool set_up[N_VERSIONS];
     static double next;
@@ -291,8 +292,8 @@ static void set_failure(int k) {
         "",
         "Choose the folder that holds the game files.",
         "Choose the folder that holds the game files.",
-        "Make sure there's about 30 GB free and try again.",
-        "BOTWRecompAndroid runs versions 1.0.0, 1.6.0, 1.8.2 and 1.9.0 of the game.",
+        "Make sure there's enough free space and try again.",
+        "Atelier Ryza Native runs version 1.0.0 of the game.",
         "Some files are missing. Choose the folder again; if it happens again, dump the game again.",
         "Try again: the build goes on where it stopped. If it keeps failing, report it on GitHub with the log."};
     if (k >= 1 && k <= 6) set_job(head[k], true, hint[k]);
@@ -327,8 +328,8 @@ static bool is_dir(const std::string &p) {
 // in the picked folder or a few levels below it (dump tools nest them).
 static void find_game(const std::string &dir, int depth, std::string &exefs, std::string &romfs, bool &unusable) {
     if (depth > 4 || (!exefs.empty() && !romfs.empty())) return;
-    if (exefs.empty() && file_exists(dir + "/main") && file_exists(dir + "/main.npdm")) exefs = dir;
-    if (romfs.empty() && is_dir(dir + "/Pack")) romfs = dir;
+    if (exefs.empty() && (file_exists(dir + "/main") || file_exists(dir + "/main.bin")) && file_exists(dir + "/main.npdm")) exefs = dir;
+    if (romfs.empty() && (is_dir(dir + "/Pack") || is_dir(dir + "/Data"))) romfs = dir;
     DIR *d = opendir(dir.c_str());
     if (!d) return;
     std::vector<std::string> sub;
@@ -338,7 +339,7 @@ static void find_game(const std::string &dir, int depth, std::string &exefs, std
         std::string ext = n.size() > 4 ? n.substr(n.size() - 4) : "";
         for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
         if (ext == ".xci" || ext == ".nsp" || ext == ".nca" || ext == ".nsz" || ext == ".xcz") unusable = true;
-        if (n != "Pack" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
+        if (n != "Pack" && n != "Data" && is_dir(dir + "/" + n)) sub.push_back(dir + "/" + n);
     }
     closedir(d);
     std::sort(sub.begin(), sub.end());
@@ -508,6 +509,8 @@ done:
 std::atomic<bool> g_android_imported{false};
 static std::string g_driver_msg;
 static bool g_driver_restart;  // (the message asks for a restart: a Restart now button beside it)
+static std::string g_gamelib_msg;
+static bool g_gamelib_restart;
 
 static void android_call(const char *method) {  // a static method of the activity
     JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
@@ -979,6 +982,17 @@ extern "C" JNIEXPORT void JNICALL Java_com_botwrecompandroid_BOTWRecompAndroidAc
                    : n && *n                ? m
                                             : tr("That file isn't a driver.");
     g_driver_restart = n && *n;
+    pthread_mutex_unlock(&g_lock);
+    if (n) env->ReleaseStringUTFChars(name, n);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_botwrecompandroid_BOTWRecompAndroidActivity_nativeGamelibPicked(JNIEnv *env, jclass, jstring name) {
+    const char *n = env->GetStringUTFChars(name, NULL);
+    pthread_mutex_lock(&g_lock);
+    char m[512];
+    snprintf(m, sizeof m, tr("%s imported & verified. Restart to apply recompilation."), n ? n : "");
+    g_gamelib_msg = n && *n ? m : tr("File is not a valid botwgame.so library.");
+    g_gamelib_restart = n && *n;
     pthread_mutex_unlock(&g_lock);
     if (n) env->ReleaseStringUTFChars(name, n);
 }
@@ -1481,21 +1495,16 @@ static void carry_game_code(int version) {
 // the ones not set up yet greyed - the files folder below sets them up. focus: the running one takes the cursor.
 static void version_rows(bool busy, bool focus) {
     static const char *const notes[N_VERSIONS] = {
-        "The game's first release, without updates.",
-        "An update of the game.",
-        "An update of the game, in Brazilian Portuguese too. 60 fps and widescreen (Video settings) work in this one.",
-        "The game's last update (2025), in Brazilian Portuguese too. Being brought up: expect problems."};
+        "Atelier Ryza: Ever Darkness & the Secret Hideout (v1.0.0)."};
     opt_section("Game version");
     int cur = rt_game_version();
     for (int i = 0; i < N_VERSIONS; i++) {
         int v = k_versions[i];
         bool set_up = version_set_up(i);
-        std::string label = std::string(tr("Version")) + " " + version_name(v);
+        std::string label = std::string("Atelier Ryza") + " " + version_name(v);
         std::string desc = std::string(tr(notes[i])) + "\n\n" +
-                           tr(!set_up ? "Not set up yet: choose the folder with this version's game files below."
-                                      : "Which version PLAY starts. Each one keeps its own game files, saves and settings; "
-                                        "1.6.0, 1.8.2 and 1.9.0 start from a copy of 1.0.0's saves and settings. Choosing another "
-                                        "one starts BOTWRecompAndroid again with it.");
+                           tr(!set_up ? "Not set up yet: choose the folder with Atelier Ryza game files below."
+                                      : "Atelier Ryza 1.0.0 is ready to play.");
         if (busy || g_switching_to || (!set_up && v != cur)) opt_disable_next();
         if (opt_radio(label.c_str(), v == cur, desc.c_str()) && v != cur && set_up) switch_to_version(v);
         if (focus && v == cur) ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
@@ -1663,6 +1672,53 @@ static void prelaunch_tab(float sc) {
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("%s", tr("Versions 1.0.0, 1.6.0, 1.8.2 and 1.9.0 can be set up side by side, each with its own saves."));
     ImGui::PopTextWrapPos();
+
+    // --- RECOMPILATION / EXECUTION MODE & GAME LIB PICKER ---
+    ImGui::Spacing();
+    ImGui::TextColored(gold, "%s", tr("Recompilation & Execution"));
+    {
+        int mode = g_exec_mode;
+        bool em_ch = false;
+        ImGui::PushID("exec_mode_radio");
+        em_ch |= ImGui::RadioButton(tr("Native EL0"), &mode, 0);
+        ImGui::SameLine();
+        em_ch |= ImGui::RadioButton(tr("Recomp C"), &mode, 1);
+        ImGui::SameLine();
+        em_ch |= ImGui::RadioButton(tr("Hybrid (Safe)"), &mode, 2);
+        ImGui::PopID();
+        if (em_ch) {
+            g_exec_mode = mode;
+            settings_save();
+        }
+
+        bool has_gamelib = gamelib_present(g_root.c_str());
+        if (has_gamelib) {
+            ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1), "%s", tr("botwgame.so detected & verified."));
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.3f, 1.0f), "%s", tr("botwgame.so not detected (using Native EL0 fallback)."));
+        }
+
+#ifdef __ANDROID__
+        if (ImGui::Button(tr(has_gamelib ? "Change botwgame.so" : "Choose botwgame.so"))) {
+            android_call("pickGamelib");
+        }
+        pthread_mutex_lock(&g_lock);
+        std::string gl_msg = g_gamelib_msg;
+        bool gl_restart = g_gamelib_restart;
+        pthread_mutex_unlock(&g_lock);
+        if (!gl_msg.empty()) {
+            ImGui::Text("%s", gl_msg.c_str());
+            if (gl_restart) {
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Restart app"))) android_call("restartApp");
+            }
+        }
+#endif
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
     if (ImGui::Button(tr("Versions and setup"))) g_open_files = true;
     static double gb = -1;
     if (gb < 0) gb = rt_game_files_size(g_root.c_str()) / 1e9;
@@ -2057,7 +2113,7 @@ extern "C" void launcher_run(const char *root) {
             ImGui::SetCursorPos(ImVec2(x0, 120 * s));
             ImGui::PushFont(g_font_title);
             if (page == MAIN) {  // gold to orange, shadowed (not behind the Settings / Game Files windows)
-                const char *t = "BOTWRecompAndroid";
+                const char *t = "Atelier Ryza Native";
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 text_fx(ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize(), p, IM_COL32(255, 232, 120, 255),
                         IM_COL32(255, 138, 48, 255), t, 3 * s);
@@ -2271,20 +2327,14 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddLine(ImVec2(x, cy), ImVec2(x + u * 0.35f, cy + u * 0.35f), g, fs * 0.11f);
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
-                std::string src_d = tr("The folder with your own game folders (exefs/romfs, or exefs and a romfs.bin) of The Legend of Zelda: Breath of "
-                                       "the Wild for Nintendo Switch: version 1.0.0, 1.6.0, 1.8.2 or 1.9.0 (the last two in "
-                                       "Brazilian Portuguese). The version is told from the files, and each one is set up in a place of "
-                                       "its own, beside the others. The game isn't included with BOTWRecompAndroid.");
+                std::string src_d = tr("The folder with your game files (exefs/romfs, or exefs and romfs.bin) of Atelier Ryza: "
+                                       "Ever Darkness and the Secret Hideout for Nintendo Switch (v1.0.0). "
+                                       "The game is executed natively without CPU recompilation.");
                 if (!src.empty()) src_d += std::string(tr("\n\nChosen: ")) + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
                 bool copied = check_copied_files(g_root).empty();  // (here, the game code to build again: an app update)
-                std::string ex_d = tr(native_wanted() ? "Copies the game files BOTWRecompAndroid needs (native game code: "
-                                                        "nothing to build). Your own files aren't changed."
-                                      : copied ? "The game files are already here: this builds the game code from them again, as "
-                                                 "BOTWRecompAndroid needs after an update. It may take a while."
-                                               : "Copies the game files BOTWRecompAndroid needs and recompiles the game from them. "
-                                                 "This only needs to be done once and may take a while. Your own files aren't changed.");
+                std::string ex_d = tr("Sets up Atelier Ryza game files (native ARM64 direct execution: no build required). Your original files are never modified.");
                 if (!job.empty()) ex_d += "\n\n" + std::string(tr(job.c_str())) + (job_hint.empty() ? "" : ".\n" + std::string(tr(job_hint.c_str())));
                 if (failed && !job_detail.empty()) ex_d += "\n(" + job_detail + ")";
 
@@ -2299,20 +2349,12 @@ extern "C" void launcher_run(const char *root) {
 #ifdef __ANDROID__
                 {   // how the game's code runs - chosen before the folder (picking it sets the game up at once): built
                     // from the files (recompiled) or the game's own on the CPU (native: no build; runtime/native.c)
-                    static const char *const modes[] = {"Recompiled", "Native (experimental)"};
-                    int m = g_settings.native_code ? 1 : 0;
+                    static const char *const modes[] = {"Native (ARM64 EL0)"};
+                    int m = 0;
+                    g_settings.native_code = true;
                     if (busy) opt_disable_next();
-                    opt_choice("Game code", &m, modes, 2, 0,
-                               "Recompiled: the setup rebuilds the game's code for this phone from your files (once, it may "
-                               "take a while). Set up this way, the game can still run natively: Video > Native game code.\n\n"
-                               "Native: the game's own code runs directly on the phone's CPU, so the setup only copies the "
-                               "files - no build. An experiment. Switching to Recompiled later means building the game code "
-                               "then.");
-                    if ((m == 1) != g_settings.native_code) {
-                        g_settings.native_code = m == 1;
-                        settings_save();
-                        status = check_game_files(g_root);
-                    }
+                    opt_choice("Game code", &m, modes, 1, 0,
+                               "Runs the game's original ARM64 instructions directly on your device CPU with zero emulation overhead.");
                 }
                 {   // copied, or read where they are (the romfs/: services/fs.c romfs.link; the exefs/ is copied, small)
                     static const char *const ways[] = {"Copy them", "Use them in place"};
@@ -2467,6 +2509,15 @@ extern "C" void launcher_run(const char *root) {
                 ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.55f, 1), "%s", tr("Game files ready."));
                 ImGui::SetCursorPosX(x0);
                 ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.98f, 1), "Nintendo Switch  \xc2\xb7  v%s", version_name(rt_game_version()));
+                {
+                    bool has_gl = gamelib_present(g_root.c_str());
+                    const char *m_str = g_exec_mode == 1 ? "Recomp C" : g_exec_mode == 2 ? "Hybrid" : "Native EL0";
+                    ImVec4 m_col = g_exec_mode == 1 ? ImVec4(0.35f, 0.85f, 1.0f, 1.0f) :
+                                   g_exec_mode == 2 ? ImVec4(0.95f, 0.85f, 0.35f, 1.0f) :
+                                                      ImVec4(0.65f, 0.95f, 0.65f, 1.0f);
+                    ImGui::SetCursorPosX(x0);
+                    ImGui::TextColored(m_col, "Mode: %s (%s)", m_str, has_gl ? "botwgame.so OK" : "botwgame.so missing");
+                }
             } else {
                 ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "!  %s", tr(busy ? "Setting up the game files..." : status.c_str()));
                 ImGui::SetCursorPosX(x0);

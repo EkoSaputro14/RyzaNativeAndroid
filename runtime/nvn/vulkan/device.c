@@ -697,6 +697,11 @@ static void create_device(void) {
         LOG("[vk-cap] storage range %llu MB, storage offset alignment %llu, memory types%s\n",
             (unsigned long long)(g_vk.props.limits.maxStorageBufferRange >> 20),
             (unsigned long long)g_vk.props.limits.minStorageBufferOffsetAlignment, types);
+        LOG("[vk-limits] maxVertexInputAttributes=%u, maxVertexInputBindings=%u, maxVertexInputAttributeOffset=%u, maxVertexInputBindingStride=%u\n",
+            g_vk.props.limits.maxVertexInputAttributes,
+            g_vk.props.limits.maxVertexInputBindings,
+            g_vk.props.limits.maxVertexInputAttributeOffset,
+            g_vk.props.limits.maxVertexInputBindingStride);
     }
     const char *missing = vk_missing_backend_feature(&h11, &h12, &h13);
     if (missing) FATAL("%sVulkan driver on %s lacks a feature required by this renderer: %s. " DRIVER_HINT "\n"

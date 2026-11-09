@@ -61,11 +61,10 @@ Settings g_settings = {
     .show_fps = false,
 #endif
 #ifdef __ANDROID__
-    .upscaler = UPSCALE_SGSR1,  // (one pass: ~1 ms on the Adreno 830 to 2560x1440, FSR 1's two ~2.7 ms; 40 fps against 38)
-    .native_code = false,       // (an experiment: runtime/native.c)
-    .sync_lag = true,           // (a few more fps; the CPU's reads of GPU results a frame old: nvn/objects.c nvnSyncWait)
-    .out_lines = OUT_AUTO,      // (POCO F7 Ultra, 3200x1440, 1.8.2's Great Plateau: GPU 22.8 ms a frame at the screen's,
-                                // 18.6 at 1080 lines with a larger scene - the final image's passes over 2.2x the pixels)
+    .upscaler = UPSCALE_BILINEAR,  // (one pass: ~1 ms on the Adreno 830 to 2560x1440, FSR 1's two ~2.7 ms; 40 fps against 38)
+    .native_code = true,       // (an experiment: runtime/native.c)
+    .sync_lag = false,         // (false on Android: avoids CPU race on bone/vertex buffers that causes stretched polygons)
+    .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 640 from 1440p down by 4.8x for 45-60 FPS)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -313,9 +312,11 @@ void settings_load(void) {
 #endif
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
-            g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
+            g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC :
+                                  (!strcmp(val, "100%") || !strcmp(val, "native")) ? RES_MATCH :
+                                  (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
                                   !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
-                                  (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
+                                  (n >= 1 && n <= 4) ? n : RES_MATCH;  // (5x-8x were removed)
         }
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
             g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
@@ -342,6 +343,10 @@ void settings_load(void) {
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "mods_off")) snprintf(g_settings.mods_off, sizeof g_settings.mods_off, "%s", val);
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
+        else if (!strcmp(key, "exec_mode")) {
+            extern int g_exec_mode;
+            g_exec_mode = atoi(val);
+        }
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
@@ -349,7 +354,14 @@ void settings_load(void) {
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
-    LOG("[settings] loaded %s\n", SETTINGS_FILE);
+#ifdef __ANDROID__
+    g_settings.sync_lag = false;
+    g_settings.upscaler = UPSCALE_BILINEAR;
+    if (g_settings.out_lines <= 0 || g_settings.out_lines == OUT_AUTO) g_settings.out_lines = 720;
+#endif
+    extern int g_exec_mode;
+    LOG("[settings] loaded %s (forced sync_lag=%d, upscaler=%d, exec_mode=%d)\n",
+        SETTINGS_FILE, g_settings.sync_lag, g_settings.upscaler, g_exec_mode);
 }
 
 void settings_save(void) {
@@ -414,6 +426,8 @@ void settings_save(void) {
     fprintf(f, "aspect_asked = %d\n", g_settings.aspect_asked);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     fprintf(f, "mods_off = %s\n", g_settings.mods_off);
+    extern int g_exec_mode;
+    if (g_exec_mode != 0) fprintf(f, "exec_mode = %d\n", g_exec_mode);
     bind_settings_save(f);
     fclose(f);
 }

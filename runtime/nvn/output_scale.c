@@ -77,7 +77,11 @@ double output_scale_dynamic_factor(void) { return g_dyn; }
 void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);
     static double forced = -1, wide_test = -1;
-    if (forced < 0) forced = getenv("LARECOMP_SCALE") ? atof(getenv("LARECOMP_SCALE")) : 0;
+    if (forced < 0) {
+        const char *e = getenv("LARECOMP_RENDER_SCALE");
+        if (!e) e = getenv("LARECOMP_SCALE");
+        forced = e ? atof(e) : 0;
+    }
     if (wide_test < 0) wide_test = getenv("LARECOMP_WIDE_TEST") ? atof(getenv("LARECOMP_WIDE_TEST")) : 0;
     double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
     bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005;
@@ -116,6 +120,10 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         else if (mode == RES_Q50) share = 0.5;
         if (mode != RES_MATCH) hs = fmin(base * share, hs);
     }
+#ifdef __ANDROID__
+    // Mobile GPU optimization: cap default 1x mode to 720p (720/900 = 0.8), but respect explicit 50%/75%/100%/forced settings
+    if (mode == 1 && forced <= 0 && hs > (720.0 / SCENE_LINES)) hs = 720.0 / SCENE_LINES;
+#endif
     hs = fmax(hs, 0.1);
     o->scene_sx = hs * shape; o->scene_sy = hs;
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));

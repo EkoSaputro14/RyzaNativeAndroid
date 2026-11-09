@@ -36,10 +36,21 @@ static void *vsync_thread(void *arg) {
     return NULL;
 }
 
-HLE_FUNC("_ZN2nn2vi10InitializeEv", vi_initialize) { (void)c; }
+void vi_init(void) {
+    if (!vsync_event) {
+        vsync_event = kernel_create_event_pair(&vsync_w, &vsync_r);
+        pthread_t t;
+        pthread_create(&t, NULL, vsync_thread, NULL);
+        LOG("[vi] vsync background timer thread started\n");
+    }
+}
+
+
+HLE_FUNC("_ZN2nn2vi10InitializeEv", vi_initialize) { vi_init(); (void)c; }
 HLE_FUNC("_ZN2nn2vi8FinalizeEv", vi_finalize) { (void)c; }
 
 HLE_FUNC("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", vi_open_default_display) {
+    vi_init();
     *(uint64_t *)(uintptr_t)c->x[0] = (uint64_t)hle_alloc(0x100);
     c->x[0] = 0;
 }
@@ -68,11 +79,8 @@ RT_ON_RESET(vi_reset) {
 }
 
 HLE_FUNC("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", vi_get_vsync_event) {
-    if (!vsync_event) {
-        vsync_event = kernel_create_event_pair(&vsync_w, &vsync_r);
-        pthread_t t;
-        pthread_create(&t, NULL, vsync_thread, NULL);
-    } else if (!vsync_r) {
+    vi_init();
+    if (!vsync_r) {
         vsync_w = kernel_new_handle(vsync_event);
         vsync_r = kernel_new_handle(vsync_event);
     }

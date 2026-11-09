@@ -827,7 +827,7 @@ static void texture_snapshot_forget(TexBackend *b) {
 static bool texture_unchanged(TexBackend *b, const uint8_t *mem, uint64_t size) {
     static int enabled = -1;
     if (enabled < 0) { const char *e = getenv("LARECOMP_TEX_SNAPSHOTS"); enabled = !e || atoi(e) != 0; }
-    if (!enabled || !size || size > (1u << 20)) return false;
+    if (!enabled || !size || size > (8u << 20)) return false;
     TextureSnapshot *e = &texture_snapshots[((uintptr_t)b >> 6) & 7];
     if (e->owner == b && e->hash == b->data_hash && e->size == size && !memcmp(e->bytes, mem, size)) return true;
     if (e->size != size) {
@@ -890,6 +890,17 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
     if (always_full < 0) always_full = getenv("LARECOMP_TEX_FULLHASH") ? 1 : 0;
+    static uint64_t dyn_deswizzle_frame = ~0ull;
+    static uint64_t dyn_deswizzle_bytes_frame = 0;
+    if (dyn_deswizzle_frame != frame) {
+        dyn_deswizzle_frame = frame;
+        dyn_deswizzle_bytes_frame = 0;
+    }
+    // Throttle heavy dynamic texture deswizzling per frame to avoid 250ms+ upload spikes
+    if (b->dynamic && b->uploaded && total > (1u << 20)) {
+        if (dyn_deswizzle_bytes_frame >= (4u << 20)) return; // defer to next frame
+        dyn_deswizzle_bytes_frame += total;
+    }
     bool full = b->dynamic || !b->uploaded || always_full;
     // (safety net: a full hash now and then - one larger than the frame's budget too, as the frame's first: a texture
     // over 4 MB never fit it, and a change its samples missed stayed unseen - TOTKRecompAndroid's 26 MB terrain atlas, 20 s)
@@ -921,9 +932,10 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (sh == b->sample_hash) return;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
-    uint64_t h = hash_full(mem, total), last_full = b->full_frame, old_sample = b->sample_hash;
+    uint64_t h = (!b->uploaded && !b->dynamic && total > (1 << 20)) ? fnv_sample(mem, total) : hash_full(mem, total);
+    uint64_t last_full = b->full_frame, old_sample = b->sample_hash;
     b->full_frame = frame;
-    b->sample_hash = fnv_sample(mem, total);
+    b->sample_hash = (!b->uploaded && !b->dynamic && total > (1 << 20)) ? h : fnv_sample(mem, total);
     if (b->uploaded && h == b->data_hash && !restyle) return;
     if (b->uploaded && h != b->data_hash && !b->dynamic && !always_full) {
         // LARECOMP_LOG_TEX_MISS=1 (diagnosis): a change the sampled check didn't see, found by the periodic full hash -

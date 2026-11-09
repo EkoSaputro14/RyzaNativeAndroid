@@ -29,6 +29,7 @@ extern "C" {
 #define RT_BUNDLE_ID "com.mamcjr.botwrecompandroid"
 
 void rt_paths_init(void);         // first thing in main(), after plat_init
+const char *rt_native_lib_dir(void); // app's nativeLibraryDir (Android) or exe dir
 const char *rt_data_root(void);   // absolute
 bool rt_dev_mode(void);           // dev / portable mode (rule 2 above): e.g. a source checkout
 

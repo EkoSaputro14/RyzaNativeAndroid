@@ -36,7 +36,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.30.4"
+            version = "3.22.1"
         }
     }
 
@@ -114,6 +114,11 @@ val prepareBotwRecompAndroid by tasks.registering {
         out.resolve("inc/smaa_hlsl.inc").writeText(inc)
         for (lib in libs)  // (FFmpeg's only once android/deps/build_ffmpeg.sh made them)
             if (deps.resolve("lib/$lib").exists()) deps.resolve("lib/$lib").copyTo(out.resolve("jniLibs/arm64-v8a/$lib"), overwrite = true)
+        val botwGameSo = repo.resolve("botwgame.so")
+        if (botwGameSo.exists()) {
+            botwGameSo.copyTo(out.resolve("jniLibs/arm64-v8a/botwgame.so"), overwrite = true)
+            println("[Gradle] Bundling botwgame.so directly into APK jniLibs/arm64-v8a")
+        }
         font.copyTo(out.resolve("assets/res/Baloo2-SemiBold.ttf"), overwrite = true)
         deps.resolve("fonts/DejaVuSans.ttf").copyTo(out.resolve("assets/res/DejaVuSans.ttf"), overwrite = true)
         icon.copyTo(out.resolve("assets/res/icon.png"), overwrite = true)

@@ -80,6 +80,10 @@ CANON = 0x7000000000    # GUEST_LO (runtime/rt.h)
 WINDOW = 0x320000000    # GUEST_HI - GUEST_LO
 DYN_BASE = False
 
+def set_canon_base(base):
+    global CANON
+    CANON = base
+
 
 def gaddr(v):
     """C for a guest address that comes from the code's own position (moves with the window under --dyn-base)."""

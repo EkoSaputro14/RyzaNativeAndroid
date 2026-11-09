@@ -66,4 +66,6 @@ target_compile_options(main PRIVATE -O2 -g -fno-strict-aliasing -Wall -Wno-unuse
     $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>)
 target_link_libraries(main PRIVATE SDL3 shaderc_shared adrenotools android log dl m)
 # (runtime/hle.h, ipc.h, main.c: tables in named sections found through __start_ / __stop_ symbols)
-target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc)
+# -rdynamic / -Wl,-export-dynamic agar simbol-simbol runtime seperti g_fnprof, fnprof_hit, dll
+# dapat di-resolve saat dlopen() botwgame.so
+target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc -Wl,-export-dynamic)

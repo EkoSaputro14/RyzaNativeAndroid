@@ -76,7 +76,7 @@ void kernel_signal(KObject *o) {
 
 // ------------------------------------------------------------------ time
 
-uint64_t rt_ticks(void) {
+__attribute__((visibility("default"))) uint64_t rt_ticks(void) {
     // 19.2 MHz system tick (running the game's own code: the counter its rewritten reads see, native.c)
     if (native_on()) return native_ticks();
     uint64_t ns = plat_now_ns();
@@ -103,8 +103,28 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
     pthread_cond_t *cv = t_cur ? &t_cur->cond : &g_nothread_cond;
     uint64_t t0 = plat_now_ns();
     bool r = true;
-    if (timeout_ns < 0) pthread_cond_wait(cv, &g_klock);
-    else r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
+    if (timeout_ns < 0) {
+        struct timespec slice;
+        int waited_sec = 0;
+        deadline(&slice, 3000000000ull);
+        while (pthread_cond_timedwait(cv, &g_klock, &slice) != 0) {
+            if (t_cur && t_cur->wait_kind == WAIT_NONE) break;
+            waited_sec += 3;
+            if (t_cur) {
+                LOG("[kernel-wait] thread t%llu (entry %llx, lr %llx) waiting (%ds)...\n",
+                    (unsigned long long)t_cur->id,
+                    (unsigned long long)t_cur->entry,
+                    (unsigned long long)t_cur->cpu.x[30],
+                    waited_sec);
+            }
+            if (t_cur && t_cur->cancel) { r = false; break; }
+            if (g_rt_unwind) { r = false; break; }
+            deadline(&slice, 3000000000ull);
+        }
+    } else {
+        r = pthread_cond_timedwait(cv, &g_klock, ts) == 0;
+        if (!r && t_cur && t_cur->wait_kind == WAIT_NONE) r = true;
+    }
     g_blocked_ns += plat_now_ns() - t0;
     return r;
 }
@@ -259,7 +279,7 @@ static void *core0_slicer(void *arg) {
 
 static pthread_once_t c0_once = PTHREAD_ONCE_INIT;
 static void core0_init(void) {
-    c0_on = !getenv("LARECOMP_NO_CORE0");
+    c0_on = 0; // Ryza SMP
     const char *e = getenv("LARECOMP_C0_SLICE_MS");
     if (e && atoi(e) > 0) c0_slice_ns = (uint64_t)atoi(e) * 1000000;
     if (c0_on && c0_slice_ns) {
@@ -322,7 +342,7 @@ static void core0_acquire(KThread *t) {
 }
 
 // Apply a pending migration or cooperative handoff at a guest safe point.
-void kernel_preempt_point(void) {
+__attribute__((visibility("default"))) void kernel_preempt_point(void) {
     KThread *t = t_cur;
     if (t && __atomic_load_n(&t->core0_evicted, __ATOMIC_ACQUIRE)) core0_acquire(t);
 }
@@ -615,7 +635,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     // A wait that timed out returns without the mutex in BOTW 1.8.2's SDK, as on the console: user mode takes it
     // again (InternalConditionVariableImplByHorizon::TimedWait calls Enter on 0xea01). Taken here too, the thread then
     // waited for the mutex it held, and every thread after it (SavageWindRecomp). The older SDKs run as before.
-    if (r != R_OK && !(r == R_TIMEOUT && g_game_version >= 182)) {
+    if (r != R_OK && r != R_TIMEOUT) {
         // timed out / cancelled: still must reacquire the mutex
         if (!mutex_acquire_or_mark(mutex, tag)) {
             t->wait_kind = WAIT_MUTEX;
@@ -823,11 +843,10 @@ static void *watchdog_main(void *arg) {
 
 static void watchdog_start(void) {
     static int started;
-    const char *e = getenv("LARECOMP_WATCHDOG");
-    if (started || !e || atoi(e) <= 0) return;
+    if (started) return;
     started = 1;
     pthread_t th;
-    pthread_create(&th, NULL, watchdog_main, (void *)(uintptr_t)atoi(e));
+    pthread_create(&th, NULL, watchdog_main, (void *)(uintptr_t)5);
     pthread_detach(th);
 }
 
@@ -846,7 +865,9 @@ static void test_crash(void) {
     *(volatile uint32_t *)(uintptr_t)0 = 0;
 }
 
-void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
+__attribute__((visibility("default"))) void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
+    extern uint64_t g_forensic_svc_calls;
+    g_forensic_svc_calls++;
     rt_unwind_point();
     test_crash();
     KThread *me = t_cur;
@@ -1008,19 +1029,7 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x0B: {  // SleepThread (in slices of at most 50 ms: a reboot doesn't wait out a long sleep)
         int64_t ns = (int64_t)x[0];
         if (ns <= 0) {
-            // A yield returns at once, without the host's: the game's job workers spin on yields, and a host sched_yield
-            // took ~30 us - each look at the job queue came that much later (TOTKRecompAndroid, 2026-10-31: +6% fps,
-            // +14% with core 0's too, whose yield still hands the core on: its queue, svc_blocks).
-            // LARECOMP_HOST_YIELD=1: the host's yield as before; =2: skipped off core 0 only. LARECOMP_AB=<n>:yield.
-#ifdef __ANDROID__
-            static int host_yield = -1;
-            if (host_yield < 0) host_yield = getenv("LARECOMP_HOST_YIELD") ? atoi(getenv("LARECOMP_HOST_YIELD")) : 0;
-            extern int vk_ab(const char *what);
-            int ab = vk_ab("yield");
-            bool c0 = t_cur && __atomic_load_n(&t_cur->core, __ATOMIC_ACQUIRE) == 0;
-            if (ab >= 0 ? ab == 1 : host_yield == 0 || (host_yield == 2 && !c0)) break;
-#endif
-            sched_yield();
+            usleep(50); // 50 us sleep so background worker/loading threads get CPU slices
             break;
         }
         for (uint64_t end = plat_now_ns() + (uint64_t)ns, now; !g_rt_unwind && (now = plat_now_ns()) < end;) {
@@ -1319,7 +1328,9 @@ void kernel_reset(void) {
     pthread_mutex_unlock(&g_klock);
 }
 
+extern void vi_init(void);
 void kernel_init(void) {
+    vi_init();
     watchdog_start();
 #ifdef __ANDROID__
     tls_next = TLS_BASE;

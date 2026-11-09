@@ -151,8 +151,8 @@ int rt_game_dir_version(const char *game_dir) {
         if (abs) snprintf(got, sizeof got, "%s", game_dir);
         else snprintf(got, sizeof got, "%s" SEP "%s", g_root, game_dir);
     }
-    static const int versions[] = {100, 160, 182, 190};
-    for (int i = 0; i < 4; i++) {
+    static const int versions[] = {100, 160, 182, 190, 200};
+    for (int i = 0; i < 5; i++) {
         char r[1024], want[1100];
         if (!rt_version_root(versions[i], r, sizeof r)) continue;
         snprintf(want, sizeof want, "%s" SEP "extracted", r);
@@ -162,11 +162,11 @@ int rt_game_dir_version(const char *game_dir) {
 }
 
 bool rt_version_game_lib(int v, char *out, size_t n) {
-    if (v != 160 && v != 182 && v != 190) return false;
 #ifdef __ANDROID__
     const char *in = SDL_GetAndroidInternalStoragePath();
-    return in && (size_t)snprintf(out, n, "%s/v%d/%s", in, v, GAMELIB_NAME) < n;
+    return in && (size_t)snprintf(out, n, "%s/v%d/%s", in, v ? v : 100, GAMELIB_NAME) < n;
 #else
+    if (v != 160 && v != 182 && v != 190) return false;
     char r[1024];
     return rt_version_root(v, r, sizeof r) && (size_t)snprintf(out, n, "%s" SEP "extracted" SEP "%s", r, GAMELIB_NAME) < n;
 #endif
@@ -233,6 +233,14 @@ void rt_paths_init(void) {
         getenv("LARECOMP_SAVE_MSL") || getenv("LARECOMP_LAUNCHER_SHOT"))
         mkdirs("build" SEP "frames");
     fprintf(stderr, "[paths] data: %s (game version %d)\n", g_root, g_version);
+}
+
+const char *rt_native_lib_dir(void) {
+#ifdef __ANDROID__
+    const char *e = getenv("LARECOMP_NATIVE_LIB_DIR");
+    if (e && *e) return e;
+#endif
+    return g_exe_dir;
 }
 
 const char *rt_data_root(void) { return g_root; }

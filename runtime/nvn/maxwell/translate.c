@@ -481,31 +481,67 @@ static bool emit_half(Ctx *c, uint64_t w) {
         hstore(c, d, t, merge, sat);
         return true;
     }
-    // ---- HSETP2 / HSET2 (reg forms)
-    if ((op & 0xfff8) == 0x5d20 || (op & 0xfff8) == 0x5d18) {
-        bool setp = (op & 0xfff8) == 0x5d20;
-        const char *x = HS(R(a), (int)bits(w, 47, 2), bits(w, 43, 1), bits(w, 44, 1));
-        const char *y = HS(R((int)bits(w, 20, 8)), (int)bits(w, 28, 2), bits(w, 31, 1), bits(w, 30, 1));
-        int cop = (int)bits(w, 35, 4), bop = (int)bits(w, 45, 2);
+    // ---- HSETP2 / HSET2 (reg 5d20/5d18, cbuf 7e8x/7c8x, imm 7e0x/7c0x)
+    bool setp = false;
+    form = -1;
+    if ((op & 0xfff8) == 0x5d20) { setp = true; form = 0; }
+    else if ((op & 0xfff8) == 0x5d18) { form = 0; }
+    else if ((op & 0xfe80) == 0x7e80) { setp = true; form = 1; }
+    else if ((op & 0xfe80) == 0x7c80) { form = 1; }
+    else if ((op & 0xfe80) == 0x7e00) { setp = true; form = 2; }
+    else if ((op & 0xfe80) == 0x7c00) { form = 2; }
+    if (form >= 0) {
+        int cop, bop = (int)bits(w, 45, 2);
+        int swa = (int)bits(w, 47, 2), swb = 0;
+        bool nega = bits(w, 43, 1), absa = bits(w, 44, 1);
+        bool negb = false, absb = false;
+        bool hand = false, bf = false;
+        const char *bv;
+        if (form == 0) {
+            cop = (int)bits(w, 35, 4);
+            swb = (int)bits(w, 28, 2);
+            negb = bits(w, 31, 1);
+            absb = bits(w, 30, 1);
+            bv = R((int)bits(w, 20, 8));
+            if (setp) hand = bits(w, 49, 1);
+            else bf = bits(w, 49, 1);
+        } else if (form == 1) {
+            cop = (int)bits(w, 49, 4);
+            swb = 1;
+            negb = bits(w, 56, 1);
+            absb = setp ? bits(w, 54, 1) : false;
+            bv = cbuf_ref(c, (int)bits(w, 34, 5), bits(w, 20, 14) * 4, NULL, cb);
+            if (setp) hand = bits(w, 53, 1);
+            else bf = bits(w, 53, 1);
+        } else {
+            cop = (int)bits(w, 49, 4);
+            swb = 0;
+            sprintf(ib, "0x%08xu", himm(w)); bv = ib;
+            if (setp) hand = bits(w, 53, 1);
+            else bf = bits(w, 53, 1);
+        }
+        const char *x = HS(R(a), swa, nega, absa);
+        const char *y = HS(bv, swb, negb, absb);
         const char *pp = P((int)bits(w, 39, 3), bits(w, 42, 1));
         char lx[512], ly[512];
         sp(&c->body, "    { float2 hx_ = %s, hy_ = %s; bool pp = %s;\n", x, y, pp);
         fcmp_expr(lx, cop, "hx_.x", "hy_.x");
         fcmp_expr(ly, cop, "hx_.y", "hy_.y");
-        sp(&c->body, "      bool l = %s, h = %s;\n", lx, ly);
+        sp(&c->body, "      bool cl = (%s) %s pp, ch = (%s) %s pp;\n", lx, bool_op(bop), ly, bool_op(bop));
         if (setp) {
             int pa = (int)bits(w, 3, 3), pb = (int)bits(w, 0, 3);
-            bool hand = bits(w, 49, 1);
-            if (hand) sp(&c->body, "      l = l && h; h = !l;\n");
-            if (pa != PT) { c->pred_used[pa] = 1; sp(&c->body, "      p%d = l %s pp;\n", pa, bool_op(bop)); }
-            if (pb != PT) { c->pred_used[pb] = 1; sp(&c->body, "      p%d = h %s pp;\n", pb, bool_op(bop)); }
+            if (hand) {
+                if (pa != PT) { c->pred_used[pa] = 1; sp(&c->body, "      p%d = cl && ch;\n", pa); }
+                if (pb != PT) { c->pred_used[pb] = 1; sp(&c->body, "      p%d = !(cl && ch);\n", pb); }
+            } else {
+                if (pa != PT) { c->pred_used[pa] = 1; sp(&c->body, "      p%d = cl;\n", pa); }
+                if (pb != PT) { c->pred_used[pb] = 1; sp(&c->body, "      p%d = ch;\n", pb); }
+            }
         } else {
-            bool bf = bits(w, 49, 1);
             if (d != RZ) {
                 c->reg_used[d] = 1;
-                sp(&c->body, "      l = l %s pp; h = h %s pp;\n", bool_op(bop), bool_op(bop));
-                sp(&c->body, bf ? "      r%d = (l ? 0x3c00u : 0u) | (h ? 0x3c000000u : 0u);\n"
-                                : "      r%d = (l ? 0xFFFFu : 0u) | (h ? 0xFFFF0000u : 0u);\n", d);
+                sp(&c->body, bf ? "      r%d = (cl ? 0x3c00u : 0u) | (ch ? 0x3c000000u : 0u);\n"
+                                : "      r%d = (cl ? 0xFFFFu : 0u) | (ch ? 0xFFFF0000u : 0u);\n", d);
             }
         }
         sp(&c->body, "    }\n");
@@ -2028,6 +2064,33 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             }
         }
         sp(&c->body, "    }\n");
+    } else if (OPM(0xec00000000000000ull, 0xff00000000000000ull)) {  // ATOMS
+        c->uses_shared = true;
+        int op = (int)bits(w, 52, 4);
+        int32_t off = ((int32_t)sbits(w, 30, 22)) << 2;
+        int b = (int)bits(w, 20, 8);
+        char addr[128];
+        if (a == RZ) sprintf(addr, "%uu", (uint32_t)off);
+        else if (off == 0) sprintf(addr, "%s", R(a));
+        else sprintf(addr, "(%s + %uu)", R(a), (uint32_t)off);
+        static const char *const atom_fn[] = {
+            "atomicAdd", "atomicMin", "atomicMax", "atomicAdd", "atomicAdd",
+            "atomicAnd", "atomicOr", "atomicXor", "atomicExchange"
+        };
+        const char *fn = (op >= 0 && op <= 8) ? atom_fn[op] : "atomicAdd";
+        char val[64];
+        if (op == 3) sprintf(val, "1u");
+        else if (op == 4) sprintf(val, "0xFFFFFFFFu");
+        else sprintf(val, "%s", R(b));
+
+        sp(&c->body, "    { uint la = %s;\n", addr);
+        if (d != RZ) {
+            c->reg_used[d] = 1;
+            sp(&c->body, "      r%d = %s(smem[(la >> 2) & %uu], %s);\n", d, fn, SMEM_WORDS - 1, val);
+        } else {
+            sp(&c->body, "      %s(smem[(la >> 2) & %uu], %s);\n", fn, SMEM_WORDS - 1, val);
+        }
+        sp(&c->body, "    }\n");
     } else if (OPM(0xef10000000000000ull, 0xfff8000000000000ull)) {  // SHFL
         int mode = (int)bits(w, 30, 2);
         char bb[32];
@@ -2049,6 +2112,40 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             set_reg(c, d, t);
         }
         if (pd != PT) { c->pred_used[pd] = 1; sp(&c->body, "    p%d = true;\n", pd); }
+    } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE
+        const char *ps = P((int)bits(w, 39, 3), bits(w, 42, 1));
+        int pd = (int)bits(w, 45, 3);
+        int vote_op = (int)bits(w, 48, 2);
+        if (c->stage == STAGE_VERTEX) {
+            if (d != RZ) {
+                sprintf(t, "(%s ? 1u : 0u)", ps);
+                set_reg(c, d, t);
+            }
+            if (pd != PT) {
+                c->pred_used[pd] = 1;
+                sp(&c->body, "    p%d = %s;\n", pd, ps);
+            }
+        } else if (c->glsl) {
+            if (d != RZ) {
+                sprintf(t, "subgroupBallot(%s).x", ps);
+                set_reg(c, d, t);
+            }
+            if (pd != PT) {
+                c->pred_used[pd] = 1;
+                static const char *const vfn[] = {"subgroupAll", "subgroupAny", "subgroupAllEqual", "subgroupAll"};
+                sp(&c->body, "    p%d = %s(%s);\n", pd, vfn[vote_op], ps);
+            }
+        } else {
+            if (d != RZ) {
+                sprintf(t, "uint(simd_ballot(%s))", ps);
+                set_reg(c, d, t);
+            }
+            if (pd != PT) {
+                c->pred_used[pd] = 1;
+                static const char *const vfn[] = {"simd_all", "simd_any", "simd_all", "simd_all"};
+                sp(&c->body, "    p%d = %s(%s);\n", pd, vfn[vote_op], ps);
+            }
+        }
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
         if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
@@ -2261,6 +2358,8 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_basic : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
+    "#extension GL_KHR_shader_subgroup_ballot : enable\n"
+    "#extension GL_KHR_shader_subgroup_vote : enable\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
@@ -3061,6 +3160,15 @@ ShaderInfo *maxwell_translate_bounded(const uint8_t *blob, size_t max_size, size
     c->glsl = key && key->glsl;
     const uint8_t *sph = blob + 0x30;
     const uint8_t *code = blob + 0x80;
+    if (stage != STAGE_COMPUTE) {
+        uint32_t expected = stage == STAGE_VERTEX ? 1 : (stage == STAGE_FRAGMENT ? 5 : 4);
+        uint32_t s00 = (*(const uint32_t *)blob >> 10) & 0xF;
+        uint32_t s30 = (*(const uint32_t *)(blob + 0x30) >> 10) & 0xF;
+        if (s00 == expected && s30 != expected) {
+            sph = blob;
+            code = blob + 0x50;
+        }
+    }
     if (stage != STAGE_COMPUTE)  // (CommonWord1 / 2: ShaderLocalMemoryLowSize / HighSize, bytes, 24 bits each)
         c->lmem_sph_bytes = (*(const uint32_t *)(sph + 4) & 0xFFFFFFu) + (*(const uint32_t *)(sph + 8) & 0xFFFFFFu);
     // compute programs have neither the 0x30-byte NVN header nor an SPH: code starts at the blob

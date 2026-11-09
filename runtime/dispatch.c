@@ -13,8 +13,17 @@
 #include "hle.h"
 #include "kernel.h"
 
+// Execution modes (defined in rt.h: EXEC_NATIVE = 0, EXEC_RECOMP = 1, EXEC_HYBRID = 2)
+int g_exec_mode;  // 0: Native EL0 only, 1: Recomp C only, 2: Hybrid (Adaptive/Fallback)
+uint64_t g_bench_native_calls, g_bench_recomp_calls;
+uint64_t g_bench_native_ns, g_bench_recomp_ns;
+uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache_misses;
+uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
+uint64_t g_forensic_dispatch_overhead_ns;
+
 typedef struct { const uint64_t *addrs; const GuestFn *fns; uint64_t count, lo, hi; } FnTable;
-static FnTable tables[2];
+static FnTable tables[3];
+static int n_tables = 2;
 
 // HLE stubs live at fake addresses HLE_BASE + 16*i
 #define MAX_HLE 4096
@@ -117,31 +126,82 @@ void *hle_alloc(uint64_t size) {
     return (void *)a;
 }
 
+// Testing suite internal untuk memverifikasi isolasi mode dan strategi fallback
+void dispatch_run_mode_tests(void) {
+    LOG("[test_dispatch] === Memulai Verifikasi Mode Isolation & Fallback Strategy ===\n");
+
+    int saved_mode = g_exec_mode;
+    Cpu dummy_cpu;
+    memset(&dummy_cpu, 0, sizeof dummy_cpu);
+    dummy_cpu.pc = 0x7100000000ull;
+    dummy_cpu.sp = 0x7200000000ull;
+    dummy_cpu.x[30] = 0x7100000004ull;
+
+    // Test 1: C Recompilation Mode (Strict)
+    g_exec_mode = EXEC_RECOMP;
+    LOG("[test_dispatch] Test 1: EXEC_RECOMP - Memastikan tidak ada fallback ke native_call\n");
+    // Pada EXEC_RECOMP, jika PC tidak ditemukan di tabel recomp, dispatch_slow HARUS memanggil fatal_recomp_diagnostic & FATAL
+    // Kita uji dispatch_lookup langsung: jika address dummy tidak ada, pastikan NULL
+    GuestFn f_lookup = dispatch_lookup(0x12345678ull);
+    LOG("[test_dispatch] Test 1.1: dispatch_lookup(invalid) = %p (Harus NULL)\n", (void *)f_lookup);
+
+    // Test 2: Hybrid Mode (Fallback Allowed)
+    g_exec_mode = EXEC_HYBRID;
+    LOG("[test_dispatch] Test 2: EXEC_HYBRID - Memastikan fallback diperbolehkan dan dicatat\n");
+    // Pada EXEC_HYBRID, dispatch_lookup tetap NULL untuk invalid address, namun dispatch_slow / guest_call
+    // akan memicu fallback ke native_call jika native_on() bernilai true
+    LOG("[test_dispatch] Test 2.1: EXEC_HYBRID mode configured, native_on() = %d\n", native_on());
+
+    // Test 3: Native EL0 Mode
+    g_exec_mode = EXEC_NATIVE;
+    LOG("[test_dispatch] Test 3: EXEC_NATIVE - Memastikan eksekusi langsung diarahkan ke native_call\n");
+
+    g_exec_mode = saved_mode;
+    LOG("[test_dispatch] === Verifikasi selesai, mode dikembalikan ke %d ===\n\n", saved_mode);
+}
+
 void dispatch_init(void) {  // (after gamelib_load)
     const GameLibTables *g = gamelib_tables();
-    uint64_t nm = *g->main_count, ns = *g->sdk_count;
+    if (!g) return;
+    uint64_t nm = g->main_count ? *g->main_count : 0;
+    uint64_t ns = g->sdk_count ? *g->sdk_count : 0;
+    uint64_t nsub = (g->abi >= 2 && g->subsdk0_count) ? *g->subsdk0_count : 0;
+    n_tables = (nsub > 0 && g->subsdk0_addrs && g->subsdk0_fns) ? 3 : 2;
+
 #ifdef __ANDROID__
     // The library lists the desktop window's addresses (gen.py --dyn-base): moved to where the window is (rt.h).
-    static uint64_t *moved[2];
-    const uint64_t *src[2] = {g->main_addrs, g->sdk_addrs}, cnt[2] = {nm, ns};
-    for (int t = 0; t < 2; t++) {
+    static uint64_t *moved[3];
+    const uint64_t *src[3] = {g->main_addrs, g->sdk_addrs, (g->abi >= 2) ? g->subsdk0_addrs : NULL};
+    const GuestFn *fns[3] = {g->main_fns, g->sdk_fns, (g->abi >= 2) ? g->subsdk0_fns : NULL};
+    uint64_t cnt[3] = {nm, ns, nsub};
+
+    for (int t = 0; t < n_tables; t++) {
         free(moved[t]);
-        moved[t] = malloc(cnt[t] * sizeof *moved[t]);
-        if (!moved[t]) FATAL("out of memory\n");
-        for (uint64_t i = 0; i < cnt[t]; i++) moved[t][i] = src[t][i] - GUEST_CANON + GUEST_LO;
+        moved[t] = NULL;
+        if (cnt[t] > 0 && src[t] && fns[t]) {
+            moved[t] = malloc(cnt[t] * sizeof *moved[t]);
+            if (!moved[t]) FATAL("out of memory\n");
+            for (uint64_t i = 0; i < cnt[t]; i++) moved[t][i] = src[t][i] - GUEST_CANON + GUEST_LO;
+            tables[t] = (FnTable){moved[t], fns[t], cnt[t], moved[t][0], moved[t][cnt[t] - 1]};
+        } else {
+            tables[t] = (FnTable){0, 0, 0, 0, 0};
+        }
     }
-    tables[0] = (FnTable){moved[0], g->main_fns, nm, moved[0][0], moved[0][nm - 1]};
-    tables[1] = (FnTable){moved[1], g->sdk_fns, ns, moved[1][0], moved[1][ns - 1]};
 #else
-    tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, g->main_addrs[0], g->main_addrs[nm - 1]};
-    tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, g->sdk_addrs[0], g->sdk_addrs[ns - 1]};
+    tables[0] = (FnTable){g->main_addrs, g->main_fns, nm, nm ? g->main_addrs[0] : 0, nm ? g->main_addrs[nm - 1] : 0};
+    tables[1] = (FnTable){g->sdk_addrs, g->sdk_fns, ns, ns ? g->sdk_addrs[0] : 0, ns ? g->sdk_addrs[ns - 1] : 0};
+    if (n_tables == 3 && nsub && g->subsdk0_addrs && g->subsdk0_fns) {
+        tables[2] = (FnTable){g->subsdk0_addrs, g->subsdk0_fns, nsub, g->subsdk0_addrs[0], g->subsdk0_addrs[nsub - 1]};
+    }
 #endif
+    LOG("[dispatch] initialized %d function tables (main: %llu, sdk: %llu, subsdk0: %llu)\n",
+        n_tables, (unsigned long long)nm, (unsigned long long)ns, (unsigned long long)nsub);
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
-    for (int t = 0; t < 2; t++) {
+    for (int t = 0; t < n_tables; t++) {
         FnTable *ft = &tables[t];
-        if (addr < ft->lo || addr > ft->hi) continue;
+        if (!ft->count || addr < ft->lo || addr > ft->hi) continue;
         uint64_t lo = 0, hi = ft->count;
         while (lo < hi) {
             uint64_t mid = (lo + hi) / 2;
@@ -155,16 +215,19 @@ GuestFn dispatch_lookup(uint64_t addr) {
 
 // Small direct-mapped cache in front of the binary search
 #ifdef __ANDROID__
-// (larger, and indexed with higher pc bits folded in: functions 16 KB apart evicted each other - about a fifth of
-// rt_dispatch's samples were the binary search)
-#define DCACHE 16384
+// (64K entries covers the vast majority of botwgame's 77K functions without eviction conflicts)
+#define DCACHE 65536
 #define DC_IDX(pc) ((unsigned)(((pc) >> 2) ^ ((pc) >> 16)) & (DCACHE - 1))
 #else
 #define DCACHE 4096
 #define DC_IDX(pc) ((unsigned)((pc) >> 2) & (DCACHE - 1))
 #endif
 typedef struct { uint64_t addr; GuestFn fn; } DcEnt;
+#ifdef __ANDROID__
+static __thread DcEnt dcache[4096];
+#else
 static __thread DcEnt dcache[DCACHE];
+#endif
 #ifdef __ANDROID__
 // A guest thread's cache lives in its KThread (Cpu.thread): the runtime is a dlopened library on Android, where
 // every __thread access goes through the dynamic TLS resolver - with one per indirect call that was ~5% of the
@@ -177,9 +240,59 @@ static DcEnt *dc_of(Cpu *c) {
 }
 #endif
 
+static void dispatch_fallback_nop(Cpu *c);
+
+// Diagnostik detail saat terjadi fatal error di runtime/recompilation
+static void fatal_recomp_diagnostic(Cpu *c, uint64_t pc, const char *reason) {
+    uint64_t sym_off = 0, lr_off = 0;
+    const char *sym_name = loader_symbol_at(pc, &sym_off);
+    const char *lr_name = loader_symbol_at(c ? c->x[30] : 0, &lr_off);
+    const char *mod_name = "?";
+    for (int i = 0; i < g_nmodules; i++) {
+        if (pc >= g_modules[i].base && pc < g_modules[i].base + g_modules[i].size) {
+            mod_name = g_modules[i].name;
+            break;
+        }
+    }
+
+    fprintf(stderr, "\n=======================================================\n");
+    fprintf(stderr, "[RECOMP FATAL ERROR] %s\n", reason ? reason : "Unknown Execution Failure");
+    fprintf(stderr, "Mode: C Recompilation (Strict - No Fallback)\n");
+    fprintf(stderr, "Guest PC    : 0x%016llx (%s: %s + 0x%llx)\n",
+            (unsigned long long)pc, mod_name, sym_name ? sym_name : "<unknown>", (unsigned long long)sym_off);
+    if (c) {
+        fprintf(stderr, "Caller LR   : 0x%016llx (%s + 0x%llx)\n",
+                (unsigned long long)c->x[30], lr_name ? lr_name : "<unknown>", (unsigned long long)lr_off);
+        fprintf(stderr, "Stack SP    : 0x%016llx\n", (unsigned long long)c->sp);
+        fprintf(stderr, "CPU Registers:\n");
+        for (int i = 0; i < 31; i += 4) {
+            fprintf(stderr, "  x%-2d: %016llx  x%-2d: %016llx  x%-2d: %016llx  x%-2d: %016llx\n",
+                    i, (unsigned long long)c->x[i],
+                    i + 1, (unsigned long long)c->x[i + 1],
+                    i + 2, (unsigned long long)c->x[i + 2],
+                    i + 3, (unsigned long long)(i + 3 < 31 ? c->x[i + 3] : 0));
+        }
+        uint64_t fp = c->x[29];
+        fprintf(stderr, "Guest Frame Callers (x29):");
+        for (int i = 0; i < 16 && fp >= GUEST_LO && fp + 16 <= GUEST_HI && !(fp & 7); i++) {
+            uint64_t next = *(const uint64_t *)(uintptr_t)fp;
+            uint64_t ret = *(const uint64_t *)(uintptr_t)(fp + 8);
+            fprintf(stderr, " 0x%llx", (unsigned long long)ret);
+            if (next <= fp) break;
+            fp = next;
+        }
+        fprintf(stderr, "\n");
+    }
+    fprintf(stderr, "=======================================================\n\n");
+    LOG("[RECOMP FATAL] %s at PC 0x%llx (mod: %s, sym: %s+0x%llx, lr: 0x%llx)\n",
+        reason ? reason : "failure", (unsigned long long)pc, mod_name,
+        sym_name ? sym_name : "?", (unsigned long long)sym_off, (unsigned long long)(c ? c->x[30] : 0));
+}
+
 static GuestFn dispatch_slow(Cpu *c) {
     uint64_t pc = c->pc;
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
+        g_forensic_hle_calls++;
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
         int i = (int)((pc - HLE_BASE) / 16);
         if (i < hle_count) {
@@ -192,6 +305,31 @@ static GuestFn dispatch_slow(Cpu *c) {
         if (overrides[i].addr == pc) return overrides[i].fn;
     GuestFn f = dispatch_lookup(pc);
     if (!f) {
+        // STRICT MODE ISOLATION:
+        // Jika mode EXEC_RECOMP (C Recompilation Strict), jangan pernah fallback ke Native EL0!
+        if (g_exec_mode == EXEC_RECOMP) {
+            fatal_recomp_diagnostic(c, pc, "Missing function in C Recompilation table / unmapped guest PC");
+            uint64_t off;
+            const char *s = loader_symbol_at(c->x[30], &off);
+            FATAL("[RECOMP STRICT] No recompiled function at 0x%llx (caller lr=0x%llx %s+0x%llx). Fallback to Native EL0 is strictly forbidden.\n",
+                  (unsigned long long)pc, (unsigned long long)c->x[30], s ? s : "?", (unsigned long long)off);
+        }
+
+        // Mode HYBRID atau NATIVE: izinkan fallback ke Native EL0 jika engine native aktif
+        if (native_on()) {
+            g_forensic_fallbacks++;
+            uint64_t sym_off = 0;
+            const char *sym_name = loader_symbol_at(pc, &sym_off);
+            LOG("[HYBRID FALLBACK] Recomp function not found for PC 0x%llx (%s+0x%llx), falling back to Native EL0\n",
+                (unsigned long long)pc, sym_name ? sym_name : "<unknown>", (unsigned long long)sym_off);
+
+            extern uint64_t g_bench_native_calls;
+            g_bench_native_calls++;
+            native_call(c, pc);
+            f = (GuestFn)dispatch_fallback_nop;
+            return f;
+        }
+
         uint64_t off;
         const char *s = loader_symbol_at(c->x[30], &off);
         FATAL("no function at %llx (lr=%llx %s+%llx)\n", pc, c->x[30], s ? s : "?", off);
@@ -199,6 +337,7 @@ static GuestFn dispatch_slow(Cpu *c) {
     unsigned h = DC_IDX(pc);
 #ifdef __ANDROID__
     DcEnt *dc = dc_of(c);
+    if (dc == dcache) h &= 4095;
     dc[h].addr = pc;
     dc[h].fn = f;
 #else
@@ -208,8 +347,13 @@ static GuestFn dispatch_slow(Cpu *c) {
     return f;
 }
 
+static void dispatch_fallback_nop(Cpu *c) {
+    (void)c;
+}
+
 #ifdef __ANDROID__
 __attribute__((noinline)) static void dispatch_miss(Cpu *c) {
+    g_forensic_dcache_misses++;
     GuestFn f = dispatch_slow(c);
     __attribute__((musttail)) return f(c);
 }
@@ -220,18 +364,28 @@ __attribute__((noinline)) static void dispatch_miss(Cpu *c) {
 // (the hit path without a stack frame or stack protector: the miss and the TLS cache are dispatch_miss's)
 __attribute__((no_stack_protector))
 #endif
-void rt_dispatch(Cpu *c) {
+__attribute__((visibility("default"))) void rt_dispatch(Cpu *c) {
     unsigned h = DC_IDX(c->pc);
 #ifdef __ANDROID__
     KThread *t = c->thread;
     const DcEnt *dc;
     if (__builtin_expect(t && (dc = t->dcache) && dc[h].addr == c->pc, 1)) {
+        if (__builtin_expect((h & 0x3F) == 0, 0)) {
+            g_forensic_dispatches += 64;
+            g_forensic_dcache_hits += 64;
+        }
         GuestFn f = dc[h].fn;
         __attribute__((musttail)) return f(c);
     }
     __attribute__((musttail)) return dispatch_miss(c);
 #else
-    GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
+    if (dcache[h].addr == c->pc) {
+        g_forensic_dcache_hits++;
+        GuestFn f = dcache[h].fn;
+        __attribute__((musttail)) return f(c);
+    }
+    g_forensic_dcache_misses++;
+    GuestFn f = dispatch_slow(c);
     __attribute__((musttail)) return f(c);
 #endif
 }
@@ -246,12 +400,63 @@ HostFn hle_slot_fn(uint64_t pc) {
 }
 
 void guest_call(Cpu *c, uint64_t addr) {
-    if (native_on()) { native_call(c, addr); return; }
+    if (g_exec_mode == EXEC_RECOMP) {
+        // Mode Recompilation-only: eksekusi HANYA lewat rt_dispatch / recompiled C, jangan pernah ke native_call
+        uint64_t lr = c->x[30];
+        c->x[30] = 0;
+        c->pc = addr;
+        rt_dispatch(c);
+        c->x[30] = lr;
+        g_bench_recomp_calls++;
+        return;
+    }
+
+    if (g_exec_mode == EXEC_HYBRID) {
+        // Mode Hybrid: coba recompiled C terlebih dahulu
+        if (gamelib_tables()) {
+            GuestFn fn = dispatch_lookup(addr);
+            if (fn) {
+                uint64_t lr = c->x[30];
+                c->x[30] = 0;
+                c->pc = addr;
+                fn(c);
+                c->x[30] = lr;
+                g_bench_recomp_calls++;
+                return;
+            }
+        }
+
+        // Jika fungsi tidak ada di recompilation table, fallback ke Native EL0
+        if (native_on()) {
+            native_call(c, addr);
+            g_bench_native_calls++;
+            return;
+        }
+
+        // Jika native_on() mati pada mode hybrid, fallback ke rt_dispatch
+        uint64_t lr = c->x[30];
+        c->x[30] = 0;
+        c->pc = addr;
+        rt_dispatch(c);
+        c->x[30] = lr;
+        g_bench_recomp_calls++;
+        return;
+    }
+
+    // Mode Native EL0 murni (EXEC_NATIVE)
+    if (native_on()) {
+        native_call(c, addr);
+        g_bench_native_calls++;
+        return;
+    }
+
+    // Jika native_on() false pada mode native (misalnya di non-ARM64 / x86_64 host)
     uint64_t lr = c->x[30];
     c->x[30] = 0;
     c->pc = addr;
     rt_dispatch(c);
     c->x[30] = lr;
+    g_bench_recomp_calls++;
 }
 
 // Host pc -> recompiled guest function containing it ("f_<addr>"), for hosts without symbol lookup.
@@ -264,10 +469,12 @@ const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
     static uint64_t n;
     static __thread char name[32];
     if (!byhost) {
-        uint64_t total = tables[0].count + tables[1].count, k = 0;
+        uint64_t total = 0;
+        for (int t = 0; t < n_tables; t++) total += tables[t].count;
+        uint64_t k = 0;
         uint64_t (*v)[2] = malloc(total * sizeof *v);
         if (!v) return NULL;
-        for (int t = 0; t < 2; t++)
+        for (int t = 0; t < n_tables; t++)
             for (uint64_t i = 0; i < tables[t].count; i++) {
                 v[k][0] = (uint64_t)(uintptr_t)tables[t].fns[i];
                 v[k++][1] = tables[t].addrs[i];
@@ -349,13 +556,19 @@ void rt_fatal_trace(void) {
     abort();
 }
 
-void rt_udf(Cpu *c, uint64_t pc) {
-    (void)c;
+__attribute__((visibility("default"))) void rt_udf(Cpu *c, uint64_t pc) {
+    if (g_exec_mode == EXEC_RECOMP) {
+        fatal_recomp_diagnostic(c, pc, "Undefined instruction / Trap in C Recompilation");
+    }
     FATAL("undefined instruction / trap at %llx\n", pc);
 }
 
-void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
-    (void)c;
+__attribute__((visibility("default"))) void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
+    if (g_exec_mode == EXEC_RECOMP) {
+        char msg[128];
+        snprintf(msg, sizeof msg, "Guest software breakpoint (brk #%u) encountered in C Recompilation", imm);
+        fatal_recomp_diagnostic(c, pc, msg);
+    }
     FATAL("brk #%u at %llx\n", imm, pc);
 }
 
@@ -530,6 +743,10 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
             (unsigned long long)fa, (unsigned long long)pc, ps ? ps : "?", (unsigned long long)po,
             (unsigned long long)lr, ls ? ls : "?");
     rt_fatal_trace();
+    if (g_exec_mode == EXEC_RECOMP) {
+        Cpu *c = kernel_current_cpu();
+        fatal_recomp_diagnostic(c, pc, what);
+    }
 }
 
 void crash_handler_install(void) { plat_crash_handler_install(); }

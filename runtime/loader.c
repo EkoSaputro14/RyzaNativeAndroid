@@ -69,6 +69,7 @@ static uint64_t gnu_hash_nsyms(uint64_t h) {
 // The game's version for main's build id (the NSO header's bytes 0x40-0x47; 0: unknown) - also runtime/gamebuild.c
 int game_version_of_build(const uint8_t id[8]) {
     static const struct { uint8_t id[8]; int version; } builds[] = {
+        {{0x50, 0x17, 0x11, 0x0d, 0xb5, 0xaa, 0xc6, 0xcc}, 100},  // Atelier Ryza 1.0.0 (Title ID: 0100d1900ec80000)
         {{0x20, 0x94, 0xf1, 0x52, 0x83, 0x66, 0x83, 0xa3}, 100},
         {{0x8e, 0x99, 0x78, 0xd5, 0x0b, 0xdd, 0x20, 0xb4}, 160},
         {{0xde, 0x0b, 0x6a, 0xc4, 0xef, 0xc1, 0xdd, 0xa7}, 182},
@@ -250,11 +251,27 @@ static void relocate(Module *m) {
 
 void loader_load(const char *exefs) {
     char path[1024];
-    const struct { const char *name; uint64_t base; } mods[] = {{"main", MAIN_BASE}, {"sdk", SDK_BASE}};  // (not static: Android's bases move)
-    for (unsigned i = 0; i < 2; i++) {
+    const struct { const char *name; uint64_t base; } mods[] = {
+        {"main", MAIN_BASE},
+        {"subsdk0", SUBSDK0_BASE},
+        {"sdk", SDK_BASE}
+    };
+    for (unsigned i = 0; i < 3; i++) {
         Module *m = &g_modules[g_nmodules++];
         m->name = mods[i].name;
         snprintf(path, sizeof path, "%s/%s", exefs, m->name);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fclose(f);
+        } else {
+            snprintf(path, sizeof path, "%s/%s.bin", exefs, m->name);
+            f = fopen(path, "rb");
+            if (f) fclose(f);
+            else if (i == 1) { // subsdk0 is optional if absent
+                g_nmodules--;
+                continue;
+            }
+        }
         load_nso(m, path, mods[i].base);
     }
     for (int i = 0; i < g_nmodules; i++) relocate(&g_modules[i]);

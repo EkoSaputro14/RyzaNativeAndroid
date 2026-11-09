@@ -718,8 +718,13 @@ def main():
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
     ap.add_argument('--dyn-base', action='store_true',
                     help='Android: guest addresses relative to the window the runtime picks (lifter.gaddr)')
+    ap.add_argument('--canon-base', type=lambda s: int(s, 0), default=0x7000000000,
+                    help='Canonical guest base (default: 0x7000000000)')
     args = ap.parse_args()
     lifter.DYN_BASE = args.dyn_base
+    lifter.set_canon_base(args.canon_base)
+    global CANON
+    CANON = args.canon_base
     generate(args.name, args.nso, args.base, args.outdir, args)
 
 

@@ -8,10 +8,18 @@
 #include <SDL3/SDL.h>
 #include <math.h>
 #include <stdio.h>
+#include <algorithm>
 
 #include "imgui.h"
 
 extern "C" {
+extern int g_exec_mode;
+extern uint64_t g_bench_native_calls, g_bench_recomp_calls;
+extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
+extern uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache_misses;
+extern uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
+extern uint64_t g_forensic_dispatch_overhead_ns;
+void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws);
 #include "platform.h"
 #include "../settings.h"
 uint64_t vk_cum_wait_ns(void);  // vulkan/exec.c
@@ -58,6 +66,9 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     static uint64_t next_ns, t0, wait0;
     static int frames;
     static float fps, avg_ms, max_ms, wait_pct;
+    static float p50_ms, p95_ms, p99_ms;
+    static double s_overlay_cpu_exec_ms, s_overlay_gpu_ms;
+    static uint64_t s_overlay_draws;
     static PlatDeviceStats ds;
     frames++;
     if (now >= next_ns) {
@@ -76,6 +87,16 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         for (int i = 0; i < nft; i++) { s += ft[i]; if (ft[i] > mx) mx = ft[i]; }
         avg_ms = nft ? s / nft : 0;
         max_ms = mx;
+
+        if (nft > 0) {
+            float sorted[FT_N];
+            for (int i = 0; i < nft; i++) sorted[i] = ft[i];
+            std::sort(sorted, sorted + nft);
+            p50_ms = sorted[(int)(nft * 0.50f)];
+            p95_ms = sorted[(int)(nft * 0.95f)];
+            p99_ms = sorted[(int)(nft * 0.99f)];
+        }
+        vk_get_forensic_stats(&s_overlay_cpu_exec_ms, &s_overlay_gpu_ms, &s_overlay_draws);
         plat_device_stats(&ds);
     }
 
@@ -86,6 +107,11 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::SetWindowFontScale(0.62f);
         ImGui::TextColored(grade(fps, 55, 28), "FPS %.0f", fps);
+        {
+            const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f), "[%s]", ms);
+        }
         ImGui::SameLine();
         ImGui::Text("  RAM %u MB", ds.rss_mb);
         if (ds.soc_temp_c > 0) {
@@ -105,6 +131,11 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     ImGui::SetWindowFontScale(0.62f);
 
     ImGui::TextColored(grade(fps, 55, 28), "%.0f FPS", fps);
+    {
+        const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f), "[%s]", ms);
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("%.1f ms", fps > 0 ? 1000.0f / fps : 0.0f);
     float graph[FT_N];  // (oldest first)
@@ -113,6 +144,17 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     ImGui::PlotLines("##ft", graph, nft, 0, NULL, 0.0f, 100.0f, ImVec2(260 * scale, 44 * scale));
     ImGui::PopStyleColor();
     ImGui::TextDisabled("frame avg %.1f ms  max %.0f ms", avg_ms, max_ms);
+    ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "P50: %.1f ms | P95: %.1f ms | P99: %.1f ms", p50_ms, p95_ms, p99_ms);
+    ImGui::Text("Render: CPU %.1f ms | GPU %.1f ms (%llu draws)", s_overlay_cpu_exec_ms, s_overlay_gpu_ms, (unsigned long long)s_overlay_draws);
+    {
+        uint64_t total_dc = g_forensic_dcache_hits + g_forensic_dcache_misses;
+        double hit_rt = total_dc ? (g_forensic_dcache_hits * 100.0 / total_dc) : 100.0;
+        ImGui::Text("Path: %s | RecCalls: %llu | Disp: %llu (%.1f%% hit)",
+                    g_exec_mode == 1 ? "Recomp C" : g_exec_mode == 2 ? "Hybrid" : "Native EL0",
+                    (unsigned long long)g_bench_recomp_calls,
+                    (unsigned long long)g_forensic_dispatches,
+                    hit_rt);
+    }
 
     char cpu[96] = "";
     for (int i = 0, n = 0; i < ds.ncluster && n < (int)sizeof cpu - 8; i++)

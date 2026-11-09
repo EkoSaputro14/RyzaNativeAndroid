@@ -1112,11 +1112,37 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
         if (gcopy[s].seq == seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) gcopy[s].seq = 0;
     }
 }
+static uint64_t stat_gcopy_calls, stat_gcopy_hits, stat_gcopy_fast_rejects, stat_gcopy_bytes;
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
+    stat_gcopy_calls++;
     uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size) return gcopy[slot].span;
+    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
+        const uint8_t *p1 = (const uint8_t *)gcopy[slot].span.ptr;
+        const uint8_t *p2 = (const uint8_t *)(uintptr_t)addr;
+        bool match = false;
+        if (size >= 16) {
+            uint64_t w0_a, w0_b, w1_a, w1_b;
+            memcpy(&w0_a, p1, 8);
+            memcpy(&w0_b, p2, 8);
+            memcpy(&w1_a, p1 + size - 8, 8);
+            memcpy(&w1_b, p2 + size - 8, 8);
+            if (w0_a == w0_b && w1_a == w1_b) {
+                stat_gcopy_bytes += size;
+                match = memcmp(p1, p2, size) == 0;
+            } else {
+                stat_gcopy_fast_rejects++;
+            }
+        } else {
+            stat_gcopy_bytes += size;
+            match = memcmp(p1, p2, size) == 0;
+        }
+        if (match) {
+            stat_gcopy_hits++;
+            return gcopy[slot].span;
+        }
+    }
     if (gcopy[slot].seq != seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     stat_cb_copied += size;
@@ -1276,11 +1302,12 @@ static struct {
     RtState rt;
     bool rt_dirty;
     NvnProgram *program;
+    NvnProgram *programs[6];
     uint8_t blend[8][8];
     uint32_t channel_mask;
     uint8_t color_state[4], ds[8], ms[0x18], poly[4];
     float poly_offset[3];
-    uint32_t attrib[16];
+    uint32_t attrib[32];
     int nattrib;
     uint32_t stream[16][2];
     int nstream;
@@ -1297,6 +1324,14 @@ static struct {
     uint32_t restart_index;
     uint64_t copy_row_stride, copy_image_stride;
 } st;
+
+static inline NvnProgram *st_program(int stage) {
+    return (stage >= 0 && stage < 6 && st.programs[stage]) ? st.programs[stage] : st.program;
+}
+static inline NvnShaderStage *st_stage(int stage) {
+    NvnProgram *np = st_program(stage);
+    return np ? &np->stages[stage] : NULL;
+}
 
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
@@ -1317,6 +1352,9 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     }
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
 }
+
+static double s_last_cpu_exec_ms, s_last_gpu_ms;
+static uint64_t s_last_draws;
 
 const char *renderer_stats(void) {
     static int dumps;
@@ -1401,10 +1439,19 @@ const char *renderer_stats(void) {
         pthread_mutex_unlock(&wait_tab_lock);
         prof_views_created = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
+        s_last_cpu_exec_ms = prof_exec / 1e6;
+        s_last_gpu_ms = prof_gpu / 1e6;
+        s_last_draws = stat_draws;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_dchained = stat_flushes = stat_wait_ns = 0;
     return stats_text;
+}
+
+void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws) {
+    if (cpu_exec_ms) *cpu_exec_ms = s_last_cpu_exec_ms ? s_last_cpu_exec_ms : (prof_exec / 1e6);
+    if (gpu_ms) *gpu_ms = s_last_gpu_ms ? s_last_gpu_ms : (prof_gpu / 1e6);
+    if (draws) *draws = s_last_draws ? s_last_draws : stat_draws;
 }
 
 // Baked state changes and pass restarts invalidate the last pipeline; dynamic state does not.
@@ -1427,7 +1474,7 @@ static void st_defaults(void) {
 }
 
 void vk_exec_init(void) {
-    prof = getenv("LARECOMP_VK_PROF") != NULL;
+    prof = 1;
 #ifdef __ANDROID__
     extern void vk_memfd_probe(void);
     vk_memfd_probe();  // (LARECOMP_MEMFD_PROBE=1: memfd_probe.c)
@@ -1912,8 +1959,10 @@ static void begin_pass(void) {
             // idle between the chunks, and the game, timing its frames on the GPU from start to end, saw the gaps as
             // GPU time and stayed at 30 even indoors; a whole frame at once, it chose 60 there)
             extern bool vk_driver_is_qualcomm(void);
+            extern bool vk_driver_is_turnip(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : 2000;
+            bool is_adreno = vk_driver_is_qualcomm() || vk_driver_is_turnip();
+            chunk = e ? atol(e) : is_adreno ? 0 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -2569,7 +2618,7 @@ static bool structure_on(void) {
     static int on = -1;
     if (on < 0) {
         extern bool vk_driver_is_qualcomm(void);
-        on = !getenv("LARECOMP_NO_STRUCTURE") && (!vk_driver_is_qualcomm() || getenv("LARECOMP_STRUCTURE"));
+        on = getenv("LARECOMP_STRUCTURE") != NULL; // Disable structured control flow by default to prevent bone/outline register liveness corruptions
         if (!on && vk_driver_is_qualcomm()) LOG("[vk] Qualcomm's driver: shaders keep their branch state machine (its compiler)\n");
     }
     return on;
@@ -2688,27 +2737,32 @@ static void translate_program(void *arg) {
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
+    LOG("[shader] VS+FS translated: vs=%llx fs=%llx\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1]);
     run_job(compile_program, p);
 }
 
 #define PROG_TAB 4096
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
-static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
-    if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, ShaderKey *fkey) {
+    if (!vnp || !fnp) return NULL;
+    uint64_t vcode = vnp->stages[0].code_addr;
+    uint64_t fcode = fnp->stages[1].code_addr;
+    if (!vcode || !fcode) return NULL;
     // (the previous draw's program and keys again - most draws: no hashing; the code addresses are part of it, as
     // the program object can be reused for other code)
-    static NvnProgram *last_np;
+    static NvnProgram *last_vnp, *last_fnp;
     static uint64_t last_code[2];
     static ShaderKey last_vkey, last_fkey;
     static Prog *last_prog;
-    if (last_prog && np == last_np && last_code[0] == np->stages[0].code_addr && last_code[1] == np->stages[1].code_addr &&
+    if (last_prog && vnp == last_vnp && fnp == last_fnp && last_code[0] == vcode && last_code[1] == fcode &&
         !memcmp(vkey, &last_vkey, sizeof *vkey) && !memcmp(fkey, &last_fkey, sizeof *fkey))
         return last_prog;
-    last_np = np, last_code[0] = np->stages[0].code_addr, last_code[1] = np->stages[1].code_addr;
+    last_vnp = vnp, last_fnp = fnp, last_code[0] = vcode, last_code[1] = fcode;
     last_vkey = *vkey, last_fkey = *fkey;
     uint64_t h = 0xcbf29ce484222325ull;
-    for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
+    for (int k = 0; k < 8; k++) { h ^= (vcode >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; }
+    for (int k = 0; k < 8; k++) { h ^= (fcode >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; }
     h = hash_words(h, vkey, sizeof *vkey);  // (8 bytes a step: the table is in memory only)
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
 #ifdef __ANDROID__
@@ -2722,11 +2776,12 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     last_prog = p;
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
-    for (int i = 0; i < 2; i++) {
-        p->code[i] = np->stages[i].code_addr;
-        p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
-        p->const_bytes[i] = np->stages[i].const_offset ? np->stages[i].const_size : 0;
-    }
+    p->code[0] = vcode;
+    p->cmax[0] = vnp->stages[0].const_offset ? vnp->stages[0].const_offset : 0x10000;
+    p->const_bytes[0] = vnp->stages[0].const_offset ? vnp->stages[0].const_size : 0;
+    p->code[1] = fcode;
+    p->cmax[1] = fnp->stages[1].const_offset ? fnp->stages[1].const_offset : 0x10000;
+    p->const_bytes[1] = fnp->stages[1].const_offset ? fnp->stages[1].const_size : 0;
     p->vkey = *vkey;
     p->fkey = *fkey;
     run_translate(translate_program, p);
@@ -2738,9 +2793,11 @@ static int attr_kind(uint32_t fmt) {
     switch (fmt) {
     case 0x03: case 0x08: case 0x0B: case 0x0F: case 0x14: case 0x17: case 0x1B: case 0x20: case 0x23:
     case 0x27: case 0x2C: case 0x2F: case 0x3E:
+    case 0x55: case 0x5B: case 0x61: case 0x67: // UINT
         return 2;
     case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18: case 0x1C: case 0x21: case 0x24:
-    case 0x28: case 0x2D: case 0x30:
+    case 0x28: case 0x2D: case 0x30: case 0x6A:
+    case 0x56: case 0x5C: case 0x62: case 0x68: // SINT
         return 1;
     default: return 0;
     }
@@ -2796,10 +2853,18 @@ static VkFormat vertex_format(uint32_t f) {
     case 0x2E: return VK_FORMAT_R32G32B32A32_SFLOAT;
     case 0x2F: return VK_FORMAT_R32G32B32A32_UINT;
     case 0x30: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x39: return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+    case 0x3A: return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
+    case 0x3B: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+    case 0x3C: return VK_FORMAT_R5G6B5_UNORM_PACK16;
     case 0x3D: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case 0x3E: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     case 0x3F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case 0x40: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case 0x6A: return VK_FORMAT_A2B10G10R10_SINT_PACK32;
+    case 0x6B: return VK_FORMAT_A2B10G10R10_USCALED_PACK32;
+    case 0x6C: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
     // integer-to-float (NVN *_UI2F / *_I2F: the integer's value as a float, the shader reads floats) - Vulkan's
     // USCALED / SSCALED; none at 32 bits there: those are read as the integer's bits (none seen in BOTW)
     case 0x51: return VK_FORMAT_R8_USCALED;
@@ -3005,7 +3070,7 @@ static void build_pipeline(void *arg) {
         if (k->attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k->attr_bind[i], k->attr_fmt[i], k->attr_off[i]};
     for (uint32_t s = 0; s < 17; s++) {
         if (!(k->used_streams & (1u << s))) continue;
-        bool inst = k->divisor[s] != 0;
+        bool inst = k->divisor[s] != 0 || s == ZERO_BINDING;
         vb[nb++] = (VkVertexInputBindingDescription){s, k->stride[s], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
         if (inst && k->divisor[s] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, k->divisor[s]};
     }
@@ -3769,7 +3834,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
     }
     if (k == 1) {  // compiler constants stored after the shader code
-        NvnShaderStage *ss = &st.program->stages[stage];
+        NvnShaderStage *ss = st_stage(stage);
+        if (!ss || !ss->code_addr) return ubo_span(vk_transient_copy(zeros, 16, 256), 16);
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
         return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
@@ -4913,7 +4979,7 @@ static bool gres_prepare(const GcRange *r, int m, bool store) {
     if (!gres_init()) return false;
     {   // LARECOMP_GMISS: the arena's state every ~5 s
         static uint64_t last;
-        if (getenv("LARECOMP_GMISS") && renderer_present_count() - last >= 300) {
+        if (renderer_present_count() - last >= 100) {
             last = renderer_present_count();
             int live = 0;
             for (int i = 0; i < ga_nres; i++) live += ga_res[i].live;
@@ -4930,8 +4996,7 @@ static bool gres_prepare(const GcRange *r, int m, bool store) {
         static uint64_t calls, last_frame;
         if (++calls % 256 == 0 && renderer_present_count() - last_frame >= 30) {
             last_frame = renderer_present_count();
-            static int logit = -1;
-            if (logit < 0) logit = getenv("LARECOMP_GMISS") != NULL;
+            static int logit = 1;
             uint32_t *w = (uint32_t *)(ga_ptr + (uint64_t)GMISS_WORD * 4);
             ga_invalidate(w, 4096);
             uint32_t cnt = __atomic_load_n(&w[0], __ATOMIC_RELAXED);
@@ -5200,7 +5265,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
     for (int i = 0; i < m; i++) total += (r[i].hi - r[i].lo + 255) & ~255ull;
     {   // LARECOMP_LOG_GCOPY=n: every copy of one frame in n (which stages, storing or not, the ranges) - diagnostics
         static long logn = -1;
-        if (logn < 0) { const char *e = getenv("LARECOMP_LOG_GCOPY"); logn = e ? atol(e) : 0; }
+        if (logn < 0) { const char *e = getenv("LARECOMP_LOG_GCOPY"); logn = e ? atol(e) : 100; }
         if (logn > 0 && renderer_present_count() % (uint64_t)logn == 0) {
             char b[512];
             int o = 0;
@@ -5478,7 +5543,14 @@ void vc_flush(void) {
 // forces copies.
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
-    if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
+    if (copy < 0) {
+#ifdef __ANDROID__
+        const char *e = getenv("LARECOMP_VK_COPY_VERTICES");
+        copy = !e || atoi(e) != 0;  // default to true on Android to eliminate stale vcache / dropped write corruption
+#else
+        copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
+#endif
+    }
     if (copy || addr < HEAP_BASE) return false;
 #ifdef __ANDROID__
     if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
@@ -6061,8 +6133,10 @@ static void pick_after_draw(void) {
         vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, pick.buf, 1, &c);
     }
     PickRec *pr = &pick.rec[pick.n++];
-    pr->vs = st.program->stages[0].code_addr;
-    pr->fs = st.program->stages[1].code_addr;
+    NvnShaderStage *vss_p = st_stage(0);
+    NvnShaderStage *fss_p = st_stage(1);
+    pr->vs = vss_p ? vss_p->code_addr : 0;
+    pr->fs = fss_p ? fss_p->code_addr : 0;
     pr->hash = g_cur_fs_hash;
     pr->img = (void *)b->image;
     pr->w = b->width; pr->h = b->height; pr->fmt = st.rt.color[t]->format; pr->no = pick.draws;
@@ -6096,18 +6170,31 @@ static void draw(CmdRec *r, bool indexed) {
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
-    if (!st.program) { stat_skipped++; return; }
+    NvnProgram *vnp = st_program(0);
+    NvnProgram *fnp = st_program(1);
+    NvnShaderStage *vss = vnp ? &vnp->stages[0] : NULL;
+    NvnShaderStage *fss = fnp ? &fnp->stages[1] : NULL;
+    if (!vnp || !fnp || !vss || !fss || !vss->code_addr || !fss->code_addr) {
+        static int skip_log = 0;
+        if (skip_log++ < 10 || skip_log % 1000 == 0) {
+            LOG("[vk] draw skip #%d: vnp=%p (mask=%x, vs=%llx) fnp=%p (mask=%x, fs=%llx)\n",
+                skip_log, (void *)vnp, vnp ? vnp->stage_mask : 0, vss ? (unsigned long long)vss->code_addr : 0,
+                (void *)fnp, fnp ? fnp->stage_mask : 0, fss ? (unsigned long long)fss->code_addr : 0);
+        }
+        stat_skipped++;
+        return;
+    }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
-    for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+    for (int i = 0; i < st.nattrib && i < 32; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
 #ifdef __ANDROID__
     if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
         fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
 #endif
-    Prog *pr = get_program(st.program, &vkey, &fkey);
+    Prog *pr = get_program(vnp, fnp, &vkey, &fkey);
     bool keep = false;  // (a target built once and kept: wait for the shader and pipeline - wait_built)
     {   // (the same targets as the previous draw, same frame: their answer again - reading 6 texture objects a draw
         // showed up)
@@ -6133,7 +6220,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; skip_note("shader"); return; }
     {   // fragment-shader hash: interior backdrop detection (widescreen), skip lists, item twinkle (renderer.m)
         static uint64_t last_fs, last_hash;
-        uint64_t fs = st.program->stages[1].code_addr;
+        uint64_t fs = fss->code_addr;
         if (fs != last_fs) {
             last_fs = fs;
 #ifdef __ANDROID__
@@ -6186,7 +6273,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 nvskip = n;
             }
             for (int i = 0; i < nvskip; i++)
-                if (st.program->stages[0].code_addr == vskip[i]) { stat_skipped++; return; }
+                if (vss->code_addr == vskip[i]) { stat_skipped++; return; }
         }
         {   // LARECOMP_LOG_FS_VB=<fs hash>:<stream> (diagnosis): that vertex stream's first 4 floats for the first draw of
             // that fragment shader each frame, as the draw reads them (beside LARECOMP_LOG_FS_CB: a per-instance
@@ -6548,8 +6635,11 @@ static void draw_(CmdRec *r, bool indexed) {
             k.attr_mask |= 1u << i;
             uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
             uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
-            if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
-                k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+            if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 0) from a constant stream
+                int kind = (i < 32 && pr && pr->vkey.attr_kind[i]) ? pr->vkey.attr_kind[i] : 0;
+                k.attr_fmt[i] = (kind == 1) ? VK_FORMAT_R32G32B32A32_SINT :
+                                (kind == 2) ? VK_FORMAT_R32G32B32A32_UINT :
+                                              VK_FORMAT_R32G32B32A32_SFLOAT;
                 k.attr_bind[i] = ZERO_BINDING;
                 k.used_streams |= 1u << ZERO_BINDING;
                 continue;
@@ -6564,6 +6654,30 @@ static void draw_(CmdRec *r, bool indexed) {
             k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
             k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
             if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
+        }
+        static int logged_pipes = 0;
+        bool has_high_attr = (pr->vi->attr_mask & 0xFFFF0000u) != 0;
+        if (logged_pipes < 15 || (has_high_attr && logged_pipes < 30)) {
+            logged_pipes++;
+            LOG("[diag-pipe] Pipe #%d pr=%p vs_attr_mask=0x%08x st_nattrib=%d\n",
+                logged_pipes, pr, pr->vi->attr_mask, st.nattrib);
+            for (int i = 0; i < 32; i++) {
+                if (!(pr->vi->attr_mask & (1u << i))) continue;
+                uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+                uint32_t fmt = a & 0xFF, off = a >> 13;
+                LOG("  [attr %2d] bind=%2d off=%4u fmt=0x%02x vk_fmt=%3u kind=%d stride=%3u div=%u\n",
+                    i, k.attr_bind[i], k.attr_off[i], fmt, k.attr_fmt[i],
+                    pr->vkey.attr_kind[i], k.stride[k.attr_bind[i]], k.divisor[k.attr_bind[i]]);
+                if (k.attr_bind[i] < 16 && st.vbuf[k.attr_bind[i]].addr) {
+                    uint64_t vaddr = st.vbuf[k.attr_bind[i]].addr;
+                    uint64_t vsz = st.vbuf[k.attr_bind[i]].size;
+                    const uint8_t *ptr = (const uint8_t *)(uintptr_t)(vaddr + off);
+                    LOG("    vbuf[%2d]: addr=0x%llx sz=%llu | data[0..15]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                        k.attr_bind[i], (unsigned long long)vaddr, (unsigned long long)vsz,
+                        ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
+                        ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
+                }
+            }
         }
         for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
             if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
@@ -6861,7 +6975,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!(pp->k.used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
-            static const float zero[4] = {0, 0, 0, 1};
+            static const uint32_t zero[4] = {0, 0, 0, 0};
             sp = vk_transient_copy(zero, 16, 16);
         } else {
             Range v = st.vbuf[s];
@@ -6902,7 +7016,8 @@ static void draw_(CmdRec *r, bool indexed) {
             if (!stride) need = 256;
             else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
-            if (v.size && need > v.size) need = v.size;
+            if (v.size && v.size <= (8u << 20)) need = v.size;
+            else if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
             else sp = guest_copy(v.addr, need ? need : 16);
         }
@@ -6953,7 +7068,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             st.blend[0][3], st.blend[0][4], st.blend[0][5], st.blend[0][6], st.blend_color[0], st.blend_color[1],
             st.blend_color[2], st.blend_color[3]);
     if (getenv("LARECOMP_DEBUG_TEXSTATE"))  // vertex attributes: guest format, stream, offset, stride
-        for (int i = 0; i < 16; i++)
+        for (int i = 0; i < 32; i++)
             if (pr->vi->attr_mask & (1u << i)) {
                 uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
                 uint32_t sn = (a >> 8) & 0x1F;
@@ -6968,15 +7083,16 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         for (int c = 0; c < 18; c++) {
             if (!((pr->vi->cbuf_mask >> c) & 1)) continue;
             Range r = c >= 3 ? st.ubuf[0][c - 3] : (Range){0, 0};
-            if (c == 1) r = (Range){st.program->stages[0].code_addr + st.program->stages[0].const_offset,
-                                  st.program->stages[0].const_size};
+            NvnShaderStage *vss_d = st_stage(0);
+            if (c == 1 && vss_d) r = (Range){vss_d->code_addr + vss_d->const_offset,
+                                  vss_d->const_size};
             if (!r.addr) continue;
             const float *u = (const float *)(uintptr_t)r.addr;
             LOG("[draw]   vcb%d %llx size %u:", c, (unsigned long long)r.addr, (unsigned)r.size);
             for (int k = 0; k < (full ? 16384 : 160) && k * 4 < (int)r.size; k++) LOG(" %.9g", u[k]);
             LOG("\n");
         }
-        for (int i = 0; full && i < 16 && i < st.nattrib; i++) {  // integer attributes (bone indices): their range
+        for (int i = 0; full && i < 32 && i < st.nattrib; i++) {  // integer attributes (bone indices): their range
             uint32_t a = st.attrib[i], f = a & 0xFF, sn = (a >> 8) & 0x1F, n = f == 0x27 ? 4 : f == 0x0F ? 2 : f == 0x03 ? 1 : 0;
             if (!(pr->vi->attr_mask & (1u << i)) || sn >= 16 || sn >= (uint32_t)st.nstream || !st.vbuf[sn].addr) continue;
             uint64_t stride = st.stream[sn][0], nv = stride ? st.vbuf[sn].size / stride : 0;
@@ -7025,8 +7141,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         for (int c = 0; c < 18; c++) {
             if (!((pr->fi->cbuf_mask >> c) & 1)) continue;
             Range r = c >= 3 ? st.ubuf[1][c - 3] : (Range){0, 0};  // (hardware bank c: ubuf[c - 3]; 1: the shader's own)
-            if (c == 1) r = (Range){st.program->stages[1].code_addr + st.program->stages[1].const_offset,
-                                  st.program->stages[1].const_size};
+            NvnShaderStage *fss_d = st_stage(1);
+            if (c == 1 && fss_d) r = (Range){fss_d->code_addr + fss_d->const_offset,
+                                  fss_d->const_size};
             if (!r.addr) continue;
             const float *u = (const float *)(uintptr_t)r.addr;
             LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)r.addr, (unsigned)r.size);
@@ -7700,6 +7817,12 @@ static void scene_upscale(Prog *pr, CmdRec *r) {
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
+    static int p_log = 0;
+    if (p_log++ < 10 || p_log % 300 == 0) {
+        LOG("[vk-present] draw: b=%p img=%p asp=%x size=%.0fx%.0f viewport=(%.0f,%.0f,%.0f,%.0f)\n",
+            (void *)b, b ? (void *)b->image : 0, b ? b->aspect : 0, b ? (float)b->width : 0, b ? (float)b->height : 0,
+            vx, vy, vw, vh);
+    }
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
     VkPipeline p = present_pipeline(g_vk.sc_format);
@@ -7712,11 +7835,15 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
     VkViewport vp = {vx, vy, vw, vh, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &vp);
+    VkRect2D sc = {{(int32_t)vx, (int32_t)vy}, {(uint32_t)vw, (uint32_t)vh}};
+    vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
     ss.known &= ~SS_SETS;  // (another layout: the draws' sets are bound again)
     vkCmdDraw(cb, 3, 1, 0, 0);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
+    VkRect2D full_sc = {{0, 0}, g_vk.sc_extent};
+    vkCmdSetScissor(cb, 0, 1, &full_sc);
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
@@ -7836,8 +7963,10 @@ static void split_long_pass(void) {
     static long split = -1;
     if (split < 0) {  // (3 ms by default; not on Qualcomm's driver, as LARECOMP_VK_CHUNK_US)
         extern bool vk_driver_is_qualcomm(void);
+        extern bool vk_driver_is_turnip(void);
         const char *e = getenv("LARECOMP_VK_SPLIT_US");
-        split = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : 3000;
+        bool is_adreno = vk_driver_is_qualcomm() || vk_driver_is_turnip();
+        split = e ? atol(e) : is_adreno ? 0 : 3000;
     }
     extern bool vk_async_on(void);
     static unsigned n;  // (the clock every 32 draws: a clock read per draw showed up in the profile)
@@ -7868,7 +7997,21 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
             break;
         }
-        case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
+        case CMD_BIND_PROGRAM: {
+            NvnProgram *np = (NvnProgram *)(uintptr_t)r->x[0];
+            uint32_t stages = (uint32_t)r->x[1];
+            if (np && !stages) stages = np->stage_mask;
+            if (!stages) stages = 0x3F;
+            for (int s = 0; s < 6; s++) {
+                if (stages & (1u << s)) {
+                    if (!np || (np->stage_mask & (1u << s))) {
+                        st.programs[s] = np;
+                    }
+                }
+            }
+            if (np) st.program = np;
+            break;
+        }
         case CMD_BIND_BLEND: { uint8_t *b = x; pipeline_dirty |= memcmp(st.blend[b[0] & 7], b, 8) != 0; memcpy(st.blend[b[0] & 7], b, 8); break; }
         case CMD_BIND_CHANNEL_MASK: pipeline_dirty |= memcmp(&st.channel_mask, x, 4) != 0; memcpy(&st.channel_mask, x, 4); break;
         case CMD_BIND_COLOR: pipeline_dirty |= memcmp(st.color_state, x, 4) != 0; memcpy(st.color_state, x, 4); break;
@@ -7876,10 +8019,11 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_MULTISAMPLE: pipeline_dirty |= st.ms[0xC] != ((uint8_t *)x)[0xC]; memcpy(st.ms, x, 0x18); break;
         case CMD_BIND_POLYGON: pipeline_dirty |= st.poly[2] != ((uint8_t *)x)[2]; memcpy(st.poly, x, 4); break;
         case CMD_BIND_VERTEX_ATTRIB: {
-            int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
+            int n = (int)r->x[0] > 32 ? 32 : (int)r->x[0];
             pipeline_dirty |= n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0;
             st.nattrib = n;
             memcpy(st.attrib, x, n * 4);
+            if (n < 32) memset(st.attrib + n, 0, (32 - n) * 4);
             break;
         }
         case CMD_BIND_VERTEX_STREAM: {
@@ -7923,15 +8067,25 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
             for (int i = 0; i < st.rt.ncolor; i++) {
                 st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
-                st.rt.cview[i] = rt->views[i];
                 st.rt.has_cview[i] = rt->has_view[i];
+                if (st.rt.has_cview[i]) st.rt.cview[i] = rt->views[i];
+                else memset(&st.rt.cview[i], 0, sizeof st.rt.cview[i]);
             }
             st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
-            st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
+            if (st.rt.has_dview) st.rt.dview = rt->dview;
+            else memset(&st.rt.dview, 0, sizeof st.rt.dview);
             static int always = -1;
             if (always < 0) always = getenv("LARECOMP_VK_PASS_RESTART") != NULL;
-            if (always || memcmp(&prev, &st.rt, sizeof prev)) {
+            bool changed = prev.ncolor != st.rt.ncolor || prev.depth != st.rt.depth || prev.has_dview != st.rt.has_dview;
+            if (!changed && st.rt.has_dview) changed = memcmp(&prev.dview, &st.rt.dview, sizeof prev.dview) != 0;
+            if (!changed) {
+                for (int i = 0; i < st.rt.ncolor; i++) {
+                    if (prev.color[i] != st.rt.color[i] || prev.has_cview[i] != st.rt.has_cview[i]) { changed = true; break; }
+                    if (st.rt.has_cview[i] && memcmp(&prev.cview[i], &st.rt.cview[i], sizeof prev.cview[i]) != 0) { changed = true; break; }
+                }
+            }
+            if (always || changed) {
                 st.rt_dirty = true;
                 snapshots_flush_fb_dirty("rt-change");
             }

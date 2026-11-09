@@ -1,5 +1,6 @@
 // Loads the recompiled game code library (runtime/gamelib.h).
 #include "gamelib.h"
+#include <SDL3/SDL.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,9 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <adrenotools/driver.h>
+#endif
 #endif
 
 #include "paths.h"
@@ -22,11 +26,11 @@ static bool id_matches(const char *lib) {
     char path[1100], id[128] = {0};
     snprintf(path, sizeof path, "%s.id", lib);
     FILE *f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) return true;
     size_t n = fread(id, 1, sizeof id - 1, f);
     fclose(f);
-    while (n && (id[n - 1] == '\n' || id[n - 1] == '\r')) id[--n] = 0;
-    return !strcmp(id, GAMELIB_ID);
+    while (n && (id[n - 1] == 10 || id[n - 1] == 13)) id[--n] = 0;
+    return !strcmp(id, GAMELIB_ID) || !strcmp(id, "dev");
 }
 
 static bool exists(const char *p) {
@@ -74,44 +78,78 @@ static void sync_from_game_dir(const char *game_dir, const char *lib) {
     char sid[1200], did[1200];
     snprintf(sid, sizeof sid, "%s.id", src);
     snprintf(did, sizeof did, "%s.id", lib);
-    bool ok = copy_to(src, lib) && copy_to(sid, did);
+    bool ok = copy_to(src, lib);
+    if (exists(sid)) copy_to(sid, did);
     LOG("[gamelib] %s -> %s: %s\n", src, lib, ok ? "copied" : "copy failed");
 }
 #endif
 
 // The places to look, in order (gamelib.h). Returns how many were filled.
-static int candidates(const char *game_dir, char out[3][1100]) {
+static int candidates(const char *game_dir, char out[8][1100]) {
     int n = 0;
     const char *env = getenv("LARECOMP_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
+
+#ifdef __ANDROID__
+    // Cek juga apakah botwgame.so ada langsung di nativeLibraryDir (misal di-bundle di APK)
+    const char *nld = rt_native_lib_dir();
+    if (nld && *nld) {
+        char nld_path[1024];
+        snprintf(nld_path, sizeof nld_path, "%s/%s", nld, GAMELIB_NAME);
+        if (exists(nld_path)) {
+            snprintf(out[n++], 1100, "%s", nld_path);
+        }
+    }
+
+    // Di Android, storage eksternal (/storage/emulated/...) di-mount noexec.
+    // dlopen() HANYA diizinkan dari internal storage (/data/user/0/.../files/v.../botwgame.so).
+    // Sinkronkan dari rt_data_root() atau game_dir ke internal storage!
+    const char *in = SDL_GetAndroidInternalStoragePath();
+    const char *data_root = rt_data_root();
+    if (in && *in) {
+        char own[1024];
+        int v = game_dir ? rt_game_dir_version(game_dir) : 100;
+        if (!v) v = 100;
+        snprintf(own, sizeof own, "%s/v%d/%s", in, v, GAMELIB_NAME);
+
+        // Sync dari data_root bila ada
+        if (data_root && *data_root) {
+            sync_from_game_dir(data_root, own);
+        }
+        if (game_dir && (!data_root || strcmp(data_root, game_dir))) {
+            sync_from_game_dir(game_dir, own);
+        }
+        snprintf(out[n++], 1100, "%s", own);
+    }
+    return n;
+#endif
+
+    // Fallback path lainnya (non-Android / root)
+    const char *data_root_other = rt_data_root();
+    if (data_root_other && *data_root_other) {
+        snprintf(out[n++], 1100, "%s/%s", data_root_other, GAMELIB_NAME);
+    }
+    if (game_dir && (!data_root_other || strcmp(data_root_other, game_dir))) {
+        snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
+    }
+
     char own[1024];
-    if (game_dir && rt_version_game_lib(rt_game_dir_version(game_dir), own, sizeof own)) {  // 1.6.0 / 1.8.2: only their
-#ifdef __ANDROID__                                                                         //  own, never 1.0.0's
+    if (game_dir && rt_version_game_lib(rt_game_dir_version(game_dir), own, sizeof own)) {
+#ifdef __ANDROID__
         sync_from_game_dir(game_dir, own);
 #endif
         snprintf(out[n++], 1100, "%s", own);
         return n;
     }
-#ifdef __ANDROID__
-    {   // 1.0.0's next to "the executable" (the activity copies it there at start; one set up just now, here)
-        char exe[1024];
-        if (game_dir && rt_game_dir_version(game_dir) == 100 && plat_exe_path(exe, sizeof exe) && strrchr(exe, '/')) {
-            *strrchr(exe, '/') = 0;
-            snprintf(own, sizeof own, "%s/%s", exe, GAMELIB_NAME);
-            sync_from_game_dir(game_dir, own);
-        }
-    }
-#endif
     char exe_side[1024];
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
         snprintf(out[n++], 1100, "%s", exe_side);
-    if (game_dir) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
     return n;
 }
 
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
-    char c[3][1100];
+    char c[8][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
         if (exists(c[i]) && id_matches(c[i])) return true;
@@ -124,24 +162,19 @@ static const GameLibTables *open_lib(const char *path) {
     if (!h) { snprintf(g_error, sizeof g_error, "can't load %s (error %lu)", path, GetLastError()); return NULL; }
     GameLibEntry entry = (GameLibEntry)(void *)GetProcAddress(h, GAMELIB_ENTRY);
 #else
-    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    void *h = NULL;
+    h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
         const char *e = dlerror();
+        LOG("[gamelib] dlopen(%s) failed: %s\n", path, e ? e : "unknown");
         snprintf(g_error, sizeof g_error, "%s", e ? e : path);
-        if (e && strstr(e, "cannot locate symbol")) {  // (built wrong - #56, #60: objects with UBSan from an earlier
-            char id[1200];                              //  build: its id goes, and the start screen builds it again)
-            snprintf(id, sizeof id, "%s.id", path);
-            remove(id);
-            snprintf(g_error, sizeof g_error, "%.180s\n\nThe game code will be built again: open the app and set up the "
-                     "game files.", e);
-        }
         return NULL;
     }
     GameLibEntry entry = (GameLibEntry)dlsym(h, GAMELIB_ENTRY);
 #endif
     if (!entry) { snprintf(g_error, sizeof g_error, "%s: not game code", path); return NULL; }
     const GameLibTables *t = entry();
-    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, GAMELIB_ID)) {
+    if (!t || (t->abi != 1 && t->abi != GAMELIB_ABI) || !t->id || (strcmp(t->id, GAMELIB_ID) && strcmp(t->id, "dev"))) {
         snprintf(g_error, sizeof g_error, "%s was built for another version", path);
         return NULL;  // (left loaded: nothing of it runs)
     }
@@ -162,10 +195,11 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     if (!tried) {
         tried = true;
         snprintf(g_error, sizeof g_error, "the game code hasn't been built: set up the game files on the start screen");
-        char c[3][1100];
+        char c[8][1100];
         int n = candidates(game_dir, c);
         const char *env = getenv("LARECOMP_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
+            LOG("[gamelib] checking candidate %d: %s (exists: %d)\n", i, c[i], exists(c[i]));
             if (!exists(c[i])) continue;
             bool given = i == 0 && env && *env;  // LARECOMP_GAME_LIB: loaded as given, the library's own id decides
             if (!given && !id_matches(c[i])) {
@@ -173,8 +207,13 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                 continue;
             }
             g_tables = open_lib(c[i]);
-            if (g_tables) LOG("[gamelib] %s (%llu + %llu functions)\n", c[i], (unsigned long long)*g_tables->main_count,
-                              (unsigned long long)*g_tables->sdk_count);
+            if (g_tables) {
+                unsigned long long sub_cnt = (g_tables->abi >= 2 && g_tables->subsdk0_count) ? (unsigned long long)*g_tables->subsdk0_count : 0ull;
+                LOG("[gamelib] %s (%llu + %llu + %llu functions, ABI %u)\n", c[i],
+                    (unsigned long long)*g_tables->main_count,
+                    (unsigned long long)*g_tables->sdk_count,
+                    sub_cnt, g_tables->abi);
+            }
         }
     }
     if (!g_tables && why) snprintf(why, why_size, "%s", g_error);

@@ -35,7 +35,11 @@ static void module_init(Cpu *c, Module *m) {
     else run_array(c, m->init_array, m->init_array_sz);
 }
 
-static void rtld_init_sdk(Cpu *c) { module_init(c, &g_modules[1]); }
+static void rtld_init_subsdk0(Cpu *c) { if (g_nmodules > 1) module_init(c, &g_modules[1]); }
+static void rtld_init_sdk(Cpu *c) {
+    if (g_nmodules > 2) module_init(c, &g_modules[2]);
+    if (g_nmodules > 1) module_init(c, &g_modules[1]);
+}
 static void rtld_init_main(Cpu *c) { module_init(c, &g_modules[0]); }
 
 // Newer SDKs (BOTW 1.8.2's) also take x4, called if nnMain returns, before nninitFinalizeSdkModule and nnosQuickExit:
@@ -57,6 +61,7 @@ static void call_sym(Cpu *c, const char *name, bool required) {
         return;
     }
     LOG("[boot] %s\n", name);
+    LOG("[BUILD_TRACE] Build: %s %s, Profile: Ryza-Turnip-Diagnostics\n", __DATE__, __TIME__);
     guest_call(c, a);
 }
 
@@ -195,12 +200,33 @@ static void boot(const char *root) {
 
     char why[512];
     native_begin_boot();  // (Native game code: the game's own code runs, no botwgame.so - runtime/native.c)
-    if (!native_on() && !gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
-    loader_load(exefs);
+
+    // Inisialisasi execution mode (0: Native EL0, 1: Recomp C only, 2: Hybrid)
+    extern int g_exec_mode;
     { extern void settings_load(void); settings_load(); }
+    const char *em_env = getenv("LARECOMP_EXEC_MODE");
+    if (em_env) g_exec_mode = atoi(em_env);
+
+    bool lib_ok = gamelib_load(root, why, sizeof why);
+    if (!lib_ok) {
+        if (g_exec_mode == EXEC_RECOMP) {
+            FATAL("[RECOMP STRICT] Cannot start game: C Recompilation mode is selected but botwgame.so failed to load (%s). Fallback to Native EL0 is strictly forbidden.\n", why);
+        }
+        if (!native_on()) FATAL("%s\n", why);
+        LOG("[boot] gamelib not loaded (%s), running purely native EL0\n", why);
+    } else {
+        LOG("[boot] gamelib loaded (mode: %s)\n",
+            g_exec_mode == 1 ? "Recomp C only" : g_exec_mode == 2 ? "Hybrid" : "Native EL0 (with Recomp available)");
+    }
+
+    loader_load(exefs);
     kernel_init();
-    if (!native_on()) dispatch_init();
-    native_prepare();
+    if (lib_ok) {
+        dispatch_init();
+    }
+    if (g_exec_mode != EXEC_RECOMP) {
+        native_prepare();
+    }
 
     uint32_t stack_size = 0x100000;
     int prio = 44;

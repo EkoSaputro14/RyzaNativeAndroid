@@ -39,11 +39,15 @@ extern char native_svc_gate[], native_hle_gate[];
 // Chosen per boot (main.c boot): the setting (Native game code), or LARECOMP_NATIVE=0/1 over it
 static bool g_on;
 bool native_wanted(void) {
+    if (g_exec_mode == EXEC_RECOMP) return false;
     const char *e = getenv("LARECOMP_NATIVE");
     return e ? atoi(e) != 0 : g_settings.native_code;
 }
 void native_begin_boot(void) { g_on = native_wanted(); }
-bool native_on(void) { return g_on; }
+bool native_on(void) {
+    if (g_exec_mode == EXEC_RECOMP) return false;
+    return g_on;
+}
 
 static uint64_t tp_now(void) { uint64_t v; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v)); return v; }
 static unsigned tab_idx(uint64_t tp) { return (unsigned)(((tp ^ (tp >> 12)) >> 12) & 4095); }
@@ -86,10 +90,16 @@ void native_call(Cpu *c, uint64_t addr) {
 }
 
 // ---- the gates' C side (on the host stack; c holds the guest's registers)
-void native_svc_c(Cpu *c, uint32_t imm) { rt_svc(c, imm, c->x[30]); }
+void native_svc_c(Cpu *c, uint32_t imm) {
+    extern uint64_t g_forensic_svc_calls;
+    g_forensic_svc_calls++;
+    rt_svc(c, imm, c->x[30]);
+}
 
 HostFn hle_slot_fn(uint64_t pc);  // dispatch.c
 void native_hle_c(Cpu *c, uint32_t i) {
+    extern uint64_t g_forensic_hle_calls;
+    g_forensic_hle_calls++;
     rt_unwind_point();
     HostFn f = hle_slot_fn(HLE_BASE + 16ull * i);
     f(c);
@@ -249,7 +259,7 @@ static void prepare_module(Module *m) {
             nsites++;
     }
     bool is_main = m->base == MAIN_BASE;
-    uint64_t nfix = sizeof fixes / sizeof *fixes;
+    uint64_t nfix = 0; // Zelda-specific fixes disabled for Atelier Ryza
     uint64_t area = (m->base + m->size + 0xFFFF) & ~0xFFFFull, asize = (nsites * 80 + nfix * 128 + 0x3FFF) & ~0x3FFFull;
     if (!asize) asize = 0x4000;
     plat_commit(area, asize);

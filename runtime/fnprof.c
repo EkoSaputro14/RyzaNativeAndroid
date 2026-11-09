@@ -10,7 +10,7 @@
 #include "platform.h"
 #include "rt.h"
 
-volatile int g_fnprof;
+__attribute__((visibility("default"))) volatile int g_fnprof;
 
 #define NSLOT (1 << 18)
 static struct { _Atomic uint64_t addr; _Atomic uint64_t count; } slots[NSLOT];
@@ -46,7 +46,7 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
 }
 
 // (g_fnprof bit 0: profiling; bit 1: a thread of core 0 was preempted - runtime/kernel.c)
-void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
+__attribute__((visibility("default"))) void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
 #ifdef __ANDROID__
     if (g_fnprof & 2) { extern void kernel_preempt_point(void); kernel_preempt_point(); }
 #endif
@@ -90,6 +90,53 @@ static void fnprof_write(long from, long to) {
 }
 
 void fnprof_frame(uint64_t frame) {
+    // Benchmark & telemetry CPU execution mode telemetry
+    extern int g_exec_mode;
+    extern uint64_t g_bench_native_calls, g_bench_recomp_calls;
+    extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
+    extern uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache_misses;
+    extern uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
+    extern uint64_t g_forensic_dispatch_overhead_ns;
+    void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws);
+
+    if (frame > 0 && frame % 120 == 0) {
+        double cpu_exec_ms = 0, gpu_ms = 0;
+        uint64_t draws = 0;
+        vk_get_forensic_stats(&cpu_exec_ms, &gpu_ms, &draws);
+
+        double nat_avg_us = g_bench_native_calls ? (double)g_bench_native_ns / (double)g_bench_native_calls / 1000.0 : 0.0;
+        double rec_avg_us = g_bench_recomp_calls ? (double)g_bench_recomp_ns / (double)g_bench_recomp_calls / 1000.0 : 0.0;
+        double rec_total_ms = (double)g_bench_recomp_ns / 1e6;
+        double nat_total_ms = (double)g_bench_native_ns / 1e6;
+
+        uint64_t total_dcache = g_forensic_dcache_hits + g_forensic_dcache_misses;
+        double hit_rate = total_dcache ? ((double)g_forensic_dcache_hits * 100.0 / (double)total_dcache) : 100.0;
+
+        LOG("\n=================== [FORENSIC AUDIT TELEMETRY] ===================\n");
+        LOG("[FORENSIC] Frame: %llu | Active Execution Mode: %s (g_exec_mode=%d)\n",
+            (unsigned long long)frame,
+            g_exec_mode == 1 ? "RECOMP C ONLY" : g_exec_mode == 2 ? "HYBRID (RECOMP+FALLBACK)" : "NATIVE EL0",
+            g_exec_mode);
+        LOG("[FORENSIC] Execution Paths:\n");
+        LOG("[FORENSIC]   - Native EL0 calls          : %llu (Total: %.2f ms, avg %.2f us)\n",
+            (unsigned long long)g_bench_native_calls, nat_total_ms, nat_avg_us);
+        LOG("[FORENSIC]   - Recomp C guest calls      : %llu (Total: %.2f ms, avg %.2f us)\n",
+            (unsigned long long)g_bench_recomp_calls, rec_total_ms, rec_avg_us);
+        LOG("[FORENSIC]   - Fallbacks Recomp->Native  : %llu\n", (unsigned long long)g_forensic_fallbacks);
+        LOG("[FORENSIC]   - Recomp Indirect Dispatches: %llu (Cache Hits: %llu [%.1f%%], Misses: %llu)\n",
+            (unsigned long long)g_forensic_dispatches,
+            (unsigned long long)g_forensic_dcache_hits, hit_rate,
+            (unsigned long long)g_forensic_dcache_misses);
+        LOG("[FORENSIC]   - HLE / Host calls          : %llu\n", (unsigned long long)g_forensic_hle_calls);
+        LOG("[FORENSIC]   - Guest SVC (Syscall) calls : %llu\n", (unsigned long long)g_forensic_svc_calls);
+        LOG("[FORENSIC] Performance Bottleneck Breakdown (Last Period):\n");
+        LOG("[FORENSIC]   - Guest Game Logic (CPU)    : %.2f ms\n", g_exec_mode == 0 ? nat_total_ms : rec_total_ms);
+        LOG("[FORENSIC]   - Dispatch Cache Quality    : %.1f%% hits (%llu misses)\n", hit_rate, (unsigned long long)g_forensic_dcache_misses);
+        LOG("[FORENSIC]   - Vulkan Backend (CPU exec) : %.2f ms (Draws: %llu)\n", cpu_exec_ms, (unsigned long long)draws);
+        LOG("[FORENSIC]   - GPU Hardware Time         : %.2f ms\n", gpu_ms);
+        LOG("==================================================================\n\n");
+    }
+
     static long from = -2, to, every;
     if (from == -2) {
         from = -1;
