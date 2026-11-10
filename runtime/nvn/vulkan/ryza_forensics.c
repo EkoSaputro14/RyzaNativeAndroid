@@ -4,7 +4,7 @@
 #include <string.h>
 #include <math.h>
 
-#define RYZA_GIT_COMMIT "798e4b5-p2"
+#define RYZA_GIT_COMMIT "d74432b-p2"
 #define RYZA_BUILD_TIMESTAMP __DATE__ " " __TIME__
 
 RyzaDrawForensic g_ryza_captured_draws[RYZA_MAX_CAPTURED_DRAWS] = {0};
