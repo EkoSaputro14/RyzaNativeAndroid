@@ -4,7 +4,7 @@
 #include <string.h>
 #include <math.h>
 
-#define RYZA_GIT_COMMIT "798e4b5-diag"
+#define RYZA_GIT_COMMIT "798e4b5-p2"
 #define RYZA_BUILD_TIMESTAMP __DATE__ " " __TIME__
 
 RyzaDrawForensic g_ryza_captured_draws[RYZA_MAX_CAPTURED_DRAWS] = {0};
@@ -12,6 +12,14 @@ uint32_t g_ryza_captured_draw_count = 0;
 uint64_t g_ryza_3d_draw_count = 0;
 
 static const char *s_body_parts[] = {
+    "Environment / Billboard",
+    "Environment / Small Prop",
+    "Environment / Water / Terrain",
+    "Environment / Grass / Foliage",
+    "Environment / Structure",
+    "Environment / Decal / Effect",
+    "Environment / Shadow Volume",
+    "Environment / Light Beam",
     "Ryza Boots / Lower Legs",
     "Ryza Thighs / Shorts",
     "Ryza Waist / Belt / Pouch",
@@ -20,8 +28,22 @@ static const char *s_body_parts[] = {
     "Ryza Hair / Head / Hat",
     "Ryza Staff / Weapon",
     "Companion / NPC Mesh",
-    "3D Skinned Prop",
-    "Static 3D Environment"
+    "Ryza Main Skinned Body",
+    "Ryza Skinned Torso",
+    "Ryza Skinned Hair",
+    "Ryza Skinned Cape/Coat",
+    "Ryza Skinned Thigh Highs",
+    "Ryza Skinned Face",
+    "Ryza Skinned Hands",
+    "Ryza Skinned Accessories",
+    "Companion Skinned Body",
+    "Companion Skinned Head",
+    "Enemy / Monster Skinned Mesh",
+    "NPC High-Poly Skinned Mesh",
+    "Bone Skinned Mesh #1",
+    "Bone Skinned Mesh #2",
+    "Bone Skinned Mesh #3",
+    "Bone Skinned Mesh #4"
 };
 
 const char *ryza_get_build_fingerprint(void) {
@@ -38,6 +60,40 @@ void ryza_forensics_init(void) {
     g_ryza_captured_draw_count = 0;
     g_ryza_3d_draw_count = 0;
     memset(g_ryza_captured_draws, 0, sizeof(g_ryza_captured_draws));
+}
+
+RyzaDrawForensic *ryza_allocate_capture_slot(uint32_t icount, uint32_t attr_mask, bool has_bones) {
+    static uint32_t s_idx_small = 0;      // 0..7: small objects (icount < 300)
+    static uint32_t s_idx_med = 8;        // 8..15: medium meshes (300 <= icount < 1000)
+    static uint32_t s_idx_large = 16;     // 16..27: large character meshes (icount >= 1000)
+    static uint32_t s_idx_bones = 28;     // 28..31: meshes with bone attributes
+
+    uint32_t slot = 0;
+    if (has_bones) {
+        slot = s_idx_bones++;
+        if (s_idx_bones > 31) s_idx_bones = 28;
+    } else if (icount >= 1000) {
+        slot = s_idx_large++;
+        if (s_idx_large > 27) s_idx_large = 16;
+    } else if (icount >= 300) {
+        slot = s_idx_med++;
+        if (s_idx_med > 15) s_idx_med = 8;
+    } else {
+        slot = s_idx_small++;
+        if (s_idx_small > 7) s_idx_small = 0;
+    }
+
+    RyzaDrawForensic *d = &g_ryza_captured_draws[slot];
+    memset(d, 0, sizeof(*d));
+    d->is_valid = true;
+
+    snprintf(d->body_part, sizeof(d->body_part), "%s", s_body_parts[slot]);
+
+    if (slot >= g_ryza_captured_draw_count) {
+        g_ryza_captured_draw_count = slot + 1;
+    }
+    g_ryza_3d_draw_count++;
+    return d;
 }
 
 void ryza_export_diagnostic_log(void) {
@@ -61,8 +117,10 @@ void ryza_export_diagnostic_log(void) {
     fprintf(f, "Total 3D Draws Captured: %u\n", g_ryza_captured_draw_count);
     fprintf(f, "=======================================================\n\n");
 
-    for (uint32_t i = 0; i < g_ryza_captured_draw_count; i++) {
+    for (uint32_t i = 0; i < RYZA_MAX_CAPTURED_DRAWS; i++) {
         RyzaDrawForensic *d = &g_ryza_captured_draws[i];
+        if (!d->is_valid) continue;
+
         fprintf(f, "--- [DRAW #%u: %s] ---\n", i, d->body_part);
         fprintf(f, "  Frame: %llu | DrawIdx: %u | VS: 0x%llx | FS: 0x%llx (Hash: 0x%016llx)\n",
                 (unsigned long long)d->frame, d->draw_idx,
@@ -100,9 +158,35 @@ void ryza_export_diagnostic_log(void) {
                     vs->bone_indices[0], vs->bone_indices[1], vs->bone_indices[2], vs->bone_indices[3]);
             fprintf(f, "      BoneWeights: [%.4f, %.4f, %.4f, %.4f]\n",
                     vs->bone_weights[0], vs->bone_weights[1], vs->bone_weights[2], vs->bone_weights[3]);
+            fprintf(f, "      Raw Attr0: [%.4f, %.4f, %.4f, %.4f]\n",
+                    vs->attr_raw[0][0], vs->attr_raw[0][1], vs->attr_raw[0][2], vs->attr_raw[0][3]);
+            fprintf(f, "      Raw Attr1: [%.4f, %.4f, %.4f, %.4f]\n",
+                    vs->attr_raw[1][0], vs->attr_raw[1][1], vs->attr_raw[1][2], vs->attr_raw[1][3]);
+            fprintf(f, "      Raw Attr2: [%.4f, %.4f, %.4f, %.4f]\n",
+                    vs->attr_raw[2][0], vs->attr_raw[2][1], vs->attr_raw[2][2], vs->attr_raw[2][3]);
+            fprintf(f, "      Raw Attr3: [%.4f, %.4f, %.4f, %.4f]\n",
+                    vs->attr_raw[3][0], vs->attr_raw[3][1], vs->attr_raw[3][2], vs->attr_raw[3][3]);
             fprintf(f, "      ClipSpace:   [X=%.4f, Y=%.4f, Z=%.4f, W=%.4f] (X/W=%.4f)\n",
                     vs->clip_pos[0], vs->clip_pos[1], vs->clip_pos[2], vs->clip_pos[3],
                     vs->clip_pos[3] != 0.0f ? vs->clip_pos[0] / vs->clip_pos[3] : 999999.0f);
+        }
+
+        if (d->vs_glsl[0]) {
+            fprintf(f, "  Vertex Shader GLSL Snippet:\n");
+            // Cetak baris per baris hingga 40 baris pertama
+            const char *cur = d->vs_glsl;
+            int line_count = 0;
+            while (*cur && line_count < 40) {
+                const char *next = strchr(cur, '\n');
+                if (next) {
+                    fprintf(f, "    %.*s\n", (int)(next - cur), cur);
+                    cur = next + 1;
+                } else {
+                    fprintf(f, "    %s\n", cur);
+                    break;
+                }
+                line_count++;
+            }
         }
 
         fprintf(f, "  Rasterization/Depth:\n");
@@ -111,55 +195,4 @@ void ryza_export_diagnostic_log(void) {
     }
 
     fclose(f);
-}
-
-void ryza_capture_draw_state(uint64_t frame, uint32_t draw_idx, uint64_t vs_code, uint64_t fs_code,
-                             uint64_t fs_hash, uint32_t attr_mask, uint32_t nattrib, uint32_t nstream,
-                             bool indexed, uint32_t icount, uint32_t itype, uint64_t iaddr,
-                             int32_t base_vertex) {
-    // Saring hanya draw call 3D karakter (berkarakteristik: indexed, icount > 100, attr_mask memiliki > 3 atribut)
-    if (!indexed || icount < 100 || (attr_mask & 0xFFFFFFF8u) == 0) {
-        return;
-    }
-
-    g_ryza_3d_draw_count++;
-
-    // Simpan hingga RYZA_MAX_CAPTURED_DRAWS sampel
-    uint32_t slot = g_ryza_captured_draw_count % RYZA_MAX_CAPTURED_DRAWS;
-    RyzaDrawForensic *d = &g_ryza_captured_draws[slot];
-    memset(d, 0, sizeof(*d));
-
-    d->frame = frame;
-    d->draw_idx = draw_idx;
-    d->vs_code = vs_code;
-    d->fs_code = fs_code;
-    d->fs_hash = fs_hash;
-    d->attr_mask = attr_mask;
-    d->nattrib = nattrib;
-    d->nstream = nstream;
-    d->itype = itype;
-    d->icount = icount;
-    d->iaddr = iaddr;
-    d->base_vertex = base_vertex;
-
-    // Tentukan label bagian tubuh berdasarkan urutan kemunculan draw call karakter
-    uint32_t part_idx = (g_ryza_captured_draw_count < 10) ? g_ryza_captured_draw_count : 9;
-    snprintf(d->body_part, sizeof(d->body_part), "%s", s_body_parts[part_idx]);
-
-    // Tandai valid
-    d->is_valid = true;
-    if (g_ryza_captured_draw_count < RYZA_MAX_CAPTURED_DRAWS) {
-        g_ryza_captured_draw_count++;
-    }
-
-    // Cetak secara berkala ke stderr (yang masuk ke botwrecomp-log.txt)
-    static uint64_t last_log_frame = 0;
-    if (frame != last_log_frame && (g_ryza_3d_draw_count <= 20 || (g_ryza_3d_draw_count % 300 == 0))) {
-        last_log_frame = frame;
-        fprintf(stderr, "[RYZA-FORENSIC] Frame %llu Draw #%u (%s): VS=0x%llx FS=0x%llx AttrMask=0x%08x ICount=%u Range=[%u, %u]\n",
-                (unsigned long long)frame, draw_idx, d->body_part,
-                (unsigned long long)vs_code, (unsigned long long)fs_code,
-                attr_mask, icount, d->min_idx, d->max_idx);
-        ryza_export_diagnostic_log();
-    }
 }

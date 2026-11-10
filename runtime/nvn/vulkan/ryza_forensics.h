@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-#define RYZA_MAX_CAPTURED_DRAWS 16
+#define RYZA_MAX_CAPTURED_DRAWS 32
 #define RYZA_MAX_ATTRS 32
 #define RYZA_MAX_SAMPLES_PER_DRAW 6
 
@@ -17,6 +17,7 @@ typedef struct {
     uint32_t bone_indices[4];
     float bone_weights[4];
     float clip_pos[4];
+    float attr_raw[8][4];
     bool w_valid;
     bool is_corrupted;
 } RyzaVertexSample;
@@ -58,6 +59,9 @@ typedef struct {
     uint32_t num_samples;
     RyzaVertexSample samples[RYZA_MAX_SAMPLES_PER_DRAW];
 
+    // Vertex shader source snippet
+    char vs_glsl[2048];
+
     // Bone matrices / constant buffer samples
     uint64_t cbuf1_addr;
     uint32_t cbuf1_size;
@@ -82,6 +86,7 @@ extern uint64_t g_ryza_3d_draw_count;
 
 const char *ryza_get_build_fingerprint(void);
 void ryza_forensics_init(void);
+RyzaDrawForensic *ryza_allocate_capture_slot(uint32_t icount, uint32_t attr_mask, bool has_bones);
 void ryza_capture_draw_state(uint64_t frame, uint32_t draw_idx, uint64_t vs_code, uint64_t fs_code,
                              uint64_t fs_hash, uint32_t attr_mask, uint32_t nattrib, uint32_t nstream,
                              bool indexed, uint32_t icount, uint32_t itype, uint64_t iaddr,

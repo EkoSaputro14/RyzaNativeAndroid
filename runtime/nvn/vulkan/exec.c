@@ -5332,15 +5332,17 @@ static bool vc_drop(VcEnt *e) {  // (freed once the submissions that may read it
 // stamps the pages it saw written with a new generation, and each user compares against the generation it last saw.
 static int pt_state = -1;  // 1: tracking, 0: none
 static bool pt_init(void) {
-    if (pt_state >= 0) return pt_state;
+    if (pt_state > 0) return true;
     uint64_t pg = VC_PAGE, one;
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
-    pt_state = n >= 0 && pg == VC_PAGE;
-    if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
-    vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
-    vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
-    vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
-    return true;
+    if (n >= 0 && pg == VC_PAGE) {
+        pt_state = 1;
+        if (!vc_page_gen) vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
+        if (!vc_page_gpu) vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
+        vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
+        return true;
+    }
+    return false;
 }
 
 // Texture upload checks (textures.c): may guest memory [addr, addr + size) have changed since generation `since`?
@@ -5398,13 +5400,9 @@ static void vc_mark_sbufs(int stage) {
 }
 
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
-    if (vc_on < 0) {
+    if (vc_on < 0 || !vc_on) {
         const char *e = getenv("LARECOMP_VK_VCACHE");
-        vc_on = !e || atoi(e) != 0;
-        if (vc_on && !pt_init()) {
-            LOG("[vk] vertex cache off: no page write tracking\n");
-            vc_on = 0;
-        }
+        vc_on = (!e || atoi(e) != 0) && pt_init();
     }
 #ifdef __ANDROID__
     bool cpu_fill = !gmem_buf && gcopy_mode;  // (Qualcomm's driver: filled from the CPU - vc_flush)
@@ -6995,17 +6993,24 @@ static void draw_(CmdRec *r, bool indexed) {
                 vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                 continue;
             }
+            uint64_t stride = pp->k.stride[s], need = 0;
             if (scan_src) {  // copying after all: the index scan bounds the copy
-                if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != (uint16_t)scan_restart) max_index = q[i]; }
-                else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != scan_restart) max_index = q[i]; }
-                max_index += 1;
-                if (base_vertex > 0) max_index += (uint32_t)base_vertex;
-                scan_src = NULL;
+                if (v.size && v.size <= 65536) {
+                    need = v.size;
+                    scan_src = NULL;
+                } else {
+                    if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != (uint16_t)scan_restart) max_index = q[i]; }
+                    else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != scan_restart) max_index = q[i]; }
+                    max_index += 1;
+                    if (base_vertex > 0) max_index += (uint32_t)base_vertex;
+                    scan_src = NULL;
+                }
             }
-            uint64_t stride = pp->k.stride[s], need;
-            if (!stride) need = 256;
-            else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
-            else need = (uint64_t)max_index * stride + 256;
+            if (!need) {
+                if (!stride) need = 256;
+                else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
+                else need = (uint64_t)max_index * stride + 256;
+            }
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
             else sp = guest_copy(v.addr, need ? need : 16);
@@ -7021,7 +7026,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else {
         vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
-        if (indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFF8u)) {
+        if (indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFFFu)) {
             ryza_forensic_inspect_draw(pr, r, true, count, icount, (uint32_t)r->x[1], r->x[3], base_vertex);
         }
     }
@@ -7046,24 +7051,45 @@ static void draw_(CmdRec *r, bool indexed) {
 }
 
 static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
-    if (!use_index || icount < 100 || !pr || !pr->vi || (pr->vi->attr_mask & 0xFFFFFFF8u) == 0) return;
+    if (!use_index || icount < 30 || !pr || !pr->vi) return;
 
-    ryza_capture_draw_state(renderer_present_count(), (uint32_t)stat_draws, (uint64_t)pr->code[0], (uint64_t)pr->code[1],
-                            (uint64_t)g_cur_fs_hash, pr->vi->attr_mask, st.nattrib, st.nstream,
-                            use_index, icount, itype, iaddr, base_vertex);
+    bool has_bones = false;
+    for (int i = 0; i < 32 && i < st.nattrib; i++) {
+        uint32_t fmt = st.attrib[i] & 0xFF;
+        if (fmt == 0x27 || fmt == 0x25 || fmt == 0x2A || fmt == 0x0F || fmt == 0x0D) has_bones = true;
+    }
 
-    uint32_t slot = (g_ryza_captured_draw_count > 0 ? g_ryza_captured_draw_count - 1 : 0) % RYZA_MAX_CAPTURED_DRAWS;
-    RyzaDrawForensic *d = &g_ryza_captured_draws[slot];
-    if (!d->is_valid) return;
+    RyzaDrawForensic *d = ryza_allocate_capture_slot(icount, pr->vi->attr_mask, has_bones);
+    if (!d) return;
 
+    d->frame = renderer_present_count();
+    d->draw_idx = (uint32_t)stat_draws;
+    d->vs_code = (uint64_t)pr->code[0];
+    d->fs_code = (uint64_t)pr->code[1];
+    d->fs_hash = (uint64_t)g_cur_fs_hash;
+    d->attr_mask = pr->vi->attr_mask;
+    d->nattrib = st.nattrib;
+    d->nstream = st.nstream;
+    d->itype = itype;
+    d->icount = icount;
+    d->iaddr = iaddr;
+    d->base_vertex = base_vertex;
+
+    if (pr->vi->msl) {
+        strncpy(d->vs_glsl, pr->vi->msl, sizeof(d->vs_glsl) - 1);
+        d->vs_glsl[sizeof(d->vs_glsl) - 1] = '\0';
+    }
+
+    int pos_attr = -1;
     for (int i = 0; i < 32 && i < st.nattrib; i++) {
         if (!(pr->vi->attr_mask & (1u << i))) continue;
         uint32_t a = st.attrib[i];
         uint32_t sn = (a >> 8) & 0x1F;
+        uint32_t fmt = a & 0xFF;
         d->attrs[i].stream = sn;
-        d->attrs[i].nvn_fmt = a & 0xFF;
-        d->attrs[i].vk_fmt = (uint8_t)vertex_format(a & 0xFF);
-        d->attrs[i].kind = (uint8_t)attr_kind(a & 0xFF);
+        d->attrs[i].nvn_fmt = fmt;
+        d->attrs[i].vk_fmt = (uint8_t)vertex_format(fmt);
+        d->attrs[i].kind = (uint8_t)attr_kind(fmt);
         d->attrs[i].off = a >> 13;
         d->attrs[i].stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
         if (sn < 16) {
@@ -7078,7 +7104,11 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 }
             }
         }
+        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21)) {
+            pos_attr = i;
+        }
     }
+    if (pos_attr < 0) pos_attr = (pr->vi->attr_mask & 2u) ? 1 : 0;
 
     d->cull_mode = (uint32_t)st.poly[0];
     d->front_face = (uint32_t)st.poly[1];
@@ -7116,38 +7146,35 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             RyzaVertexSample *vs = &d->samples[s];
             vs->vertex_idx = vidx;
 
-            if (st.nattrib > 0 && (pr->vi->attr_mask & 1u)) {
-                uint32_t sn = (st.attrib[0] >> 8) & 0x1F;
-                uint32_t off = st.attrib[0] >> 13;
-                uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
-                if (sn < 16 && st.vbuf[sn].addr && stride > 0) {
-                    uint64_t pos_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
-                    if (pos_addr + 12 <= st.vbuf[sn].addr + st.vbuf[sn].size) {
-                        const float *pf = (const float *)(uintptr_t)pos_addr;
-                        vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
-                    }
-                }
-            }
-
-            for (int a = 1; a < 32 && a < st.nattrib; a++) {
+            for (int a = 0; a < 8 && a < st.nattrib; a++) {
                 if (!(pr->vi->attr_mask & (1u << a))) continue;
-                uint32_t afmt = st.attrib[a] & 0xFF;
                 uint32_t sn = (st.attrib[a] >> 8) & 0x1F;
                 uint32_t off = st.attrib[a] >> 13;
                 uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
-                if (sn >= 16 || !st.vbuf[sn].addr || stride == 0) continue;
+                uint32_t afmt = st.attrib[a] & 0xFF;
+                if (sn < 16 && st.vbuf[sn].addr && stride > 0) {
+                    uint64_t attr_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
+                    if (attr_addr + 16 <= st.vbuf[sn].addr + st.vbuf[sn].size) {
+                        const float *pf = (const float *)(uintptr_t)attr_addr;
+                        for (int k = 0; k < 4; k++) vs->attr_raw[a][k] = pf[k];
 
-                uint64_t attr_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
-                if (attr_addr + 4 > st.vbuf[sn].addr + st.vbuf[sn].size) continue;
-
-                if (afmt == 0x27) { // R8G8B8A8_UINT bone indices
-                    const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
-                    vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
-                    vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                } else if (afmt == 0x25) { // R8G8B8A8_UNORM bone weights
-                    const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
-                    vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
-                    vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
+                        if (a == pos_attr) {
+                            vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                        }
+                        if (afmt == 0x27) { // R8G8B8A8_UINT bone indices
+                            const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
+                            vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                            vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                        } else if (afmt == 0x25) { // R8G8B8A8_UNORM bone weights
+                            const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
+                            vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
+                            vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
+                        } else if (afmt == 0x2A) { // R16G16B16A16_UNORM
+                            const uint16_t *w = (const uint16_t *)(uintptr_t)attr_addr;
+                            vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
+                            vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
+                        }
+                    }
                 }
             }
 
@@ -7156,8 +7183,15 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             vs->clip_pos[2] = vs->pos[2];
             vs->clip_pos[3] = 1.0f;
             vs->w_valid = (vs->clip_pos[3] > 0.0001f && !isnan(vs->clip_pos[3]) && !isinf(vs->clip_pos[3]));
-            vs->is_corrupted = (fabsf(vs->pos[0]) > 500.0f || vs->pos[0] > 1000.0f);
+            vs->is_corrupted = (fabsf(vs->pos[0]) > 50000.0f);
         }
+    }
+
+    static uint64_t last_log_frame = 0;
+    uint64_t cur_frame = renderer_present_count();
+    if (cur_frame != last_log_frame && (cur_frame % 60 == 0 || g_ryza_3d_draw_count <= 40)) {
+        last_log_frame = cur_frame;
+        ryza_export_diagnostic_log();
     }
 }
 

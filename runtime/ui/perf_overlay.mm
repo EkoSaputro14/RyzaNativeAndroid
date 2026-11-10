@@ -215,6 +215,9 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "BUILD: %s", ryza_get_build_fingerprint());
     ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "Ryza 3D Character Draws: %llu (Captured: %u)",
                        (unsigned long long)g_ryza_3d_draw_count, g_ryza_captured_draw_count);
+    if (ImGui::Button("Force Dump Log Now")) {
+        ryza_export_diagnostic_log();
+    }
 
     if (g_ryza_captured_draw_count > 0) {
         static int selected_draw = 0;
