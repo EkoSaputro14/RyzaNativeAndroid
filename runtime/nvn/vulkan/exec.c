@@ -23,6 +23,7 @@
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../../paths.h"
+#include "ryza_forensics.h"
 
 // LARECOMP_AB (vk_ab, below): AB() costs no call while it is not set - it is asked per constant buffer and per pass
 static int ab_n = -1;  // (LARECOMP_AB's frame count; 0: no A/B)
@@ -1514,7 +1515,7 @@ static struct {
     VkViewport vp;
     VkRect2D sc;
     VkBuffer ib; VkDeviceSize io; VkIndexType it;
-    VkBuffer vb[17]; VkDeviceSize vo[17];
+    VkBuffer vb[32]; VkDeviceSize vo[32];
     VkPipelineLayout layout; VkDescriptorSet sets[2];  // (SS_SETS: the graphics sets bound and their layout,
     uint32_t ndyn, dyn[64];                             // and their dynamic uniform buffer offsets)
 } ss;
@@ -6004,6 +6005,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 
 // ================================================================== draws
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed);
+static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex);
 
 // Quads / fans / polygons as a 32-bit triangle index list.
 static uint32_t *expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first, uint32_t *out_count) {
@@ -7017,7 +7019,12 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
     // ---- draw
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
-    else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    else {
+        vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+        if (indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFF8u)) {
+            ryza_forensic_inspect_draw(pr, r, true, count, icount, (uint32_t)r->x[1], r->x[3], base_vertex);
+        }
+    }
     if (g_debug_frame) pick_after_draw();
     pass_written |= draw_w;
     stat_draws++;
@@ -7035,6 +7042,122 @@ static void draw_(CmdRec *r, bool indexed) {
             gp_mark(cb, "draw vs %llx fs %llx n %u inst %u%s", (unsigned long long)pr->code[0], (unsigned long long)pr->code[1],
                     use_index ? icount : count, inst, use_index ? " idx" : "");
 #endif
+    }
+}
+
+static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
+    if (!use_index || icount < 100 || !pr || !pr->vi || (pr->vi->attr_mask & 0xFFFFFFF8u) == 0) return;
+
+    ryza_capture_draw_state(renderer_present_count(), (uint32_t)stat_draws, (uint64_t)pr->code[0], (uint64_t)pr->code[1],
+                            (uint64_t)g_cur_fs_hash, pr->vi->attr_mask, st.nattrib, st.nstream,
+                            use_index, icount, itype, iaddr, base_vertex);
+
+    uint32_t slot = (g_ryza_captured_draw_count > 0 ? g_ryza_captured_draw_count - 1 : 0) % RYZA_MAX_CAPTURED_DRAWS;
+    RyzaDrawForensic *d = &g_ryza_captured_draws[slot];
+    if (!d->is_valid) return;
+
+    for (int i = 0; i < 32 && i < st.nattrib; i++) {
+        if (!(pr->vi->attr_mask & (1u << i))) continue;
+        uint32_t a = st.attrib[i];
+        uint32_t sn = (a >> 8) & 0x1F;
+        d->attrs[i].stream = sn;
+        d->attrs[i].nvn_fmt = a & 0xFF;
+        d->attrs[i].vk_fmt = (uint8_t)vertex_format(a & 0xFF);
+        d->attrs[i].kind = (uint8_t)attr_kind(a & 0xFF);
+        d->attrs[i].off = a >> 13;
+        d->attrs[i].stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
+        if (sn < 16) {
+            d->attrs[i].buf_addr = st.vbuf[sn].addr;
+            d->attrs[i].buf_size = st.vbuf[sn].size;
+            if (st.vbuf[sn].addr && st.vbuf[sn].size >= d->attrs[i].off + 16) {
+                const uint32_t *raw = (const uint32_t *)(uintptr_t)(st.vbuf[sn].addr + d->attrs[i].off);
+                const float *flt = (const float *)raw;
+                for (int k = 0; k < 4; k++) {
+                    d->attrs[i].raw_data[k] = raw[k];
+                    d->attrs[i].float_data[k] = flt[k];
+                }
+            }
+        }
+    }
+
+    d->cull_mode = (uint32_t)st.poly[0];
+    d->front_face = (uint32_t)st.poly[1];
+    d->depth_test = (uint32_t)st.ds[0];
+    d->depth_write = (uint32_t)st.ds[1];
+    d->depth_compare_op = (uint32_t)st.ds[2];
+
+    const void *isrc = (const void *)(uintptr_t)iaddr;
+    if (isrc) {
+        uint32_t isz = itype == 1 ? 2 : 4;
+        uint32_t min_idx = 0xFFFFFFFFu, max_idx = 0;
+        for (uint32_t i = 0; i < icount && i < 16; i++) {
+            uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
+            d->raw_indices[i] = val;
+        }
+        for (uint32_t i = 0; i < icount; i++) {
+            uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
+            if (val < min_idx) min_idx = val;
+            if (val > max_idx) max_idx = val;
+        }
+        d->min_idx = min_idx;
+        d->max_idx = max_idx;
+
+        uint32_t sample_indices[6];
+        sample_indices[0] = min_idx;
+        sample_indices[1] = (min_idx + max_idx) / 2;
+        sample_indices[2] = max_idx;
+        sample_indices[3] = d->raw_indices[0];
+        sample_indices[4] = d->raw_indices[1 < icount ? 1 : 0];
+        sample_indices[5] = d->raw_indices[2 < icount ? 2 : 0];
+
+        d->num_samples = 6;
+        for (uint32_t s = 0; s < 6; s++) {
+            uint32_t vidx = sample_indices[s];
+            RyzaVertexSample *vs = &d->samples[s];
+            vs->vertex_idx = vidx;
+
+            if (st.nattrib > 0 && (pr->vi->attr_mask & 1u)) {
+                uint32_t sn = (st.attrib[0] >> 8) & 0x1F;
+                uint32_t off = st.attrib[0] >> 13;
+                uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
+                if (sn < 16 && st.vbuf[sn].addr && stride > 0) {
+                    uint64_t pos_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
+                    if (pos_addr + 12 <= st.vbuf[sn].addr + st.vbuf[sn].size) {
+                        const float *pf = (const float *)(uintptr_t)pos_addr;
+                        vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                    }
+                }
+            }
+
+            for (int a = 1; a < 32 && a < st.nattrib; a++) {
+                if (!(pr->vi->attr_mask & (1u << a))) continue;
+                uint32_t afmt = st.attrib[a] & 0xFF;
+                uint32_t sn = (st.attrib[a] >> 8) & 0x1F;
+                uint32_t off = st.attrib[a] >> 13;
+                uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
+                if (sn >= 16 || !st.vbuf[sn].addr || stride == 0) continue;
+
+                uint64_t attr_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
+                if (attr_addr + 4 > st.vbuf[sn].addr + st.vbuf[sn].size) continue;
+
+                if (afmt == 0x27) { // R8G8B8A8_UINT bone indices
+                    const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
+                    vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                    vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                } else if (afmt == 0x25) { // R8G8B8A8_UNORM bone weights
+                    const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
+                    vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
+                    vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
+                }
+            }
+
+            vs->clip_pos[0] = vs->pos[0];
+            vs->clip_pos[1] = vs->pos[1];
+            vs->clip_pos[2] = vs->pos[2];
+            vs->clip_pos[3] = 1.0f;
+            vs->w_valid = (vs->clip_pos[3] > 0.0001f && !isnan(vs->clip_pos[3]) && !isinf(vs->clip_pos[3]));
+            vs->is_corrupted = (fabsf(vs->pos[0]) > 500.0f || vs->pos[0] > 1000.0f);
+        }
     }
 }
 

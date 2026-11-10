@@ -24,6 +24,7 @@ void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws)
 #include "../settings.h"
 uint64_t vk_cum_wait_ns(void);  // vulkan/exec.c
 const char *vk_gpu_desc(void);  // vulkan/device.c
+#include "../nvn/vulkan/ryza_forensics.h"
 }
 
 #define FT_N 120  // frame times in the graph
@@ -207,6 +208,45 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         if (ds.headroom > 0) {
             ImGui::SameLine();
             ImGui::TextDisabled("(headroom %.2f)", ds.headroom);
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "BUILD: %s", ryza_get_build_fingerprint());
+    ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "Ryza 3D Character Draws: %llu (Captured: %u)",
+                       (unsigned long long)g_ryza_3d_draw_count, g_ryza_captured_draw_count);
+
+    if (g_ryza_captured_draw_count > 0) {
+        static int selected_draw = 0;
+        if (selected_draw >= (int)g_ryza_captured_draw_count) selected_draw = (int)g_ryza_captured_draw_count - 1;
+
+        ImGui::SliderInt("Submesh##rdraw", &selected_draw, 0, (int)g_ryza_captured_draw_count - 1);
+        RyzaDrawForensic *d = &g_ryza_captured_draws[selected_draw];
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.8f, 1.0f), "[%s]", d->body_part);
+        ImGui::TextDisabled("Frame %llu Draw #%u | VS: %llx FS: %llx",
+                            (unsigned long long)d->frame, d->draw_idx,
+                            (unsigned long long)d->vs_code, (unsigned long long)d->fs_code);
+        ImGui::Text("Indices: %u (range %u..%u) | AttrMask: 0x%08x",
+                    d->icount, d->min_idx, d->max_idx, d->attr_mask);
+
+        for (uint32_t a = 0; a < 8; a++) {
+            if (d->attr_mask & (1u << a)) {
+                ImGui::TextDisabled("A%u: strm=%u off=%u strd=%u fmt=0x%02x k=%u raw=0x%08x",
+                                    a, d->attrs[a].stream, d->attrs[a].off, d->attrs[a].stride,
+                                    d->attrs[a].nvn_fmt, d->attrs[a].kind, d->attrs[a].raw_data[0]);
+            }
+        }
+
+        if (d->num_samples > 0) {
+            RyzaVertexSample *s = &d->samples[0];
+            ImGui::Text("Vtx #%u Pos: (%.2f, %.2f, %.2f)", s->vertex_idx, s->pos[0], s->pos[1], s->pos[2]);
+            ImGui::Text("Bones: [%u, %u, %u, %u] W: (%.2f, %.2f, %.2f, %.2f)",
+                        s->bone_indices[0], s->bone_indices[1], s->bone_indices[2], s->bone_indices[3],
+                        s->bone_weights[0], s->bone_weights[1], s->bone_weights[2], s->bone_weights[3]);
+            ImGui::TextColored(s->w_valid ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                               "ClipPos: (%.2f, %.2f, %.2f, W=%.2f) X/W=%.2f",
+                               s->clip_pos[0], s->clip_pos[1], s->clip_pos[2], s->clip_pos[3],
+                               s->clip_pos[3] != 0.0f ? s->clip_pos[0] / s->clip_pos[3] : 9999.0f);
         }
     }
     record();
