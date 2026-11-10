@@ -1112,36 +1112,15 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
         if (gcopy[s].seq == seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) gcopy[s].seq = 0;
     }
 }
-static uint64_t stat_gcopy_calls, stat_gcopy_hits, stat_gcopy_fast_rejects, stat_gcopy_bytes;
+static uint64_t stat_gcopy_calls, stat_gcopy_hits;
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     stat_gcopy_calls++;
     uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
     if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
-        const uint8_t *p1 = (const uint8_t *)gcopy[slot].span.ptr;
-        const uint8_t *p2 = (const uint8_t *)(uintptr_t)addr;
-        bool match = false;
-        if (size >= 16) {
-            uint64_t w0_a, w0_b, w1_a, w1_b;
-            memcpy(&w0_a, p1, 8);
-            memcpy(&w0_b, p2, 8);
-            memcpy(&w1_a, p1 + size - 8, 8);
-            memcpy(&w1_b, p2 + size - 8, 8);
-            if (w0_a == w0_b && w1_a == w1_b) {
-                stat_gcopy_bytes += size;
-                match = memcmp(p1, p2, size) == 0;
-            } else {
-                stat_gcopy_fast_rejects++;
-            }
-        } else {
-            stat_gcopy_bytes += size;
-            match = memcmp(p1, p2, size) == 0;
-        }
-        if (match) {
-            stat_gcopy_hits++;
-            return gcopy[slot].span;
-        }
+        stat_gcopy_hits++;
+        return gcopy[slot].span;
     }
     if (gcopy[slot].seq != seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
@@ -2618,7 +2597,7 @@ static bool structure_on(void) {
     static int on = -1;
     if (on < 0) {
         extern bool vk_driver_is_qualcomm(void);
-        on = getenv("LARECOMP_STRUCTURE") != NULL; // Disable structured control flow by default to prevent bone/outline register liveness corruptions
+        on = !getenv("LARECOMP_NO_STRUCTURE") && (!vk_driver_is_qualcomm() || getenv("LARECOMP_STRUCTURE"));
         if (!on && vk_driver_is_qualcomm()) LOG("[vk] Qualcomm's driver: shaders keep their branch state machine (its compiler)\n");
     }
     return on;
@@ -3018,14 +2997,16 @@ typedef struct {
 } PipeFx;
 
 // Everything a pipeline bakes in, captured by value so it can be built on a worker thread.
-#define ZERO_BINDING 16
+#define ZERO_BINDING_FLOAT 16
+#define ZERO_BINDING_INT   17
+#define NUM_STREAMS        18
 typedef struct {
     Prog *prog;
     VkFormat color[8], depth, stencil;
     uint32_t ncolor, samples;
     uint32_t attr_fmt[32], attr_off[32], attr_bind[32];
     uint32_t attr_mask;
-    uint32_t stride[17], divisor[17], used_streams;
+    uint32_t stride[NUM_STREAMS], divisor[NUM_STREAMS], used_streams;
     uint8_t blend[8][8];
     uint8_t blend_on, a2c, topo_class, poly_fill, depth_clamp;
     uint8_t prim_restart;  // (no extended dynamic state 2 only: primitive restart is pipeline state then)
@@ -3063,14 +3044,14 @@ static void build_pipeline(void *arg) {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->prog->fs, .pName = "main"}};
     VkVertexInputAttributeDescription va[32];
-    VkVertexInputBindingDescription vb[17];
-    VkVertexInputBindingDivisorDescriptionEXT vd[17];
+    VkVertexInputBindingDescription vb[NUM_STREAMS];
+    VkVertexInputBindingDivisorDescriptionEXT vd[NUM_STREAMS];
     uint32_t na = 0, nb = 0, nd = 0;
     for (int i = 0; i < 32; i++)
         if (k->attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k->attr_bind[i], k->attr_fmt[i], k->attr_off[i]};
-    for (uint32_t s = 0; s < 17; s++) {
+    for (uint32_t s = 0; s < NUM_STREAMS; s++) {
         if (!(k->used_streams & (1u << s))) continue;
-        bool inst = k->divisor[s] != 0 || s == ZERO_BINDING;
+        bool inst = k->divisor[s] != 0 || s == ZERO_BINDING_FLOAT || s == ZERO_BINDING_INT;
         vb[nb++] = (VkVertexInputBindingDescription){s, k->stride[s], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
         if (inst && k->divisor[s] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, k->divisor[s]};
     }
@@ -5543,14 +5524,7 @@ void vc_flush(void) {
 // forces copies.
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
-    if (copy < 0) {
-#ifdef __ANDROID__
-        const char *e = getenv("LARECOMP_VK_COPY_VERTICES");
-        copy = !e || atoi(e) != 0;  // default to true on Android to eliminate stale vcache / dropped write corruption
-#else
-        copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
-#endif
-    }
+    if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
 #ifdef __ANDROID__
     if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
@@ -6635,13 +6609,20 @@ static void draw_(CmdRec *r, bool indexed) {
             k.attr_mask |= 1u << i;
             uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
             uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
-            if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 0) from a constant stream
+            if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) for float, (0, 0, 0, 0) for int
                 int kind = (i < 32 && pr && pr->vkey.attr_kind[i]) ? pr->vkey.attr_kind[i] : 0;
-                k.attr_fmt[i] = (kind == 1) ? VK_FORMAT_R32G32B32A32_SINT :
-                                (kind == 2) ? VK_FORMAT_R32G32B32A32_UINT :
-                                              VK_FORMAT_R32G32B32A32_SFLOAT;
-                k.attr_bind[i] = ZERO_BINDING;
-                k.used_streams |= 1u << ZERO_BINDING;
+                if (kind == 1) {
+                    k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SINT;
+                    k.attr_bind[i] = ZERO_BINDING_INT;
+                } else if (kind == 2) {
+                    k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_UINT;
+                    k.attr_bind[i] = ZERO_BINDING_INT;
+                } else {
+                    k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+                    k.attr_bind[i] = ZERO_BINDING_FLOAT;
+                }
+                k.attr_off[i] = 0;
+                k.used_streams |= 1u << k.attr_bind[i];
                 continue;
             }
             k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
@@ -6655,6 +6636,10 @@ static void draw_(CmdRec *r, bool indexed) {
             k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
             if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
         }
+        k.stride[ZERO_BINDING_FLOAT] = 0;
+        k.divisor[ZERO_BINDING_FLOAT] = 0;
+        k.stride[ZERO_BINDING_INT] = 0;
+        k.divisor[ZERO_BINDING_INT] = 0;
         static int logged_pipes = 0;
         bool has_high_attr = (pr->vi->attr_mask & 0xFFFF0000u) != 0;
         if (logged_pipes < 15 || (has_high_attr && logged_pipes < 30)) {
@@ -6971,12 +6956,15 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
-    for (int s = 0; s < 17; s++) {
+    for (int s = 0; s < NUM_STREAMS; s++) {
         if (!(pp->k.used_streams & (1u << s))) continue;
         VkSpan sp;
-        if (s == ZERO_BINDING) {
-            static const uint32_t zero[4] = {0, 0, 0, 0};
-            sp = vk_transient_copy(zero, 16, 16);
+        if (s == ZERO_BINDING_FLOAT) {
+            static const float zero_f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            sp = vk_transient_copy(zero_f, 16, 16);
+        } else if (s == ZERO_BINDING_INT) {
+            static const uint32_t zero_i[4] = {0, 0, 0, 0};
+            sp = vk_transient_copy(zero_i, 16, 16);
         } else {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
@@ -7016,8 +7004,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (!stride) need = 256;
             else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
-            if (v.size && v.size <= (8u << 20)) need = v.size;
-            else if (v.size && need > v.size) need = v.size;
+            if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
             else sp = guest_copy(v.addr, need ? need : 16);
         }

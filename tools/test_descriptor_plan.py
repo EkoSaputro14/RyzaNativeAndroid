@@ -19,6 +19,7 @@ typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
 #define MAX_BIND 96
 #define GMAP_BUFFER_INDEX 20
+#define CBPATCH_BUFFER_INDEX 21
 enum { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, UNUSED_STORAGE_IMAGE, UNUSED_SAMPLER };
 typedef struct { uint32_t set, binding, type; } VkBindingInfo;
@@ -50,7 +51,7 @@ int check(unsigned seed, int count, unsigned set) {
     for (int i = 0; i < count; i++) {
         const VkBindingInfo *b = &binds[i];
         if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-            (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX)) continue;
+            (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX && b->binding != CBPATCH_BUFFER_INDEX)) continue;
         legacy[n++] = i;
     }
     struct { unsigned before; DescriptorPlan plan; unsigned after; } checked;

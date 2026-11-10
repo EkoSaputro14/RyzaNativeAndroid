@@ -9,6 +9,7 @@
 #include "nvn.h"
 
 void renderer_sync(void);
+void precompute_register_program(void *nvn_program);
 
 static uint64_t next_debug_id = 1;
 
@@ -1350,6 +1351,7 @@ static void set_shaders(Cpu *c, int stride) {
         LOG("[nvn] set_shaders[%d/%d]: prog=%p stage=%u code=%llx h0=%08x sph0=%08x mask=%#x\n",
             i, n, (void *)p, stage, (unsigned long long)code, h0, sph0, p->stage_mask);
     }
+    precompute_register_program(p);
     RET(1);
 }
 
