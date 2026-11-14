@@ -49,6 +49,7 @@ add_library(main SHARED ${RT_SRC} ${R}/runtime/platform/android.c ${VK_SRC} ${UI
 set_source_files_properties(${UI_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xc++")
 set_source_files_properties(${R}/runtime/gamelib.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
+set_source_files_properties(${R}/runtime/android_libm_compat.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
 
 execute_process(
     COMMAND git rev-parse --short HEAD
@@ -61,8 +62,8 @@ if(NOT RYZA_GIT_COMMIT)
 endif()
 
 file(READ "${R}/android/botwrecompandroid/app/build.gradle.kts" RYZA_GRADLE_CFG)
-set(RYZA_VERSION_CODE "40")
-set(RYZA_VERSION_NAME "0.3.2-forensic-p7")
+set(RYZA_VERSION_CODE "41")
+set(RYZA_VERSION_NAME "0.3.2-forensic-p8")
 if(RYZA_GRADLE_CFG MATCHES "versionCode[ \t]*=[ \t]*([0-9]+)")
     set(RYZA_VERSION_CODE "${CMAKE_MATCH_1}")
 endif()

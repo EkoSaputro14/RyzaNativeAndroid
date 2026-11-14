@@ -55,8 +55,9 @@ def main():
     include_dir = os.path.join(REPO_DIR, "runtime")
     compile_cmd = (
         f'"{NDK_CLANG}" -O2 -fPIC -shared -DHAS_SUBSDK0 '
+        f'-Wl,-z,max-page-size=16384 '
         f'-I"{include_dir}" '
-        f'@{rsp_file} -o "{OUT_LIB}"'
+        f'@{rsp_file} -lm -o "{OUT_LIB}"'
     )
     run(compile_cmd, cwd=REPO_DIR)
 

@@ -168,6 +168,7 @@ static const GameLibTables *open_lib(const char *path) {
     static bool globalized_main = false;
     if (!globalized_main) {
         globalized_main = true;
+        dlopen("libm.so", RTLD_NOW | RTLD_GLOBAL);
         void *self = dlopen("libmain.so", RTLD_NOW | RTLD_GLOBAL);
         if (!self) {
             const char *nld = rt_native_lib_dir();
