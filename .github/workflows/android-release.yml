@@ -52,22 +52,25 @@ jobs:
       - name: Run companion verification tests
         run: python3 companion/tests/test_ryza_fixes.py
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK, NDK r30, and CMake
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager --install \
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_HOME"
+          SDKMANAGER=$(command -v sdkmanager || find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n1)
+          [ -x "$SDKMANAGER" ] || { echo "sdkmanager not found under $ANDROID_HOME"; exit 1; }
+          echo "Using ANDROID_HOME=$ANDROID_HOME, sdkmanager=$SDKMANAGER"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "cmake;3.22.1" \
             "cmake;3.30.4"
 
           if [ ! -d "$ANDROID_HOME/ndk/30.0.16248370" ]; then
-            if ! sdkmanager --install "ndk;30.0.16248370"; then
+            if ! "$SDKMANAGER" --install "ndk;30.0.16248370"; then
               echo "Falling back to direct android-ndk-r30-linux.zip download..."
               curl -fsSL -o /tmp/ndk-r30.zip https://dl.google.com/android/repository/android-ndk-r30-linux.zip
               mkdir -p "$ANDROID_HOME/ndk" /tmp/ndk-extract
@@ -77,6 +80,8 @@ jobs:
             fi
           fi
 
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_LINUX=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/cmake/3.30.4/bin" >> "$GITHUB_PATH"
