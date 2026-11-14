@@ -70,6 +70,7 @@ static bool lookup(uint64_t now_ms) {
 // The selected rune (0-7, as above), or -1 unknown. *owned: a bit per rune the player has (all 8 if unknown).
 int gdt_rune(uint32_t *owned) {
     *owned = 0xFF;
+    if (g_is_ryza) return -1;
     if (!rune_flag || RD32(rune_flag + 0x1C) != RUNE_FLAG) {
         rune_flag = 0;
         if (!lookup(plat_now_ns() / 1000000)) return -1;

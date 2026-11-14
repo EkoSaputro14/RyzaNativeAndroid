@@ -6,6 +6,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
+
+static pthread_mutex_t romfs_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #include "../mods.h"
 #include "../hle.h"
@@ -425,8 +428,11 @@ static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
                 r = in < ov[i].size ? (ssize_t)(n < ov[i].size - in ? n : ov[i].size - in) : 0;
                 memcpy(dst + done, ov[i].mem + in, (size_t)r);
             } else {
+                pthread_mutex_lock(&romfs_lock);
                 if (ov[i].fd < 0) ov[i].fd = open(ov[i].path, O_RDONLY);
-                r = in < ov[i].size ? pread(ov[i].fd, dst + done, n < ov[i].size - in ? n : ov[i].size - in, (off_t)in) : 0;
+                int ofd = ov[i].fd;
+                pthread_mutex_unlock(&romfs_lock);
+                r = (ofd >= 0 && in < ov[i].size) ? pread(ofd, dst + done, n < ov[i].size - in ? n : ov[i].size - in, (off_t)in) : 0;
             }
             if (r < 0) r = 0;
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
@@ -463,7 +469,8 @@ const char *romfs_file_at(uint64_t off) {
 // malloc'd buffer - mods included. For the app's own use (ui/touch_icons.mm: the touch controls' item icons). NULL
 // until the game has opened its RomFS, or when the path isn't there.
 uint8_t *fs_romfs_read(const char *path, size_t *size) {
-    if (romfs_fd == -1) return NULL;
+    if (romfs_fd == -1 || !path) return NULL;
+    pthread_mutex_lock(&romfs_lock);
     RomImage *was = R;
     R = &img_game;
     uint8_t *out = NULL;
@@ -471,10 +478,11 @@ uint8_t *fs_romfs_read(const char *path, size_t *size) {
         if (strcmp(rom_files[i].path, path)) continue;
         out = malloc(rom_files[i].size ? rom_files[i].size : 1);
         if (romfs_read(romfs_fd, out, rom_files[i].size, rom_files[i].off) != (ssize_t)rom_files[i].size) free(out), out = NULL;
-        else *size = rom_files[i].size;
+        else if (size) *size = rom_files[i].size;
         break;
     }
     R = was;
+    pthread_mutex_unlock(&romfs_lock);
     return out;
 }
 

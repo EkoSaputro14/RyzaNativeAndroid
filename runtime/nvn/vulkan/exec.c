@@ -26,6 +26,14 @@
 #include "ryza_forensics.h"
 #include "precompute.h"
 
+
+static inline VkSpan vk_transient_copy_padded4(const void *src, uint64_t bytes) {
+    VkSpan s = vk_transient(bytes + 4, 4);
+    if (bytes) memcpy(s.ptr, src, (size_t)bytes);
+    memset((uint8_t *)s.ptr + bytes, 0, 4);
+    return s;
+}
+
 // LARECOMP_AB (vk_ab, below): AB() costs no call while it is not set - it is asked per constant buffer and per pass
 static int ab_n = -1;  // (LARECOMP_AB's frame count; 0: no A/B)
 int vk_ab(const char *what);
@@ -1141,6 +1149,7 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+    crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1168,6 +1177,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -2682,7 +2692,7 @@ static void translate_program(void *arg) {
     {   // LARECOMP_DUMP_FS=<fs hash, as [gpuprof] / [fshash] print it>: that fragment shader's GLSL (and its vertex
         // shader's) to build/fs_<hash>.glsl, for looking at a slow one
         const char *want = getenv("LARECOMP_DUMP_FS");
-        uint64_t h = hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200);
+        uint64_t h = ryza_guest_readable(p->code[1] + 0x30, 0x200) ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200) : 0;
         bool hit = false;  // (several: "+"-separated)
         for (const char *e = want; e && *e && !hit;) {
             hit = strtoull(e, (char **)&e, 16) == h;
@@ -2708,7 +2718,7 @@ static void translate_program(void *arg) {
         // frame: LARECOMP_SHADER_SUBST's files can't name them.
         const char *pf = getenv("LARECOMP_SHADER_PATCH");
         FILE *f = pf ? fopen(pf, "rb") : NULL;
-        uint64_t h = f ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200) : 0;
+        uint64_t h = (f && ryza_guest_readable(p->code[1] + 0x30, 0x200)) ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(p->code[1] + 0x30), 0x200) : 0;
         char line[1024];
         while (f && fgets(line, sizeof line, f)) {
             unsigned long long lh;
@@ -2779,9 +2789,11 @@ static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, Shad
     prog_tab[slot].prog = p;
     p->code[0] = vcode;
     p->cmax[0] = vnp->stages[0].const_offset ? vnp->stages[0].const_offset : 0x10000;
+    if (vcode >= GUEST_LO && vcode < GUEST_HI && p->cmax[0] > GUEST_HI - vcode) p->cmax[0] = (uint32_t)(GUEST_HI - vcode);
     p->const_bytes[0] = vnp->stages[0].const_offset ? vnp->stages[0].const_size : 0;
     p->code[1] = fcode;
     p->cmax[1] = fnp->stages[1].const_offset ? fnp->stages[1].const_offset : 0x10000;
+    if (fcode >= GUEST_LO && fcode < GUEST_HI && p->cmax[1] > GUEST_HI - fcode) p->cmax[1] = (uint32_t)(GUEST_HI - fcode);
     p->const_bytes[1] = fnp->stages[1].const_offset ? fnp->stages[1].const_size : 0;
     p->vkey = *vkey;
     p->fkey = *fkey;
@@ -3843,15 +3855,22 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         if (!ss || !ss->code_addr) return ubo_span(vk_transient_copy(zeros, 16, 256), 16);
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-        return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
+        if (size > sizeof(zeros)) size = sizeof(zeros);
+        uint64_t caddr = ss->code_addr + ss->const_offset;
+        if (!ryza_guest_readable(caddr, size)) return ubo_span(vk_transient_copy(zeros, size, 256), size);
+        return ubo_span(guest_copy(caddr, size), size);  // (constant: shared per submission)
     }
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
-    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size <= sizeof(zeros) ? size : sizeof(zeros), 256), size <= sizeof(zeros) ? size : sizeof(zeros));
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
+    if (!ryza_guest_readable(r.addr, size)) {
+        uint64_t zsz = size <= sizeof(zeros) ? size : sizeof(zeros);
+        return ubo_span(vk_transient_copy(zeros, zsz, 256), zsz);
+    }
     if (g_debug_frame && getenv("LARECOMP_DUMP_CBUF_FS")) {
         // (diagnosis) LARECOMP_DUMP_CBUF_FS=<fs hash>+<fs hash>...: in debug frames, every constant buffer of those
         // fragment shaders' draws, as floats (the first 0x400 bytes)
@@ -3954,7 +3973,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
-    if (stage == 0 && idx == 0 && size >= 64) {
+    if (!g_is_ryza && stage == 0 && idx == 0 && size >= 64) {
         // Widescreen: what the HUD's layouts draw through the widened camera moves out towards the screen's edge
         // (widescreen.c widescreen_hud_shift), in its own copy. nn::ui2d's panes: the layout camera's projection in
         // cb3[0..3], the pane's matrix in cb3[4..6] (its x at [4][3]); its text: one matrix, projection times the pane's,
@@ -6237,7 +6256,7 @@ static void draw_(CmdRec *r, bool indexed) {
             static struct { uint64_t addr, hash; uint8_t code[0x200]; } fsh[1024];
             const void *code = (const void *)(uintptr_t)(fs + 0x30);
             unsigned i = (unsigned)((fs * 0x9E3779B97F4A7C15ull) >> 54);
-            if (!fs) last_hash = 0;
+            if (!fs || !ryza_guest_readable(fs + 0x30, 0x200)) last_hash = 0;
             else if (fsh[i].addr == fs && !memcmp(fsh[i].code, code, 0x200)) last_hash = fsh[i].hash;
             else {
                 last_hash = hmix(1469598103934665603ull, code, 0x200);
@@ -6245,7 +6264,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 memcpy(fsh[i].code, code, 0x200);
             }
 #else
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+            last_hash = (fs && ryza_guest_readable(fs + 0x30, 0x200)) ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
 #endif
         }
         static uint64_t skip[128];  // (bisecting a frame's shaders: many at once)
@@ -6689,11 +6708,16 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (k.attr_bind[i] < 16 && st.vbuf[k.attr_bind[i]].addr) {
                     uint64_t vaddr = st.vbuf[k.attr_bind[i]].addr;
                     uint64_t vsz = st.vbuf[k.attr_bind[i]].size;
-                    const uint8_t *ptr = (const uint8_t *)(uintptr_t)(vaddr + off);
-                    LOG("    vbuf[%2d]: addr=0x%llx sz=%llu | data[0..15]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                        k.attr_bind[i], (unsigned long long)vaddr, (unsigned long long)vsz,
-                        ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
-                        ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
+                    if ((!vsz || (uint64_t)off + 16 <= vsz) && ryza_guest_readable(vaddr + off, 16)) {
+                        const uint8_t *ptr = (const uint8_t *)(uintptr_t)(vaddr + off);
+                        LOG("    vbuf[%2d]: addr=0x%llx sz=%llu | data[0..15]: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                            k.attr_bind[i], (unsigned long long)vaddr, (unsigned long long)vsz,
+                            ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7],
+                            ptr[8], ptr[9], ptr[10], ptr[11], ptr[12], ptr[13], ptr[14], ptr[15]);
+                    } else {
+                        LOG("    vbuf[%2d]: addr=0x%llx sz=%llu off=%u (out of range for 16B sample)\n",
+                            k.attr_bind[i], (unsigned long long)vaddr, (unsigned long long)vsz, off);
+                    }
                 }
             }
         }
@@ -6935,12 +6959,17 @@ static void draw_(CmdRec *r, bool indexed) {
         max_index = first + count;
         if (!native) {
             uint32_t *e = expand_indices(mode, count, NULL, 0, first, &icount);
-            ib = vk_transient_copy(e, (uint64_t)icount * 4 + 4, 4);
+            ib = vk_transient_copy_padded4(e, (uint64_t)icount * 4);
             free(e);
         }
     } else {
         uint32_t itype = (uint32_t)r->x[1];
         uint64_t iaddr = r->x[3];
+        uint32_t isz_check = itype == 0 ? 1 : (itype == 1 ? 2 : 4);
+        if (!ryza_guest_readable(iaddr, (uint64_t)count * isz_check)) {
+            stat_skipped++;
+            return;
+        }
         base_vertex = (int32_t)r->x[4];
         base_inst = (uint32_t)r->x[5];
         inst = (uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1;
@@ -6953,7 +6982,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
-                ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
+                ib = vk_transient_copy_padded4(src, (uint64_t)count * isz);
 #ifdef __ANDROID__
                 // (no primitive restart - most draws: a plain maximum, which the compiler vectorizes; the scalar
                 // loop with the restart test was ~9% of the render thread in the copy mode, every indexed draw)
@@ -6977,7 +7006,7 @@ static void draw_(CmdRec *r, bool indexed) {
         } else {
             uint32_t *e = expand_indices(mode, count, src, (int)itype, 0, &icount);
             for (uint32_t i = 0; i < icount; i++) if (e[i] > max_index) max_index = e[i];
-            ib = vk_transient_copy(e, (uint64_t)icount * 4 + 4, 4);
+            ib = vk_transient_copy_padded4(e, (uint64_t)icount * 4);
             free(e);
         }
         if (!scan_src) {
@@ -7011,7 +7040,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (pp->k.stride[s] && !use_index)
                 reach = pp->k.divisor[s] ? ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * pp->k.stride[s]
                                      : ((uint64_t)first + count) * pp->k.stride[s];
-            if (v.addr && v.size && reach > v.size && reach <= (1u << 20)) {
+            if (v.addr && v.size && reach > v.size && reach <= (1u << 20) && ryza_guest_readable(v.addr, v.size)) {
                 sp = vk_transient(reach, 16);
                 memcpy(sp.ptr, (const void *)(uintptr_t)v.addr, v.size);
                 memset((uint8_t *)sp.ptr + v.size, 0, reach - v.size);
@@ -7047,8 +7076,11 @@ static void draw_(CmdRec *r, bool indexed) {
                 else need = (uint64_t)max_index * stride + 256;
             }
             if (v.size && need > v.size) need = v.size;
-            if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
-            else sp = guest_copy(v.addr, need ? need : 16);
+            uint64_t copy_sz = need ? need : 16;
+            if (v.addr && v.addr >= GUEST_LO && v.addr < GUEST_HI && copy_sz > GUEST_HI - v.addr)
+                copy_sz = GUEST_HI - v.addr;
+            if (!v.addr || !ryza_guest_readable(v.addr, copy_sz)) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
+            else sp = guest_copy(v.addr, copy_sz);
         }
         VkDeviceSize off = sp.off;
         if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;

@@ -37,6 +37,7 @@ static uint64_t pmdm_instance_ref(void) {  // where sInstance is (canonical, 0x7
 // running, another version, the list changing).
 bool pouch_equipped(char out[4][64]) {
     for (int i = 0; i < 4; i++) out[i][0] = 0;
+    if (g_is_ryza) return false;
     uint64_t ref = pmdm_instance_ref();
     if (!ref) return false;
     uint64_t inst = *(volatile uint64_t *)(uintptr_t)(ref - 0x7000000000ull + GUEST_LO);

@@ -325,3 +325,22 @@ if __name__ == '__main__':
     test_dynamic_texture_throttle_budget()
     test_runtime_wiring_and_version_sync()
     print("\n>>> ALL REGRESSION & VALIDATION TESTS PASSED SUCCESSFULLY! <<<")
+
+
+def _verify_p10_transition_guards():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    rt_h = (repo_root / "runtime" / "rt.h").read_text(encoding="utf-8")
+    loader_c = (repo_root / "runtime" / "loader.c").read_text(encoding="utf-8")
+    tc_mm = (repo_root / "runtime" / "ui" / "touch_controls.mm").read_text(encoding="utf-8")
+    fs_c = (repo_root / "runtime" / "services" / "fs.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    assert "extern bool g_is_ryza;" in rt_h
+    assert "bool g_is_ryza = true;" in loader_c
+    assert "if (g_is_ryza) return false;" in tc_mm
+    assert "release_all_locked();" in tc_mm
+    assert "romfs_lock" in fs_c
+    assert "vk_transient_copy_padded4" in exec_c
+    assert "(!vsz || (uint64_t)off + 16 <= vsz) && ryza_guest_readable(vaddr + off, 16)" in exec_c
+
+_verify_p10_transition_guards()

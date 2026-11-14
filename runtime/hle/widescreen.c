@@ -35,6 +35,7 @@ static bool g_allowed;  // (widescreen_set_allowed: tests)
 static volatile bool g_hooked;  // (the game code calls rt_persp_update: built with the hooks)
 static int g_boot_aspect = -1;  // (the setting this boot of the game started with)
 bool widescreen_allowed(void) {
+    if (g_is_ryza) return false;
     // 1.8.2 once its game code shows the hooks (one built before them would stretch the image: it stays 16:9), with
     // the setting the game started with: the layouts' camera takes its aspect once, early on (a copy of a projection
     // built on the stack, never rebuilt), so a change applies when the game starts again (a reboot: widescreen_reset)
@@ -160,6 +161,7 @@ void widescreen_talk_seen(void) {
 float widescreen_hud_top(float x, float y) {
     extern bool touch_hud_top(void);
     extern uint64_t renderer_present_count(void);
+    if (g_is_ryza) return 0;
     if (x < 290.0f || y > -140.0f || y < -315.0f || !touch_hud_top() || !in_world() || framepace_in_menu()) return 0;
     if (!minimap_frame || renderer_present_count() - minimap_frame > 3) return 0;
     return 490.0f;
@@ -188,6 +190,7 @@ void widescreen_band_seen(void) {
 // (row: below this y the prompts' row - a pane's centre or a text's origin, widescreen_hud_shift / _text)
 static float hud_shift(float x, float y, float row) {
     extern uint64_t renderer_present_count(void);
+    if (g_is_ryza) return 0;
     if (!widescreen_ui_centred() || widescreen_in_menu() || !in_world()) return 0;
     if (band_frame && renderer_present_count() - band_frame <= 3) return 0;
     // A talk's box on screen: nothing moves out. Its ends (+-284) and the name, and its answers (boxes at 450, texts from

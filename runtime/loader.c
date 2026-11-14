@@ -16,6 +16,7 @@ typedef struct { uint32_t name; uint8_t info, other; uint16_t shndx; uint64_t va
 typedef struct { uint64_t off, info; int64_t addend; } Elf64Rela;
 
 int g_game_version;
+bool g_is_ryza = true;
 
 static size_t lz4_decompress(const uint8_t *src, size_t srclen, uint8_t *dst, size_t dstlen) {
     const uint8_t *s = src, *se = src + srclen;
@@ -86,6 +87,7 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
     if (!raw || memcmp(raw, "NSO0", 4)) FATAL("cannot load %s\n", path);
     if (base == MAIN_BASE) {  // (the game's version: g_game_version)
         g_game_version = game_version_of_build(raw + 0x40);
+        g_is_ryza = (g_game_version == 100);
         LOG("[loader] main build %02x%02x%02x%02x...: game version %d\n", raw[0x40], raw[0x41], raw[0x42], raw[0x43],
             g_game_version);
     }

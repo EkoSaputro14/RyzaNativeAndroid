@@ -1319,9 +1319,15 @@ static void set_shaders(Cpu *c, int stride) {
     memset(p->stages, 0, sizeof p->stages);
     p->stage_mask = 0;
     p->backend = NULL;
+    if (!data || n <= 0 || n > 6) { RET(1); return; }
+    uintptr_t data_addr = (uintptr_t)data;
+    if (data_addr < GUEST_LO || data_addr + (size_t)n * (size_t)stride > GUEST_HI) { RET(1); return; }
     for (int i = 0; i < n; i++) {
         uint64_t code = *(uint64_t *)(data + i * stride);
         const uint8_t *control = (const uint8_t *)(uintptr_t) * (uint64_t *)(data + i * stride + 8);
+        if (code < GUEST_LO || code + 0x80 > GUEST_HI) continue;
+        uintptr_t ctrl_addr = (uintptr_t)control;
+        bool ctrl_ok = (control && ctrl_addr >= GUEST_LO && ctrl_addr + 0x708 <= GUEST_HI);
         // stage from the Maxwell shader program header (after the 0x30-byte NVN header)
         uint32_t sph0 = *(uint32_t *)(uintptr_t)(code + 0x30);
         uint32_t h0 = *(uint32_t *)(uintptr_t)code;
@@ -1344,9 +1350,9 @@ static void set_shaders(Cpu *c, int stride) {
 
         p->stages[stage].stage = stage;
         p->stages[stage].code_addr = code;
-        p->stages[stage].control = control;
-        p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
-        p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
+        p->stages[stage].control = ctrl_ok ? control : NULL;
+        p->stages[stage].const_offset = ctrl_ok ? *(const uint32_t *)(control + 0x700) : 0;
+        p->stages[stage].const_size = ctrl_ok ? *(const uint32_t *)(control + 0x6FC) : 0;
         p->stage_mask |= 1u << stage;
         LOG("[nvn] set_shaders[%d/%d]: prog=%p stage=%u code=%llx h0=%08x sph0=%08x mask=%#x\n",
             i, n, (void *)p, stage, (unsigned long long)code, h0, sph0, p->stage_mask);

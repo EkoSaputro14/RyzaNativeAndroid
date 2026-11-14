@@ -39,7 +39,8 @@ void menu_request_close(void);   // ui/menu.mm
 _Atomic uint64_t g_touch_buttons;  // (runtime/hle/input.c) Switch button bits held on the screen
 _Atomic int32_t g_touch_lx, g_touch_ly;  // left stick, -32767..32767, y up
 _Atomic int32_t g_touch_rx, g_touch_ry;  // right stick
-bool widescreen_world_play(void);                       // hle/widescreen.c
+bool widescreen_world_play(void);
+extern bool g_is_ryza;                       // hle/widescreen.c
 bool widescreen_minimap_at(float w, float h, float *x, float *y, float *r);
 bool widescreen_talk(void);
 uint8_t *fs_romfs_read(const char *path, size_t *size);  // services/fs.c
@@ -122,6 +123,7 @@ static _Atomic uint64_t last_draw_ms;
 // The icon layout is in use: its setting on, playing in the world (or editing it)
 static bool icons_wanted(void) {
     if (editing) return edit_icons;
+    if (g_is_ryza) return false;
     return g_settings.touch_scheme == 1 && widescreen_world_play();
 }
 
@@ -510,14 +512,18 @@ static void icon_release(int f, bool cancelled) {  // (t_lock held)
     if (k == I_BLOCK) block_up_ms = now;  // (a second touch soon: shield surfing)
 }
 
-static void release_all(void) {
-    pthread_mutex_lock(&t_lock);
+static void release_all_locked(void) {
     nfingers = 0;
     stick_release(0);
     stick_release(1);
     memset(pulse_until, 0, sizeof pulse_until), surf_a_at = 0;
     aiming = false, fan_open = false, rune_goal = -1;
     g_touch_buttons = 0;
+}
+
+static void release_all(void) {
+    pthread_mutex_lock(&t_lock);
+    release_all_locked();
     pthread_mutex_unlock(&t_lock);
 }
 
@@ -525,16 +531,22 @@ static void release_all(void) {
 // pickers held open from the icon layout (weapon, shield, the rune wheel) count as its menus: the icon layout stays
 // while a finger is on one of its controls, and after a picker's is lifted until the game is back in the world (icon_release)
 static void mode_check(void) {
+    pthread_mutex_lock(&t_lock);
     bool m = icons_wanted();
     if (icons_on && !m && !editing) {
         bool held = false;
-        pthread_mutex_lock(&t_lock);
         for (int i = 0; i < nfingers; i++) held |= fingers[i].ctl >= C_ICON && fingers[i].ctl < C_ICON + I_N;
-        pthread_mutex_unlock(&t_lock);
-        if (held || rune_goal >= 0 || SDL_GetTicks() < keep_icons_until) return;  // (also the fan stepping the wheel)
+        if (held || rune_goal >= 0 || SDL_GetTicks() < keep_icons_until) {
+            pthread_mutex_unlock(&t_lock);
+            return;  // (also the fan stepping the wheel)
+        }
     }
     if (m && rune_goal < 0) keep_icons_until = 0;  // (back in the world: the picker has closed)
-    if (m != icons_on) release_all(), icons_on = m;
+    if (m != icons_on) {
+        release_all_locked();
+        icons_on = m;
+    }
+    pthread_mutex_unlock(&t_lock);
 }
 
 // The on-screen controls are up (no controller, the setting on): the game's minimap group goes up to the top right,
@@ -552,7 +564,7 @@ extern "C" void touch_edit_begin_layout(int icons) {
     memcpy(edit_pos2, g_settings.touch_pos2, sizeof edit_pos2);
     memcpy(edit_size, g_settings.touch_size, sizeof edit_size);
     memcpy(edit_size2, g_settings.touch_size2, sizeof edit_size2);
-    edit_icons = icons >= 0 ? icons == 1 : g_settings.touch_scheme == 1 && widescreen_world_play();
+    edit_icons = (!g_is_ryza) && (icons >= 0 ? icons == 1 : g_settings.touch_scheme == 1 && widescreen_world_play());
     edit_sel = -1;
     release_all();
     editing = true;
