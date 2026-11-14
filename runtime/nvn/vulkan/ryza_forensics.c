@@ -8,6 +8,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #if defined(__ANDROID__)
 #include <jni.h>
@@ -25,6 +26,24 @@ uint64_t g_ryza_3d_draw_count = 0;
 uint64_t g_ryza_character_draw_count = 0;
 bool g_ryza_capture_freeze = false;
 char g_ryza_session_id[32] = {0};
+static pthread_mutex_t g_ryza_capture_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_ryza_auto_dump_pending = 0;
+static volatile uint32_t g_ryza_auto_dump_draw = 0;
+
+void ryza_capture_lock(void) { pthread_mutex_lock(&g_ryza_capture_mutex); }
+void ryza_capture_unlock(void) { pthread_mutex_unlock(&g_ryza_capture_mutex); }
+
+void ryza_request_auto_dump(uint32_t draw_idx) {
+    g_ryza_auto_dump_draw = draw_idx;
+    __atomic_store_n(&g_ryza_auto_dump_pending, 1, __ATOMIC_RELEASE);
+}
+
+void ryza_process_pending_auto_dump(void) {
+    if (__atomic_exchange_n(&g_ryza_auto_dump_pending, 0, __ATOMIC_ACQ_REL)) {
+        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP EXECUTING ON UI THREAD (Draw %u)\n", g_ryza_auto_dump_draw);
+        ryza_export_diagnostic_log();
+    }
+}
 
 RyzaDumpResult g_ryza_dump_result = {
     .status = RYZA_DUMP_STATUS_IDLE,
@@ -49,10 +68,10 @@ RyzaTestResult g_ryza_test_result = {
 #define RYZA_BUILD_COMMIT "local"
 #endif
 #ifndef RYZA_VERSION_CODE
-#define RYZA_VERSION_CODE "41"
+#define RYZA_VERSION_CODE "42"
 #endif
 #ifndef RYZA_VERSION_NAME
-#define RYZA_VERSION_NAME "0.3.2-forensic-p8"
+#define RYZA_VERSION_NAME "0.3.2-forensic-p9"
 #endif
 #ifndef RYZA_BUILD_VARIANT
 #define RYZA_BUILD_VARIANT "precomputed-render-pipeline"
@@ -83,9 +102,11 @@ void ryza_forensics_init(void) {
 }
 
 void ryza_rearm_capture(void) {
+    ryza_capture_lock();
     g_ryza_capture_freeze = false;
     g_ryza_captured_draw_count = 0;
     memset(g_ryza_captured_draws, 0, sizeof(g_ryza_captured_draws));
+    ryza_capture_unlock();
     fprintf(stderr, "[RYZA-FORENSIC] Capture buffer cleared and re-armed.\n");
 }
 
@@ -303,6 +324,7 @@ static void serialize_forensics_to_file(FILE *f, const char *path, time_t now) {
     fprintf(f, "Capture Freeze:    %s\n", g_ryza_capture_freeze ? "YES" : "NO");
     fprintf(f, "=======================================================\n\n");
 
+    ryza_capture_lock();
     for (uint32_t i = 0; i < g_ryza_captured_draw_count; i++) {
         RyzaDrawForensic *d = &g_ryza_captured_draws[i];
         if (!d->is_valid) continue;
@@ -401,6 +423,7 @@ static void serialize_forensics_to_file(FILE *f, const char *path, time_t now) {
         fprintf(f, "    CullMode=%u, FrontFace=%u, DepthTest=%u, DepthWrite=%u, DepthOp=%u\n\n",
                 d->cull_mode, d->front_face, d->depth_test, d->depth_write, d->depth_compare_op);
     }
+    ryza_capture_unlock();
 }
 
 void ryza_export_diagnostic_log(void) {

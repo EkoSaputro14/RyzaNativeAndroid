@@ -2148,6 +2148,11 @@ int ui_run(void) {
         motion_open();
         menu_apply_window_requests(window);
 #ifdef __ANDROID__
+        {
+            extern void ryza_process_pending_auto_dump(void);
+            ryza_process_pending_auto_dump();
+        }
+
         {   // the pipeline cache to disk now and then while it grows: an app is killed rather than exited, so
             // quick_exit_handler never saves it (every start compiled every shader again: missing objects at first)
             static uint64_t last;

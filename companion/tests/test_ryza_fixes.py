@@ -295,6 +295,20 @@ def test_runtime_wiring_and_version_sync():
     assert "precompute_init();" in exec_c and "precompute_record_pipeline_hash(" in exec_c, "precompute must be wired into exec.c"
     assert "precompute_shutdown();" in device_c, "precompute_shutdown() must be called on exit/background"
     assert "precompute_get_snapshot(" in overlay_mm, "perf_overlay.mm must display precompute snapshot"
+    with open(os.path.join(repo, ".github/workflows/android-release.yml")) as f:
+        wf = f.read()
+    with open(os.path.join(repo, "runtime/dispatch.c")) as f:
+        dispatch_c = f.read()
+    with open(os.path.join(repo, "runtime/platform/android.c")) as f:
+        android_c = f.read()
+    with open(os.path.join(repo, "runtime/nvn/vulkan/async.c")) as f:
+        async_c = f.read()
+
+    assert "android-debug-keystore-v1" in wf and "keytool -genkeypair" in wf, "CI workflow must persist debug.keystore"
+    assert "ryza_guest_readable(" in exec_c, "exec.c must validate guest memory before forensic reads"
+    assert "MemAvailable:" in exec_c, "vk_heap_place must verify MemAvailable headroom"
+    assert "rt_host_fn_table_prepare();" in dispatch_c, "dispatch_init must prebuild host fn lookup table"
+    assert "plat_crash_handler_install();" in android_c and "crash_handler_install();" in async_c, "Crash handler must be installed on main & render threads"
     print("  -> PASS: Runtime wiring, version sync, and forensic evaluation checks verified.")
 
 if __name__ == '__main__':

@@ -94,6 +94,14 @@ static void load_nso(Module *m, const char *path, uint64_t base) {
     for (int i = 0; i < 3; i++) memcpy(seg[i], raw + 0x10 + i * 0x10, 12);
     uint32_t bss = *(uint32_t *)(raw + 0x3C);
     uint64_t size = (seg[2][1] + seg[2][2] + bss + 0x3FFF) & ~0x3FFFull;
+    for (int i = 0; i < g_nmodules - 1; i++) {
+        uint64_t mb = g_modules[i].base, me = mb + g_modules[i].size;
+        if (mb && base < me && mb < base + size) {
+            FATAL("module %s (%#llx..%#llx) overlaps previously loaded %s (%#llx..%#llx)\n",
+                  m->name, (unsigned long long)base, (unsigned long long)(base + size),
+                  g_modules[i].name, (unsigned long long)mb, (unsigned long long)me);
+        }
+    }
     plat_commit(base, size);  // inside the guest window: zero-filled, read/write
     for (int i = 0; i < 3; i++) {
         uint32_t csize = *(uint32_t *)(raw + 0x60 + i * 4);

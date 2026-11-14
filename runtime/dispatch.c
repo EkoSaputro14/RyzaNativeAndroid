@@ -196,6 +196,8 @@ void dispatch_init(void) {  // (after gamelib_load)
 #endif
     LOG("[dispatch] initialized %d function tables (main: %llu, sdk: %llu, subsdk0: %llu)\n",
         n_tables, (unsigned long long)nm, (unsigned long long)ns, (unsigned long long)nsub);
+    extern void rt_host_fn_table_prepare(void);
+    rt_host_fn_table_prepare();
 }
 
 GuestFn dispatch_lookup(uint64_t addr) {
@@ -464,25 +466,32 @@ static int cmp_host(const void *a, const void *b) {
     uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
     return x < y ? -1 : x > y;
 }
+static uint64_t (*g_byhost)[2];  // {host address, guest address}, sorted by host address
+static uint64_t g_byhost_n;
+
+void rt_host_fn_table_prepare(void) {
+    uint64_t total = 0;
+    for (int t = 0; t < n_tables; t++) total += tables[t].count;
+    if (!total) return;
+    uint64_t k = 0;
+    uint64_t (*v)[2] = malloc(total * sizeof *v);
+    if (!v) return;
+    for (int t = 0; t < n_tables; t++)
+        for (uint64_t i = 0; i < tables[t].count; i++) {
+            v[k][0] = (uint64_t)(uintptr_t)tables[t].fns[i];
+            v[k++][1] = tables[t].addrs[i];
+        }
+    qsort(v, k, sizeof *v, cmp_host);
+    uint64_t (*old)[2] = __atomic_exchange_n(&g_byhost, v, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&g_byhost_n, k, __ATOMIC_RELEASE);
+    free(old);
+}
+
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
-    static uint64_t (*byhost)[2];  // {host address, guest address}, sorted by host address
-    static uint64_t n;
     static __thread char name[32];
-    if (!byhost) {
-        uint64_t total = 0;
-        for (int t = 0; t < n_tables; t++) total += tables[t].count;
-        uint64_t k = 0;
-        uint64_t (*v)[2] = malloc(total * sizeof *v);
-        if (!v) return NULL;
-        for (int t = 0; t < n_tables; t++)
-            for (uint64_t i = 0; i < tables[t].count; i++) {
-                v[k][0] = (uint64_t)(uintptr_t)tables[t].fns[i];
-                v[k++][1] = tables[t].addrs[i];
-            }
-        qsort(v, k, sizeof *v, cmp_host);
-        n = k;
-        byhost = v;
-    }
+    uint64_t (*byhost)[2] = __atomic_load_n(&g_byhost, __ATOMIC_ACQUIRE);
+    uint64_t n = __atomic_load_n(&g_byhost_n, __ATOMIC_ACQUIRE);
+    if (!byhost || !n) return NULL;
     uint64_t lo = 0, hi = n;  // last entry with host address <= pc
     while (lo < hi) {
         uint64_t mid = (lo + hi) / 2;
@@ -550,6 +559,9 @@ void rt_fatal_trace(void) {
                 fprintf(stderr, "  +%#06llx %016llx\n", off + k, (unsigned long long)*(const uint64_t *)(uintptr_t)(base + off + k));
         }
     }
+#ifdef __ANDROID__
+    plat_flush_logs();
+#endif
     plat_fatal_notice();
     // our crash handler also catches SIGABRT: without this abort() re-entered it forever (a 5 GB log)
     signal(SIGABRT, SIG_DFL);
@@ -730,6 +742,14 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
 
 void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
     fatal_gate();
+#ifdef __ANDROID__
+    {
+        char raw[256];
+        snprintf(raw, sizeof raw, "\n[CRASH] %s accessing %#llx host_pc=%#llx host_lr=%#llx\n",
+                 what ? what : "fault", (unsigned long long)fa, (unsigned long long)pc, (unsigned long long)lr);
+        plat_crash_write_raw(raw);
+    }
+#endif
     uint64_t po = 0, lo = 0;
     const char *ps = host_sym(pc, &po), *ls = host_sym(lr, &lo);
     if (pc >= GUEST_LO && pc < GUEST_HI) {  // (the game's own code, LARECOMP_NATIVE: named by the modules' symbols)
@@ -742,11 +762,11 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
     fprintf(stderr, "\n*** %s accessing %#llx\n    host pc %llx (%s+%llx)\n    host lr %llx (%s)\n", what,
             (unsigned long long)fa, (unsigned long long)pc, ps ? ps : "?", (unsigned long long)po,
             (unsigned long long)lr, ls ? ls : "?");
-    rt_fatal_trace();
     if (g_exec_mode == EXEC_RECOMP) {
         Cpu *c = kernel_current_cpu();
         fatal_recomp_diagnostic(c, pc, what);
     }
+    rt_fatal_trace();
 }
 
 void crash_handler_install(void) { plat_crash_handler_install(); }

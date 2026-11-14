@@ -40,6 +40,8 @@ uint64_t g_guest_lo;  // the window's start (rt.h GUEST_LO), set by plat_reserve
 // the setting is read, or a later switch on) wait in a buffer, so the file starts with the driver's and the GPU's lines.
 static pthread_mutex_t g_logf_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_logf;
+static int g_crash_log_fd = -1;             // dup of g_logf fd for async-signal-safe crash writes
+static volatile int g_in_signal_crash;
 static bool g_logf_in_folder;               // g_logf is in the picked folder (else the data root)
 static bool g_folder_started, g_root_started;  // this run's file was made there (a later switch on appends)
 static char g_early[64 << 10];
@@ -226,6 +228,7 @@ void android_log_file(bool on) {
     snprintf(root_prev, sizeof root_prev, "%s/botwrecomp-previous.log", rt_data_root());
     pthread_mutex_lock(&g_logf_lock);
     if (!on) {
+        if (g_crash_log_fd >= 0) { close(g_crash_log_fd); g_crash_log_fd = -1; }
         if (g_logf) fclose(g_logf);
         g_logf = NULL;
     } else if (!g_logf || !g_logf_in_folder) {  // (a folder picked while the data root's file is open: it moves)
@@ -235,13 +238,19 @@ void android_log_file(bool on) {
         if (fd >= 0 && !f) close(fd);
         if (f) {
             if (!g_folder_started) log_file_begin(f, root);
+            if (g_crash_log_fd >= 0) { close(g_crash_log_fd); g_crash_log_fd = -1; }
             if (g_logf) fclose(g_logf);
             g_logf = f;
+            g_crash_log_fd = dup(fileno(g_logf));
             g_logf_in_folder = g_folder_started = true;
         } else if (!g_logf) {
             if (!g_root_started) rename(root, root_prev);  // (a crash's log survives the next start)
             g_logf = fopen(root, g_root_started ? "a" : "w");
             if (g_logf && !g_root_started) log_file_begin(g_logf, root);
+            if (g_logf) {
+                if (g_crash_log_fd >= 0) close(g_crash_log_fd);
+                g_crash_log_fd = dup(fileno(g_logf));
+            }
             g_root_started |= g_logf != NULL;
             g_logf_in_folder = false;
         }
@@ -561,7 +570,38 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-void plat_init(void) { log_to_logcat(); }
+void plat_crash_write_raw(const char *s) {
+    if (!s || !*s) return;
+    __android_log_write(ANDROID_LOG_ERROR, "BOTWRecompAndroid", s);
+    int fd = __atomic_load_n(&g_crash_log_fd, __ATOMIC_ACQUIRE);
+    if (fd >= 0) {
+        size_t len = strlen(s);
+        ssize_t r = write(fd, s, len);
+        (void)r;
+        fsync(fd);
+    }
+}
+
+void plat_flush_logs(void) {
+    fflush(stdout);
+    fflush(stderr);
+    usleep(60000);  // give log_pump time to drain pipe into logcat + g_logf
+    if (pthread_mutex_trylock(&g_logf_lock) == 0) {
+        if (g_logf) {
+            fflush(g_logf);
+            fsync(fileno(g_logf));
+        }
+        pthread_mutex_unlock(&g_logf_lock);
+    } else {
+        int fd = __atomic_load_n(&g_crash_log_fd, __ATOMIC_ACQUIRE);
+        if (fd >= 0) fsync(fd);
+    }
+}
+
+void plat_init(void) {
+    log_to_logcat();
+    plat_crash_handler_install();
+}
 
 // "The executable": a file in the folder the app copies its shipped resources to (internal storage, files/res: the
 // Baloo font, the icon, ...), so runtime/paths.c finds them next to it as on the desktop. Native libraries stay in
@@ -615,7 +655,8 @@ static bool driver_error_dialog(const char *text) {
 }
 
 void plat_fatal_notice(void) {
-    fflush(stderr);
+    plat_flush_logs();
+    if (__atomic_load_n(&g_in_signal_crash, __ATOMIC_RELAXED)) return;
     char message[1400];
     snprintf(message, sizeof message, "BOTWRecompAndroid stopped because of an error.\n\n%s\n\n"
              "Please include a screenshot of this message and your app/driver version in your bug report.\n"
@@ -727,6 +768,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
                 si->si_code == SEGV_ACCERR ? "no access" : si->si_code == SEGV_MAPERR ? "not mapped" : "other", g_fault_wnr,
                 st, (unsigned long long)odd);
     }
+    __atomic_store_n(&g_in_signal_crash, 1, __ATOMIC_RELEASE);
     char what[32];
     snprintf(what, sizeof what, "signal %d", sig);
     if (pc >= GUEST_LO && pc < GUEST_HI) {  // (the game's own code on the CPU: its registers are the signal's, not the Cpu's)
@@ -742,16 +784,26 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
 }
 
 void plat_crash_handler_install(void) {
-    stack_t ss = {.ss_sp = malloc(1 << 20), .ss_size = 1 << 20};
-    sigaltstack(&ss, NULL);
-    struct sigaction sa = {0};
-    sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-    sigaction(SIGFPE, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
+    static __thread bool ss_installed;
+    if (!ss_installed) {
+        ss_installed = true;
+        void *sp = malloc(128 * 1024);
+        if (sp) {
+            stack_t ss = {.ss_sp = sp, .ss_size = 128 * 1024};
+            sigaltstack(&ss, NULL);
+        }
+    }
+    static atomic_bool sa_installed;
+    if (!atomic_exchange(&sa_installed, true)) {
+        struct sigaction sa = {0};
+        sa.sa_sigaction = crash_handler;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGILL, &sa, NULL);
+        sigaction(SIGFPE, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+    }
 }
 
 // ---- child processes (none of the desktop's helpers exist on Android yet: docs/las/ANDROID-PORT.md, Fases 6-7)

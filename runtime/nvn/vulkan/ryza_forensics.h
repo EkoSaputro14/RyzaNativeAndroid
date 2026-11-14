@@ -138,6 +138,10 @@ void ryza_capture_draw_state(uint64_t frame, uint32_t draw_idx, uint64_t vs_code
                              bool indexed, uint32_t icount, uint32_t itype, uint64_t iaddr,
                              int32_t base_vertex);
 void ryza_export_diagnostic_log(void);
+void ryza_request_auto_dump(uint32_t draw_idx);
+void ryza_process_pending_auto_dump(void);
+void ryza_capture_lock(void);
+void ryza_capture_unlock(void);
 void ryza_run_file_write_test(void);
 void ryza_rearm_capture(void);
 

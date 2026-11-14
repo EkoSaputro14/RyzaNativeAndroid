@@ -4310,17 +4310,27 @@ bool vk_heap_place(uint64_t size) {
     }
     {   // The placed heap is committed at once (~3.1 GB for BOTW), where CPU copies commit only the pages the game
         // touches: on a 6 GB phone with it turned on by hand, Android killed the app as the world loaded (issue #83,
-        // Adreno 640, 3.6 GB in use). Below ~7 GB of RAM (6 GB phones report ~5.5, 8 GB ones ~7.4): CPU copies whatever
-        // the setting says. LARECOMP_HEAP_ANY_RAM=1: placed anyway.
-        long total_kb = 0;
+        // Adreno 640, 3.6 GB in use). Below ~7 GB of RAM (6 GB phones report ~5.5, 8 GB ones ~7.4) or when MemAvailable
+        // cannot spare the upfront allocation plus ~1.5 GB headroom for the runtime/driver/recomp SO: CPU copies.
+        // LARECOMP_HEAP_ANY_RAM=1: placed anyway.
+        long total_kb = 0, avail_kb = 0;
         FILE *f = fopen("/proc/meminfo", "r");
         if (f) {
-            if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
+            char line[128];
+            while (fgets(line, sizeof line, f)) {
+                long v = 0;
+                if (!total_kb && sscanf(line, "MemTotal: %ld kB", &v) == 1) total_kb = v;
+                else if (!avail_kb && sscanf(line, "MemAvailable: %ld kB", &v) == 1) avail_kb = v;
+                if (total_kb && avail_kb) break;
+            }
             fclose(f);
         }
-        if (total_kb && total_kb < 7L * 1024 * 1024 && !getenv("LARECOMP_HEAP_ANY_RAM")) {
-            LOG("[vk] guest heap as GPU memory: off (%ld MB of RAM: it would take %llu MB at once) - shader global memory "
-                "through CPU copies\n", total_kb >> 10, (unsigned long long)(size >> 20));
+        long need_kb = (long)(size >> 10) + 1536L * 1024L;
+        if (((total_kb && total_kb < 7L * 1024 * 1024) || (avail_kb && avail_kb < need_kb)) &&
+            !getenv("LARECOMP_HEAP_ANY_RAM")) {
+            LOG("[vk] guest heap as GPU memory: off (MemTotal %ld MB, MemAvail %ld MB: placing %llu MB needs >= %ld MB free) - "
+                "shader global memory through CPU copies\n",
+                total_kb >> 10, avail_kb >> 10, (unsigned long long)(size >> 20), need_kb >> 10);
             return NOT_PLACED();
         }
     }
@@ -7159,10 +7169,19 @@ static void ryza_mat4_mul_vec(const float m[16], const float v[4], bool row_majo
     }
 }
 
+static inline bool ryza_guest_readable(uint64_t addr, uint64_t size) {
+    return size > 0 && addr >= GUEST_LO && addr <= GUEST_HI && size <= GUEST_HI - addr;
+}
+
+static uint32_t ryza_read_index(const void *isrc, uint32_t isz, uint32_t idx) {
+    if (isz == 1) return ((const uint8_t *)isrc)[idx];
+    if (isz == 2) return ((const uint16_t *)isrc)[idx];
+    return ((const uint32_t *)isrc)[idx];
+}
+
 static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
     (void)r;
-    (void)count;
-    if (!use_index || icount < 30 || !pr || !pr->vi) return;
+    if (!use_index || count == 0 || icount < 30 || !pr || !pr->vi) return;
     if (g_ryza_capture_freeze) return;
 
     g_ryza_3d_draw_count++;
@@ -7195,7 +7214,8 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         uint32_t sn = (a >> 8) & 0x1F;
         uint32_t off = a >> 13;
         uint32_t elem_sz = ryza_fmt_byte_size(fmt);
-        if (sn < 16 && st.vbuf[sn].addr && (uint64_t)off + elem_sz <= st.vbuf[sn].size) {
+        if (sn < 16 && st.vbuf[sn].addr && (uint64_t)off + elem_sz <= st.vbuf[sn].size &&
+            ryza_guest_readable(st.vbuf[sn].addr + off, elem_sz)) {
             float p0[4];
             if (ryza_decode_pos(fmt, (const void *)(uintptr_t)(st.vbuf[sn].addr + off), p0)) {
                 if (!isfinite(p0[0]) || !isfinite(p0[1]) || !isfinite(p0[2]) ||
@@ -7206,8 +7226,12 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         }
     }
 
+    ryza_capture_lock();
     RyzaDrawForensic *d = ryza_allocate_capture_slot(icount, pr->vi->attr_mask, has_bones, is_character, is_deformed);
-    if (!d) return;
+    if (!d) {
+        ryza_capture_unlock();
+        return;
+    }
 
     d->frame = renderer_present_count();
     d->draw_idx = (uint32_t)stat_draws;
@@ -7246,8 +7270,11 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             if (st.vbuf[sn].addr && st.vbuf[sn].size >= (uint64_t)d->attrs[i].off + elem_sz) {
                 uint64_t avail = st.vbuf[sn].size - d->attrs[i].off;
                 size_t cp = avail >= 16 ? 16 : (size_t)avail;
-                memcpy(d->attrs[i].raw_data, (const void *)(uintptr_t)(st.vbuf[sn].addr + d->attrs[i].off), cp);
-                memcpy(d->attrs[i].float_data, d->attrs[i].raw_data, sizeof(d->attrs[i].float_data));
+                uint64_t src_addr = st.vbuf[sn].addr + d->attrs[i].off;
+                if (ryza_guest_readable(src_addr, cp)) {
+                    memcpy(d->attrs[i].raw_data, (const void *)(uintptr_t)src_addr, cp);
+                    memcpy(d->attrs[i].float_data, d->attrs[i].raw_data, sizeof(d->attrs[i].float_data));
+                }
             }
         }
         if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D)) {
@@ -7265,11 +7292,13 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     // Constant buffer capture: prefer game VS UBOs (st.ubuf[0][0..3]) for transforms & bone palette,
     // falling back to compiler const pool (vss->const_offset) if no game UBO is bound.
     NvnShaderStage *vss = st_stage(0);
-    if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 64) {
+    if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 64 &&
+        ryza_guest_readable(st.ubuf[0][0].addr, sizeof(d->cbuf1_sample))) {
         d->cbuf1_addr = st.ubuf[0][0].addr;
         d->cbuf1_size = (uint32_t)st.ubuf[0][0].size;
         memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
-    } else if (vss && vss->const_size >= 64) {
+    } else if (vss && vss->code_addr && vss->const_offset && vss->const_size >= 64 &&
+               ryza_guest_readable(vss->code_addr + vss->const_offset, sizeof(d->cbuf1_sample))) {
         d->cbuf1_addr = vss->code_addr + vss->const_offset;
         d->cbuf1_size = vss->const_size;
         memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
@@ -7277,13 +7306,15 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
 
     int bone_ubuf = -1;
     for (int u = 1; u < 4; u++) {
-        if (st.ubuf[0][u].addr && st.ubuf[0][u].size >= 128) {
+        if (st.ubuf[0][u].addr && st.ubuf[0][u].size >= 128 &&
+            ryza_guest_readable(st.ubuf[0][u].addr, sizeof(d->cbuf3_sample))) {
             if (bone_ubuf < 0 || st.ubuf[0][u].size > st.ubuf[0][bone_ubuf].size) {
                 bone_ubuf = u;
             }
         }
     }
-    if (bone_ubuf < 0 && st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128) {
+    if (bone_ubuf < 0 && st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128 &&
+        ryza_guest_readable(st.ubuf[0][0].addr, sizeof(d->cbuf3_sample))) {
         bone_ubuf = 0;
     }
     if (bone_ubuf >= 0) {
@@ -7294,31 +7325,37 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
 
     bool has_mvp = d->cbuf1_addr && d->cbuf1_size >= 64 && ryza_mat4_finite_nonzero(d->cbuf1_sample);
 
-    const void *isrc = (const void *)(uintptr_t)iaddr;
-    if (isrc) {
-        uint32_t isz = itype == 1 ? 2 : 4;
+    uint32_t isz = (itype == 0) ? 1u : (itype == 1) ? 2u : 4u;
+    uint32_t scan_count = count > 256 ? 256 : count;
+    if (iaddr && scan_count > 0 && ryza_guest_readable(iaddr, (uint64_t)scan_count * isz)) {
+        const void *isrc = (const void *)(uintptr_t)iaddr;
+        uint32_t restart_val = (isz == 1) ? 0xFFu : (isz == 2) ? 0xFFFFu : 0xFFFFFFFFu;
         uint32_t min_idx = 0xFFFFFFFFu, max_idx = 0;
-        for (uint32_t i = 0; i < icount && i < 16; i++) {
-            uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
-            d->raw_indices[i] = val;
+        for (uint32_t i = 0; i < scan_count && i < 16; i++) {
+            d->raw_indices[i] = ryza_read_index(isrc, isz, i);
         }
-        // Bounded scan up to 256 indices to avoid massive CPU stalls
-        uint32_t scan_limit = icount > 256 ? 256 : icount;
-        for (uint32_t i = 0; i < scan_limit; i++) {
-            uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
+        // Bounded scan up to 256 raw indices to avoid reading past unexpanded guest IB or stalling CPU
+        for (uint32_t i = 0; i < scan_count; i++) {
+            uint32_t val = ryza_read_index(isrc, isz, i);
+            if (st.prim_restart && val == restart_val) continue;
             if (val < min_idx) min_idx = val;
             if (val > max_idx) max_idx = val;
         }
+        if (min_idx > max_idx) min_idx = max_idx = 0;
         d->min_idx = min_idx;
         d->max_idx = max_idx;
 
+        uint32_t first0 = (st.prim_restart && d->raw_indices[0] == restart_val) ? min_idx : d->raw_indices[0];
+        uint32_t first1 = (1 < scan_count && !(st.prim_restart && d->raw_indices[1] == restart_val)) ? d->raw_indices[1] : first0;
+        uint32_t first2 = (2 < scan_count && !(st.prim_restart && d->raw_indices[2] == restart_val)) ? d->raw_indices[2] : first0;
+
         uint32_t sample_indices[6];
         sample_indices[0] = min_idx;
-        sample_indices[1] = (min_idx + max_idx) / 2;
+        sample_indices[1] = min_idx + (max_idx - min_idx) / 2u;
         sample_indices[2] = max_idx;
-        sample_indices[3] = d->raw_indices[0];
-        sample_indices[4] = d->raw_indices[1 < icount ? 1 : 0];
-        sample_indices[5] = d->raw_indices[2 < icount ? 2 : 0];
+        sample_indices[3] = first0;
+        sample_indices[4] = first1;
+        sample_indices[5] = first2;
 
         d->num_samples = 6;
         for (uint32_t s = 0; s < 6; s++) {
@@ -7335,35 +7372,38 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
                 uint32_t afmt = st.attrib[a] & 0xFF;
                 uint32_t elem_sz = ryza_fmt_byte_size(afmt);
-                if (sn < 16 && st.vbuf[sn].addr && stride > 0) {
-                    uint64_t attr_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
-                    if (attr_addr + elem_sz <= st.vbuf[sn].addr + st.vbuf[sn].size) {
-                        uint64_t avail = (st.vbuf[sn].addr + st.vbuf[sn].size) - attr_addr;
+                if (sn < 16 && st.vbuf[sn].addr && st.vbuf[sn].size > 0 && stride > 0) {
+                    uint64_t rel = (uint64_t)off + (uint64_t)vidx * stride;
+                    if (rel <= st.vbuf[sn].size && elem_sz <= st.vbuf[sn].size - rel) {
+                        uint64_t attr_addr = st.vbuf[sn].addr + rel;
+                        uint64_t avail = st.vbuf[sn].size - rel;
                         size_t cp = avail >= 16 ? 16 : (size_t)avail;
-                        memcpy(vs->attr_raw[a], (const void *)(uintptr_t)attr_addr, cp);
+                        if (ryza_guest_readable(attr_addr, cp)) {
+                            memcpy(vs->attr_raw[a], (const void *)(uintptr_t)attr_addr, cp);
 
-                        if (a == pos_attr) {
-                            if (!ryza_decode_pos(afmt, (const void *)(uintptr_t)attr_addr, vs->pos)) {
-                                const float *pf = (const float *)(uintptr_t)attr_addr;
-                                vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                            if (a == pos_attr) {
+                                if (!ryza_decode_pos(afmt, (const void *)(uintptr_t)attr_addr, vs->pos) && avail >= 12) {
+                                    const float *pf = (const float *)(uintptr_t)attr_addr;
+                                    vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                                }
                             }
-                        }
-                        if (afmt == 0x27) { // R8G8B8A8_UINT bone indices
-                            const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
-                            vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
-                            vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                        } else if (afmt == 0x2C) { // R16G16B16A16_UINT bone indices
-                            const uint16_t *b = (const uint16_t *)(uintptr_t)attr_addr;
-                            vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
-                            vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                        } else if (afmt == 0x25) { // R8G8B8A8_UNORM bone weights
-                            const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
-                            vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
-                            vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
-                        } else if (afmt == 0x2A) { // R16G16B16A16_UNORM bone weights
-                            const uint16_t *w = (const uint16_t *)(uintptr_t)attr_addr;
-                            vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
-                            vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
+                            if (afmt == 0x27 && avail >= 4) { // R8G8B8A8_UINT bone indices
+                                const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
+                                vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                                vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                            } else if (afmt == 0x2C && avail >= 8) { // R16G16B16A16_UINT bone indices
+                                const uint16_t *b = (const uint16_t *)(uintptr_t)attr_addr;
+                                vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                                vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                            } else if (afmt == 0x25 && avail >= 4) { // R8G8B8A8_UNORM bone weights
+                                const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
+                                vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
+                                vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
+                            } else if (afmt == 0x2A && avail >= 8) { // R16G16B16A16_UNORM bone weights
+                                const uint16_t *w = (const uint16_t *)(uintptr_t)attr_addr;
+                                vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
+                                vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
+                            }
                         }
                     }
                 }
@@ -7381,7 +7421,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                     float w = vs->bone_weights[k];
                     if (w > 0.0001f) {
                         uint32_t bidx = vs->bone_indices[k];
-                        if (bidx >= max_bones) {
+                        if (bidx >= max_bones || !ryza_guest_readable(d->cbuf3_addr + (uint64_t)bidx * 48u, 48u)) {
                             bone_oob = true;
                         } else {
                             // Standard 3x4 row-major bone matrix (3 vec4s = 12 floats)
@@ -7426,12 +7466,16 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         }
     }
 
-    // Auto-dump saat deformasi mesh karakter terdeteksi
+    uint32_t dump_draw_idx = d->draw_idx;
+    bool trigger_dump = d->is_deformed;
+    ryza_capture_unlock();
+
+    // Defer file export to UI/main thread to avoid JNI/SAF stalls or crashes on the Vulkan render thread
     static bool s_auto_dumped = false;
-    if (d->is_deformed && !s_auto_dumped) {
+    if (trigger_dump && !s_auto_dumped) {
         s_auto_dumped = true;
-        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP TRIGGERED: Mesh corruption detected on Draw %u!\n", d->draw_idx);
-        ryza_export_diagnostic_log();
+        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP QUEUED: Mesh corruption detected on Draw %u!\n", dump_draw_idx);
+        ryza_request_auto_dump(dump_draw_idx);
     }
 }
 
