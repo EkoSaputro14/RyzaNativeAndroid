@@ -61,8 +61,8 @@ if(NOT RYZA_GIT_COMMIT)
 endif()
 
 file(READ "${R}/android/botwrecompandroid/app/build.gradle.kts" RYZA_GRADLE_CFG)
-set(RYZA_VERSION_CODE "39")
-set(RYZA_VERSION_NAME "0.3.2-forensic-p6")
+set(RYZA_VERSION_CODE "40")
+set(RYZA_VERSION_NAME "0.3.2-forensic-p7")
 if(RYZA_GRADLE_CFG MATCHES "versionCode[ \t]*=[ \t]*([0-9]+)")
     set(RYZA_VERSION_CODE "${CMAKE_MATCH_1}")
 endif()
@@ -92,4 +92,4 @@ target_link_libraries(main PRIVATE SDL3 shaderc_shared adrenotools android log d
 # (runtime/hle.h, ipc.h, main.c: tables in named sections found through __start_ / __stop_ symbols)
 # -rdynamic / -Wl,-export-dynamic agar simbol-simbol runtime seperti g_fnprof, fnprof_hit, dll
 # dapat di-resolve saat dlopen() botwgame.so
-target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc -Wl,-export-dynamic)
+target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc -Wl,-z,global -Wl,-export-dynamic)

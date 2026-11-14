@@ -162,6 +162,27 @@ static const GameLibTables *open_lib(const char *path) {
     if (!h) { snprintf(g_error, sizeof g_error, "can't load %s (error %lu)", path, GetLastError()); return NULL; }
     GameLibEntry entry = (GameLibEntry)(void *)GetProcAddress(h, GAMELIB_ENTRY);
 #else
+#ifdef __ANDROID__
+    // Ensure libmain.so symbols (rt_udf, rt_dispatch, rt_svc, rt_ticks, fnprof_hit, g_fnprof, ...)
+    // are visible globally even when botwgame.so was linked without DT_NEEDED libmain.so.
+    static bool globalized_main = false;
+    if (!globalized_main) {
+        globalized_main = true;
+        void *self = dlopen("libmain.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!self) {
+            const char *nld = rt_native_lib_dir();
+            if (nld && *nld) {
+                char mp[1024];
+                snprintf(mp, sizeof mp, "%s/libmain.so", nld);
+                self = dlopen(mp, RTLD_NOW | RTLD_GLOBAL);
+            }
+        }
+        if (!self) {
+            LOG("[gamelib] warning: failed to promote libmain.so RTLD_GLOBAL: %s
+", dlerror());
+        }
+    }
+#endif
     void *h = NULL;
     h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
