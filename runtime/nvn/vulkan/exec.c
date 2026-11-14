@@ -27,6 +27,10 @@
 #include "precompute.h"
 
 
+static inline bool ryza_guest_readable(uint64_t addr, uint64_t size) {
+    return size > 0 && addr >= GUEST_LO && addr <= GUEST_HI && size <= GUEST_HI - addr;
+}
+
 static inline VkSpan vk_transient_copy_padded4(const void *src, uint64_t bytes) {
     VkSpan s = vk_transient(bytes + 4, 4);
     if (bytes) memcpy(s.ptr, src, (size_t)bytes);
@@ -7201,9 +7205,6 @@ static void ryza_mat4_mul_vec(const float m[16], const float v[4], bool row_majo
     }
 }
 
-static inline bool ryza_guest_readable(uint64_t addr, uint64_t size) {
-    return size > 0 && addr >= GUEST_LO && addr <= GUEST_HI && size <= GUEST_HI - addr;
-}
 
 static uint32_t ryza_read_index(const void *isrc, uint32_t isz, uint32_t idx) {
     if (isz == 1) return ((const uint8_t *)isrc)[idx];
