@@ -21,11 +21,15 @@ package com.botwrecompandroid;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
 import android.provider.DocumentsContract;
+import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.content.IntentFilter;
 import android.content.res.AssetManager;
@@ -86,7 +90,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
     private static native void nativeSaveDone(int result, String detail);
     private static final int REQ_GAME = 0x4c41, REQ_DRIVER = 0x4c42, REQ_MOD = 0x4c46, REQ_LOG = 0x4c47,
             REQ_DRIVER_RECOVER = 0x4c48, REQ_SAVE_IN = 0x4c49, REQ_SAVE_OUT = 0x4c4a, REQ_SAVE_IN_TREE = 0x4c4c,
-            REQ_DLC = 0x4c4d, REQ_GAMELIB = 0x4c4e;
+            REQ_DLC = 0x4c4d, REQ_GAMELIB = 0x4c4e, REQ_LOG_EXPORT = 0x4c4f;
     private native String nativeBuildDlc(String[] paths, long[] sizes);
     private static native void nativeDlcDone(int result, String detail);
     private static BOTWRecompAndroidActivity self;
@@ -453,6 +457,31 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             nativeLogFolderPicked(logFolderName());  // ("": cancelled, or no write access)
             return;
         }
+        if (req == REQ_LOG_EXPORT) {
+            Uri dst = result == Activity.RESULT_OK && data != null ? data.getData() : null;
+            if (dst != null && s_logExportSource != null) {
+                String src = s_logExportSource;
+                s_logExportSource = null;
+                new Thread(() -> {
+                    try {
+                        int rfd = openLogFileForRead(src);
+                        if (rfd >= 0) {
+                            try (FileInputStream in = new FileInputStream(android.os.ParcelFileDescriptor.adoptFd(rfd).getFileDescriptor());
+                                 OutputStream out = getContentResolver().openOutputStream(dst)) {
+                                byte[] buf = new byte[8192];
+                                int n;
+                                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                                out.flush();
+                            }
+                            Log.i(TAG, "Log file " + src + " exported successfully to " + dst);
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "export log copy failed", e);
+                    }
+                }).start();
+            }
+            return;
+        }
         super.onActivityResult(req, result, data);
     }
 
@@ -531,28 +560,227 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
 
     // A file descriptor to write the log to (native code owns it), -1 without a usable folder. first: the run's first
     // open - the last run's log becomes the previous one and a new file starts; otherwise this run's is appended to.
+    public static final String LOG_FORENSIC = "ryza_forensic_dump.txt", LOG_FORENSIC_PREV = "ryza_forensic_dump_previous.txt";
+    private static String s_logExportSource = null;
+
     public static int openLog(boolean first) {
-        Uri tree = logTree();
-        if (tree == null) return -1;
+        return openLogFile(LOG_NAME, first);
+    }
+
+    public static int openLogFile(String filename, boolean first) {
+        if (self == null) return -1;
+        String prevName = filename.contains(".") ? filename.replaceFirst("\\.", "_previous.") : (filename + "_previous");
+
+        // 1. Existing SAF picked folder
         try {
-            ContentResolver cr = self.getContentResolver();
-            String treeId = DocumentsContract.getTreeDocumentId(tree);
-            List<Doc> kids = self.children(tree, treeId);
-            Doc cur = named(kids, LOG_NAME), prev = named(kids, LOG_PREVIOUS);
-            if (first && cur != null) {
-                if (prev != null) DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, prev.id));
-                DocumentsContract.renameDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, cur.id), LOG_PREVIOUS);
-                cur = null;
+            Uri tree = logTree();
+            if (tree != null) {
+                ContentResolver cr = self.getContentResolver();
+                String treeId = DocumentsContract.getTreeDocumentId(tree);
+                List<Doc> kids = self.children(tree, treeId);
+                Doc cur = named(kids, filename), prev = named(kids, prevName);
+                if (first && cur != null) {
+                    if (prev != null) {
+                        try { DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, prev.id)); } catch (Exception ignored) {}
+                    }
+                    try { DocumentsContract.renameDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, cur.id), prevName); } catch (Exception ignored) {}
+                    cur = null;
+                }
+                Uri file = cur != null ? DocumentsContract.buildDocumentUriUsingTree(tree, cur.id)
+                    : DocumentsContract.createDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, treeId), "text/plain", filename);
+                if (file != null) {
+                    android.os.ParcelFileDescriptor pfd = cr.openFileDescriptor(file, first ? "wt" : "wa");
+                    if (pfd != null) return pfd.detachFd();
+                }
             }
-            Uri file = cur != null ? DocumentsContract.buildDocumentUriUsingTree(tree, cur.id)
-                : DocumentsContract.createDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, treeId), "text/plain", LOG_NAME);
-            if (file == null) return -1;
-            android.os.ParcelFileDescriptor pfd = cr.openFileDescriptor(file, first ? "wt" : "wa");
-            return pfd == null ? -1 : pfd.detachFd();
         } catch (Exception e) {
-            Log.w(TAG, "log file in the picked folder", e);
-            return -1;
+            Log.w(TAG, "openLogFile SAF " + filename, e);
         }
+
+        // 2. Fallback to App External / Internal Files
+        try {
+            File dir = self.getExternalFilesDir(null);
+            if (dir == null) dir = self.getFilesDir();
+            if (dir != null) {
+                if (!dir.exists()) dir.mkdirs();
+                File curFile = new File(dir, filename);
+                File prevFile = new File(dir, prevName);
+                if (first && curFile.exists()) {
+                    if (prevFile.exists()) prevFile.delete();
+                    curFile.renameTo(prevFile);
+                }
+                android.os.ParcelFileDescriptor pfd = android.os.ParcelFileDescriptor.open(curFile,
+                    android.os.ParcelFileDescriptor.MODE_CREATE | android.os.ParcelFileDescriptor.MODE_READ_WRITE | (first ? android.os.ParcelFileDescriptor.MODE_TRUNCATE : 0));
+                if (pfd != null) return pfd.detachFd();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "openLogFile file fallback " + filename, e);
+        }
+
+        return -1;
+    }
+
+    public static int openLogFileForRead(String filename) {
+        if (self == null) return -1;
+        try {
+            Uri tree = logTree();
+            if (tree != null) {
+                String treeId = DocumentsContract.getTreeDocumentId(tree);
+                List<Doc> kids = self.children(tree, treeId);
+                Doc cur = named(kids, filename);
+                if (cur != null) {
+                    Uri file = DocumentsContract.buildDocumentUriUsingTree(tree, cur.id);
+                    android.os.ParcelFileDescriptor pfd = self.getContentResolver().openFileDescriptor(file, "r");
+                    if (pfd != null) return pfd.detachFd();
+                }
+            }
+        } catch (Exception ignored) {}
+
+        try {
+            File dir = self.getExternalFilesDir(null);
+            if (dir == null) dir = self.getFilesDir();
+            if (dir != null) {
+                File target = new File(dir, filename);
+                if (target.exists()) {
+                    android.os.ParcelFileDescriptor pfd = android.os.ParcelFileDescriptor.open(target, android.os.ParcelFileDescriptor.MODE_READ_ONLY);
+                    if (pfd != null) return pfd.detachFd();
+                }
+            }
+        } catch (Exception ignored) {}
+
+        return -1;
+    }
+
+    public static String listLogFiles() {
+        if (self == null) return "";
+        StringBuilder sb = new StringBuilder();
+        try {
+            Uri tree = logTree();
+            if (tree != null) {
+                String treeId = DocumentsContract.getTreeDocumentId(tree);
+                List<Doc> kids = self.children(tree, treeId);
+                for (Doc d : kids) {
+                    if (!d.dir && (d.name.endsWith(".txt") || d.name.endsWith(".log"))) {
+                        if (sb.length() > 0) sb.append(";");
+                        sb.append(d.name).append("|").append(d.size >= 0 ? d.size : 0);
+                    }
+                }
+            } else {
+                File dir = self.getExternalFilesDir(null);
+                if (dir == null) dir = self.getFilesDir();
+                if (dir != null && dir.exists()) {
+                    File[] files = dir.listFiles();
+                    if (files != null) {
+                        for (File f : files) {
+                            if (f.isFile() && (f.getName().endsWith(".txt") || f.getName().endsWith(".log"))) {
+                                if (sb.length() > 0) sb.append(";");
+                                sb.append(f.getName()).append("|").append(f.length());
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "listLogFiles failed", e);
+        }
+        return sb.toString();
+    }
+
+    public static void shareLogFile(String filename) {
+        if (self == null) return;
+        self.runOnUiThread(() -> {
+            try {
+                Uri fileUri = null;
+                Uri tree = logTree();
+                if (tree != null) {
+                    String treeId = DocumentsContract.getTreeDocumentId(tree);
+                    List<Doc> kids = self.children(tree, treeId);
+                    Doc cur = named(kids, filename);
+                    if (cur != null) {
+                        fileUri = DocumentsContract.buildDocumentUriUsingTree(tree, cur.id);
+                    }
+                }
+                if (fileUri != null) {
+                    Intent intent = new Intent(Intent.ACTION_SEND);
+                    intent.setType("text/plain");
+                    intent.putExtra(Intent.EXTRA_STREAM, fileUri);
+                    intent.putExtra(Intent.EXTRA_SUBJECT, "Log: " + filename);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    Intent chooser = Intent.createChooser(intent, "Share " + filename);
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    self.startActivity(chooser);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "shareLogFile failed: " + filename, e);
+            }
+        });
+    }
+
+    public static void viewLogFile(String filename) {
+        if (self == null) return;
+        self.runOnUiThread(() -> {
+            try {
+                Uri fileUri = null;
+                Uri tree = logTree();
+                if (tree != null) {
+                    String treeId = DocumentsContract.getTreeDocumentId(tree);
+                    List<Doc> kids = self.children(tree, treeId);
+                    Doc cur = named(kids, filename);
+                    if (cur != null) {
+                        fileUri = DocumentsContract.buildDocumentUriUsingTree(tree, cur.id);
+                    }
+                }
+                if (fileUri != null) {
+                    Intent intent = new Intent(Intent.ACTION_VIEW);
+                    intent.setDataAndType(fileUri, "text/plain");
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    Intent chooser = Intent.createChooser(intent, "View " + filename);
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    self.startActivity(chooser);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "viewLogFile failed: " + filename, e);
+            }
+        });
+    }
+
+    public static boolean deleteLogFile(String filename) {
+        if (self == null) return false;
+        try {
+            Uri tree = logTree();
+            if (tree != null) {
+                ContentResolver cr = self.getContentResolver();
+                String treeId = DocumentsContract.getTreeDocumentId(tree);
+                List<Doc> kids = self.children(tree, treeId);
+                Doc cur = named(kids, filename);
+                if (cur != null) {
+                    return DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, cur.id));
+                }
+            }
+            File dir = self.getExternalFilesDir(null);
+            if (dir == null) dir = self.getFilesDir();
+            File f = new File(dir, filename);
+            if (f.exists()) return f.delete();
+        } catch (Exception e) {
+            Log.e(TAG, "deleteLogFile failed: " + filename, e);
+        }
+        return false;
+    }
+
+    public static void exportLogFile(String filename) {
+        if (self == null) return;
+        s_logExportSource = filename;
+        self.runOnUiThread(() -> {
+            try {
+                Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("text/plain");
+                i.putExtra(Intent.EXTRA_TITLE, filename);
+                self.startActivityForResult(i, REQ_LOG_EXPORT);
+            } catch (Exception e) {
+                Log.e(TAG, "exportLogFile picker failed", e);
+            }
+        });
     }
 
     // ---- saves (the start screen's Settings > Saves): this version's save_0 lives in Android/data/, out of file managers'

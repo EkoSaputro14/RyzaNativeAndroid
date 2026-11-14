@@ -213,19 +213,86 @@ void perf_overlay_draw(ImVec2 display, float scale) {
 
     ImGui::Separator();
     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "BUILD: %s", ryza_get_build_fingerprint());
-    ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "Ryza 3D Character Draws: %llu (Captured: %u)",
-                       (unsigned long long)g_ryza_3d_draw_count, g_ryza_captured_draw_count);
+    ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "3D Draws: %llu | Char: %llu | Captured: %u/32",
+                       (unsigned long long)g_ryza_3d_draw_count,
+                       (unsigned long long)g_ryza_character_draw_count,
+                       g_ryza_captured_draw_count);
+
+    // ACTION BUTTONS
     if (ImGui::Button("Force Dump Log Now")) {
         ryza_export_diagnostic_log();
     }
+    ImGui::SameLine();
+    if (ImGui::Button("TEST FORENSIC FILE WRITE")) {
+        ryza_run_file_write_test();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(g_ryza_capture_freeze ? "Unfreeze" : "Freeze")) {
+        g_ryza_capture_freeze = !g_ryza_capture_freeze;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Re-arm")) {
+        ryza_rearm_capture();
+    }
+
+    // FORCE DUMP DIAGNOSTIC STATUS
+    if (g_ryza_dump_result.status == RYZA_DUMP_STATUS_RUNNING) {
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), "FORCE DUMP: RUNNING...");
+    } else if (g_ryza_dump_result.status == RYZA_DUMP_STATUS_SUCCESS) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "FORCE DUMP: SUCCESS (%zu bytes)", g_ryza_dump_result.bytes_written);
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "  Path: %s", g_ryza_dump_result.target_path);
+        ImGui::TextDisabled("  Time: %s", g_ryza_dump_result.timestamp);
+    } else if (g_ryza_dump_result.status == RYZA_DUMP_STATUS_FAILED) {
+        ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f), "FORCE DUMP: FAILED (Err %d: %s)",
+                           g_ryza_dump_result.error_code, g_ryza_dump_result.error_msg);
+        ImGui::TextDisabled("  Target: %s | Written: %zu", g_ryza_dump_result.target_path, g_ryza_dump_result.bytes_written);
+    } else {
+        ImGui::TextDisabled("FORCE DUMP: IDLE");
+    }
+
+    // SELF-TEST DIAGNOSTIC STATUS
+    if (g_ryza_test_result.ran) {
+        if (g_ryza_test_result.passed) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "STORAGE TEST: PASS (Wrote: %zu, Read: %zu)",
+                               g_ryza_test_result.bytes_written, g_ryza_test_result.bytes_read);
+            ImGui::TextDisabled("  Test Path: %s", g_ryza_test_result.target_path);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.25f, 0.25f, 1.0f), "STORAGE TEST: FAIL (Err %d: %s)",
+                               g_ryza_test_result.error_code, g_ryza_test_result.error_msg);
+            ImGui::TextDisabled("  Target: %s", g_ryza_test_result.target_path);
+        }
+    }
+
+#if defined(__ANDROID__)
+    if (g_ryza_dump_result.status == RYZA_DUMP_STATUS_SUCCESS) {
+        if (ImGui::Button("Share Dump File")) {
+            android_share_log_file("ryza_forensic_dump.txt");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Export Dump File")) {
+            android_export_log_file("ryza_forensic_dump.txt");
+        }
+    }
+#endif
 
     if (g_ryza_captured_draw_count > 0) {
-        static int selected_draw = 0;
-        if (selected_draw >= (int)g_ryza_captured_draw_count) selected_draw = (int)g_ryza_captured_draw_count - 1;
+        static int selected_draw = -1;
+        // Cari slot pertama yang berisi karakter atau mesh terdeformasi agar tidak menampilkan environment kosong
+        if (selected_draw < 0 || selected_draw >= (int)g_ryza_captured_draw_count) {
+            selected_draw = 0;
+            for (uint32_t i = 0; i < g_ryza_captured_draw_count; i++) {
+                if (g_ryza_captured_draws[i].is_valid && (g_ryza_captured_draws[i].is_character || g_ryza_captured_draws[i].is_deformed)) {
+                    selected_draw = (int)i;
+                    break;
+                }
+            }
+        }
 
         ImGui::SliderInt("Submesh##rdraw", &selected_draw, 0, (int)g_ryza_captured_draw_count - 1);
         RyzaDrawForensic *d = &g_ryza_captured_draws[selected_draw];
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.8f, 1.0f), "[%s]", d->body_part);
+        ImGui::TextColored(d->is_deformed ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f) :
+                           (d->is_character ? ImVec4(0.2f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.5f, 0.8f, 1.0f)),
+                           "[%s]", d->body_part);
         ImGui::TextDisabled("Frame %llu Draw #%u | VS: %llx FS: %llx",
                             (unsigned long long)d->frame, d->draw_idx,
                             (unsigned long long)d->vs_code, (unsigned long long)d->fs_code);

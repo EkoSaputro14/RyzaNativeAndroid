@@ -80,6 +80,132 @@ static int picked_folder_log(bool first) {  // BOTWRecompAndroidActivity.openLog
     return fd;
 }
 
+int android_open_log_named(const char *name, bool first) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return -1;
+    int fd = -1;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "openLogFile", "(Ljava/lang/String;Z)I");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        fd = (*env)->CallStaticIntMethod(env, c, m, js, (jboolean)first);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fd = -1; }
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+    return fd;
+}
+
+int android_open_log_for_read(const char *name) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return -1;
+    int fd = -1;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "openLogFileForRead", "(Ljava/lang/String;)I");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        fd = (*env)->CallStaticIntMethod(env, c, m, js);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); fd = -1; }
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+    return fd;
+}
+
+void android_share_log_file(const char *name) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "shareLogFile", "(Ljava/lang/String;)V");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        (*env)->CallStaticVoidMethod(env, c, m, js);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+}
+
+void android_view_log_file(const char *name) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "viewLogFile", "(Ljava/lang/String;)V");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        (*env)->CallStaticVoidMethod(env, c, m, js);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+}
+
+bool android_delete_log_file(const char *name) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return false;
+    jboolean res = JNI_FALSE;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "deleteLogFile", "(Ljava/lang/String;)Z");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        res = (*env)->CallStaticBooleanMethod(env, c, m, js);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); res = JNI_FALSE; }
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+    return res == JNI_TRUE;
+}
+
+void android_export_log_file(const char *name) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "exportLogFile", "(Ljava/lang/String;)V");
+    if (m) {
+        jstring js = (*env)->NewStringUTF(env, name);
+        (*env)->CallStaticVoidMethod(env, c, m, js);
+        if (js) (*env)->DeleteLocalRef(env, js);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+}
+
+char *android_list_log_files(void) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return NULL;
+    char *res = NULL;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "listLogFiles", "()Ljava/lang/String;");
+    if (m) {
+        jstring s = (jstring)(*env)->CallStaticObjectMethod(env, c, m);
+        if (s) {
+            const char *chars = (*env)->GetStringUTFChars(env, s, NULL);
+            if (chars) {
+                res = strdup(chars);
+                (*env)->ReleaseStringUTFChars(env, s, chars);
+            }
+            (*env)->DeleteLocalRef(env, s);
+        }
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+    return res;
+}
+
 // This run's log so far into a new file: the data root's file when there is one (the folder was picked later), else
 // the lines kept from the start
 static void log_file_begin(FILE *f, const char *root_file) {

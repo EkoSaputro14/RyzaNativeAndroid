@@ -578,6 +578,13 @@ static bool android_copy_document(const std::string &uri, const std::string &dst
 // The log file (Driver compatibility; runtime/platform/android.c): written to a folder the player picks
 // (BOTWRecompAndroidActivity pickLogFolder / openLog), where a file manager can open it - Android/data/ is out of its reach
 extern "C" void android_log_file(bool on);
+#ifdef __ANDROID__
+extern "C" char *android_list_log_files(void);
+extern "C" void android_share_log_file(const char *name);
+extern "C" void android_view_log_file(const char *name);
+extern "C" void android_export_log_file(const char *name);
+extern "C" void android_delete_log_file(const char *name);
+#endif
 extern "C" bool vk_adreno_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
 extern "C" bool vk_turnip_heap_on(int setting);
 extern "C" bool vk_lrz_at_start(void);
@@ -1661,6 +1668,54 @@ static void prelaunch_tab(float sc) {
         ImGui::PushID("logdir");
         if (ImGui::Button(tr(folder.empty() ? "Choose folder" : "Change folder"))) android_call("pickLogFolder");
         ImGui::PopID();
+
+#ifdef __ANDROID__
+        ImGui::Spacing();
+        ImGui::TextColored(gold, "%s", tr("Active Log Files:"));
+        char *log_list_str = android_list_log_files();
+        if (log_list_str) {
+            if (log_list_str[0] == '\0') {
+                ImGui::TextDisabled("  %s", tr("(No log files generated yet)"));
+            } else {
+                char *token = strtok(log_list_str, ";");
+                while (token != NULL) {
+                    char *pipe = strchr(token, '|');
+                    std::string fname = token;
+                    long sz = 0;
+                    if (pipe) {
+                        *pipe = '\0';
+                        fname = token;
+                        sz = atol(pipe + 1);
+                    }
+                    bool is_forensic = (fname.find("ryza_forensic") != std::string::npos);
+                    ImVec4 item_col = is_forensic ? ImVec4(0.3f, 1.0f, 0.4f, 1.0f) : ImVec4(0.9f, 0.9f, 0.9f, 1.0f);
+
+                    ImGui::Bullet();
+                    ImGui::TextColored(item_col, "%s (%.1f KB)", fname.c_str(), sz / 1024.0f);
+                    ImGui::SameLine();
+                    ImGui::PushID(fname.c_str());
+                    if (ImGui::SmallButton(tr("View"))) {
+                        android_view_log_file(fname.c_str());
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Share"))) {
+                        android_share_log_file(fname.c_str());
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Export"))) {
+                        android_export_log_file(fname.c_str());
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Delete"))) {
+                        android_delete_log_file(fname.c_str());
+                    }
+                    ImGui::PopID();
+                    token = strtok(NULL, ";");
+                }
+            }
+            free(log_list_str);
+        }
+#endif
         ImGui::PopTextWrapPos();
         if (changed) settings_save();
     }

@@ -7052,14 +7052,41 @@ static void draw_(CmdRec *r, bool indexed) {
 
 static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
     if (!use_index || icount < 30 || !pr || !pr->vi) return;
+    if (g_ryza_capture_freeze) return;
+
+    g_ryza_3d_draw_count++;
 
     bool has_bones = false;
+    bool is_character = false;
     for (int i = 0; i < 32 && i < st.nattrib; i++) {
-        uint32_t fmt = st.attrib[i] & 0xFF;
+        uint32_t a = st.attrib[i];
+        uint32_t fmt = a & 0xFF;
+        uint32_t sn = (a >> 8) & 0x1F;
+        uint32_t off = a >> 13;
+        uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
+
         if (fmt == 0x27 || fmt == 0x25 || fmt == 0x2A || fmt == 0x0F || fmt == 0x0D) has_bones = true;
+        if (stride == 124 || stride == 64 || (fmt == 0x22 && off == 28)) is_character = true;
+    }
+    if (has_bones) is_character = true;
+    if (is_character) g_ryza_character_draw_count++;
+
+    // Cepat deteksi deformasi dari vertex pertama sebelum alokasi
+    bool is_deformed = false;
+    for (int i = 0; i < 32 && i < st.nattrib; i++) {
+        uint32_t a = st.attrib[i];
+        uint32_t sn = (a >> 8) & 0x1F;
+        uint32_t off = a >> 13;
+        if (off == 0 && sn < 16 && st.vbuf[sn].addr && st.vbuf[sn].size >= 16) {
+            const float *flt = (const float *)(uintptr_t)st.vbuf[sn].addr;
+            if (fabsf(flt[0]) > 1000.0f) {
+                is_deformed = true;
+                break;
+            }
+        }
     }
 
-    RyzaDrawForensic *d = ryza_allocate_capture_slot(icount, pr->vi->attr_mask, has_bones);
+    RyzaDrawForensic *d = ryza_allocate_capture_slot(icount, pr->vi->attr_mask, has_bones, is_character, is_deformed);
     if (!d) return;
 
     d->frame = renderer_present_count();
@@ -7104,7 +7131,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 }
             }
         }
-        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21)) {
+        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B)) {
             pos_attr = i;
         }
     }
@@ -7116,6 +7143,25 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     d->depth_write = (uint32_t)st.ds[1];
     d->depth_compare_op = (uint32_t)st.ds[2];
 
+    // Constant buffer capture (View/Proj matrix & Bone palette)
+    NvnShaderStage *vss = st_stage(0);
+    if (vss && vss->const_size >= 64) {
+        d->cbuf1_addr = vss->code_addr + vss->const_offset;
+        d->cbuf1_size = vss->const_size;
+        const float *c1 = (const float *)(uintptr_t)d->cbuf1_addr;
+        if (c1) {
+            for (int k = 0; k < 16; k++) d->cbuf1_sample[k] = c1[k];
+        }
+    }
+    if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128) {
+        d->cbuf3_addr = st.ubuf[0][0].addr;
+        d->cbuf3_size = st.ubuf[0][0].size;
+        const float *c3 = (const float *)(uintptr_t)d->cbuf3_addr;
+        if (c3) {
+            for (int k = 0; k < 32; k++) d->cbuf3_sample[k] = c3[k];
+        }
+    }
+
     const void *isrc = (const void *)(uintptr_t)iaddr;
     if (isrc) {
         uint32_t isz = itype == 1 ? 2 : 4;
@@ -7124,7 +7170,9 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
             d->raw_indices[i] = val;
         }
-        for (uint32_t i = 0; i < icount; i++) {
+        // Bounded scan up to 256 indices to avoid massive CPU stalls
+        uint32_t scan_limit = icount > 256 ? 256 : icount;
+        for (uint32_t i = 0; i < scan_limit; i++) {
             uint32_t val = (isz == 2) ? ((const uint16_t *)isrc)[i] : ((const uint32_t *)isrc)[i];
             if (val < min_idx) min_idx = val;
             if (val > max_idx) max_idx = val;
@@ -7159,7 +7207,21 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                         for (int k = 0; k < 4; k++) vs->attr_raw[a][k] = pf[k];
 
                         if (a == pos_attr) {
-                            vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                            if (afmt == 0x2D) { // R16G16B16A16_SINT (pos raw int16)
+                                const int16_t *p16 = (const int16_t *)(uintptr_t)attr_addr;
+                                vs->pos[0] = (float)p16[0];
+                                vs->pos[1] = (float)p16[1];
+                                vs->pos[2] = (float)p16[2];
+                                vs->pos[3] = (float)p16[3];
+                            } else if (afmt == 0x2B) { // R16G16B16A16_SNORM
+                                const int16_t *p16 = (const int16_t *)(uintptr_t)attr_addr;
+                                vs->pos[0] = (float)p16[0] / 32767.0f;
+                                vs->pos[1] = (float)p16[1] / 32767.0f;
+                                vs->pos[2] = (float)p16[2] / 32767.0f;
+                                vs->pos[3] = (float)p16[3] / 32767.0f;
+                            } else {
+                                vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
+                            }
                         }
                         if (afmt == 0x27) { // R8G8B8A8_UINT bone indices
                             const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
@@ -7184,13 +7246,15 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             vs->clip_pos[3] = 1.0f;
             vs->w_valid = (vs->clip_pos[3] > 0.0001f && !isnan(vs->clip_pos[3]) && !isinf(vs->clip_pos[3]));
             vs->is_corrupted = (fabsf(vs->pos[0]) > 50000.0f);
+            if (vs->is_corrupted) d->is_deformed = true;
         }
     }
 
-    static uint64_t last_log_frame = 0;
-    uint64_t cur_frame = renderer_present_count();
-    if (cur_frame != last_log_frame && (cur_frame % 60 == 0 || g_ryza_3d_draw_count <= 40)) {
-        last_log_frame = cur_frame;
+    // Auto-dump saat deformasi mesh karakter terdeteksi
+    static bool s_auto_dumped = false;
+    if (d->is_deformed && !s_auto_dumped) {
+        s_auto_dumped = true;
+        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP TRIGGERED: Mesh corruption detected on Draw %u!\n", d->draw_idx);
         ryza_export_diagnostic_log();
     }
 }

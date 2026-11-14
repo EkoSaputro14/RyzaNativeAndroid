@@ -21,3 +21,9 @@ tools/venv/
 venv/
 __pycache__/
 .DS_Store
+*.so
+*.so.*
+*.apk
+game/
+recomp_c/
+botwgame*

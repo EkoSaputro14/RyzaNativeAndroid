@@ -50,9 +50,21 @@ set_source_files_properties(${UI_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-
 set_source_files_properties(${R}/runtime/gamelib.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${R}
+    OUTPUT_VARIABLE RYZA_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT RYZA_GIT_COMMIT)
+    set(RYZA_GIT_COMMIT "d74432b")
+endif()
+
 target_include_directories(main PRIVATE ${R}/runtime ${R}/runtime/nvn ${IMGUI} ${IMGUI}/backends ${DEPS}/include
                            ${DEPS}/volk ${BOTW_GEN_DIR} ${R}/third_party/smaa/Textures ${R}/android/common)
 target_compile_definitions(main PRIVATE
+    RYZA_BUILD_COMMIT="${RYZA_GIT_COMMIT}"
+    RYZA_BUILD_VARIANT="precomputed-render-pipeline"
     VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK   # Vulkan from the loaded driver (volk)
     VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
 if(HAVE_FFMPEG)
