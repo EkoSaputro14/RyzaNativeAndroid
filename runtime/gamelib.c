@@ -178,8 +178,7 @@ static const GameLibTables *open_lib(const char *path) {
             }
         }
         if (!self) {
-            LOG("[gamelib] warning: failed to promote libmain.so RTLD_GLOBAL: %s
-", dlerror());
+            LOG("[gamelib] warning: failed to promote libmain.so RTLD_GLOBAL: %s\n", dlerror());
         }
     }
 #endif
