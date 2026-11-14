@@ -140,7 +140,6 @@ void ryza_capture_draw_state(uint64_t frame, uint32_t draw_idx, uint64_t vs_code
 void ryza_export_diagnostic_log(void);
 void ryza_run_file_write_test(void);
 void ryza_rearm_capture(void);
-void ryza_render_forensic_hud(void);
 
 #ifdef __cplusplus
 }

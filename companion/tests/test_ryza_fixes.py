@@ -46,8 +46,8 @@ def test_vertex_attributes():
         off = a >> 13
         if i >= nattrib or fmt == 0 or stream >= 16:
             attr_fmt[i] = 100 # VK_FORMAT_R32G32B32A32_SFLOAT
-            attr_bind[i] = ZERO_BINDING
-            used_streams |= (1 << ZERO_BINDING)
+            attr_bind[i] = ZERO_BINDING_FLOAT
+            used_streams |= (1 << ZERO_BINDING_FLOAT)
             continue
         attr_fmt[i] = fmt
         attr_off[i] = off
@@ -63,11 +63,11 @@ def test_vertex_attributes():
 
     # Validate 16..31 (Secondary bones, skinning weights - PREVIOUSLY BROKEN)
     assert attr_bind[16] == 0, f"Attr 16 bind mismatch: {attr_bind[16]}"
-    assert attr_bind[16] != ZERO_BINDING, "Attr 16 erroneously clamped to ZERO_BINDING!"
+    assert attr_bind[16] != ZERO_BINDING_FLOAT, "Attr 16 erroneously clamped to ZERO_BINDING_FLOAT!"
     assert attr_bind[17] == 1, f"Attr 17 bind mismatch: {attr_bind[17]}"
-    assert attr_bind[17] != ZERO_BINDING, "Attr 17 erroneously clamped to ZERO_BINDING!"
+    assert attr_bind[17] != ZERO_BINDING_FLOAT, "Attr 17 erroneously clamped to ZERO_BINDING_FLOAT!"
     assert attr_bind[31] == 15, f"Attr 31 bind mismatch: {attr_bind[31]}"
-    assert attr_bind[31] != ZERO_BINDING, "Attr 31 erroneously clamped to ZERO_BINDING!"
+    assert attr_bind[31] != ZERO_BINDING_FLOAT, "Attr 31 erroneously clamped to ZERO_BINDING_FLOAT!"
 
     # Test unbound fallback when game only binds 16 attributes
     nattrib = 16
@@ -78,14 +78,14 @@ def test_vertex_attributes():
         stream = (a >> 8) & 0x1F
         off = a >> 13
         if i >= nattrib or fmt == 0 or stream >= 16:
-            attr_bind_unbound[i] = ZERO_BINDING
+            attr_bind_unbound[i] = ZERO_BINDING_FLOAT
         else:
             attr_bind_unbound[i] = stream
 
     for i in range(16, 32):
-        assert attr_bind_unbound[i] == ZERO_BINDING, f"Unbound attr {i} did not route to ZERO_BINDING"
+        assert attr_bind_unbound[i] == ZERO_BINDING_FLOAT, f"Unbound attr {i} did not route to ZERO_BINDING_FLOAT"
 
-    print("  -> PASS: All boundary cases (16, 17, 31, 32) and ZERO_BINDING routing verified.")
+    print("  -> PASS: All boundary cases (16, 17, 31, 32) and ZERO_BINDING_FLOAT routing verified.")
 
 def test_render_target_transitions():
     print("[TEST 2/4] Running Render Target Transition & Semantic Comparison Tests...")
@@ -194,7 +194,7 @@ def test_guest_copy_fast_rejection():
     print("  -> PASS: Fast multi-word rejection verified with zero false matches.")
 
 def test_zero_binding_integer_safety():
-    print("[TEST 5/7] Running ZERO_BINDING Integer Type Safety & Zero-Index Tests...")
+    print("[TEST 5/7] Running ZERO_BINDING_FLOAT Integer Type Safety & Zero-Index Tests...")
     import struct
     # Verify that float 1.0f in IEEE 754 is integer 1065353216 (the bug)
     f_one_bytes = struct.pack('<f', 1.0)
@@ -223,7 +223,7 @@ def test_zero_binding_integer_safety():
     assert pick_unbound_format(0) == VK_FORMAT_R32G32B32A32_SFLOAT
     assert pick_unbound_format(1) == VK_FORMAT_R32G32B32A32_SINT
     assert pick_unbound_format(2) == VK_FORMAT_R32G32B32A32_UINT
-    print("  -> PASS: ZERO_BINDING provides root bone index 0 for integer shader inputs.")
+    print("  -> PASS: ZERO_BINDING_FLOAT provides root bone index 0 for integer shader inputs.")
 
 def test_kwait_lost_wakeup_guard():
     print("[TEST 6/7] Running Kernel Mutex / kwait Lost Wakeup Guard Tests...")
@@ -266,6 +266,37 @@ def test_dynamic_texture_throttle_budget():
     assert deswizzle_bytes == 3 * 1024 * 1024
     print("  -> PASS: Second heavy dynamic texture deferred, preventing 250ms+ CPU render hitch.")
 
+
+def test_runtime_wiring_and_version_sync():
+    print("[TEST 8/8] Running Runtime Wiring, Clip-Space Math & Version Sync Checks...")
+    import os, re
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    with open(os.path.join(repo, "android/botwrecompandroid/app/build.gradle.kts")) as f:
+        gradle = f.read()
+    with open(os.path.join(repo, "android/botwrecompandroid/app/src/main/cpp/CMakeLists.txt")) as f:
+        cmake = f.read()
+    with open(os.path.join(repo, "runtime/nvn/vulkan/ryza_forensics.h")) as f:
+        forensics_h = f.read()
+    with open(os.path.join(repo, "runtime/nvn/vulkan/ryza_forensics.c")) as f:
+        forensics_c = f.read()
+    with open(os.path.join(repo, "runtime/nvn/vulkan/exec.c")) as f:
+        exec_c = f.read()
+    with open(os.path.join(repo, "runtime/nvn/vulkan/device.c")) as f:
+        device_c = f.read()
+    with open(os.path.join(repo, "runtime/ui/perf_overlay.mm")) as f:
+        overlay_mm = f.read()
+
+    assert re.search(r"versionCode\s*=\s*\d+", gradle), "Missing versionCode in build.gradle.kts"
+    assert "RYZA_VERSION_CODE" in cmake and "RYZA_VERSION_NAME" in cmake, "CMakeLists.txt must forward version macros"
+    assert "RYZA_VERSION_CODE" in forensics_c and "RYZA_VERSION_NAME" in forensics_c, "ryza_forensics.c must use version macros"
+    assert "ryza_render_forensic_hud" not in forensics_h, "Unimplemented ryza_render_forensic_hud declaration left in header"
+    assert "ryza_forensics_init();" in exec_c, "ryza_forensics_init() must be called in vk_exec_init()"
+    assert "ryza_mat4_mul_vec(" in exec_c and "ryza_decode_pos(" in exec_c, "Forensic inspector must evaluate pos/clip_pos"
+    assert "precompute_init();" in exec_c and "precompute_record_pipeline_hash(" in exec_c, "precompute must be wired into exec.c"
+    assert "precompute_shutdown();" in device_c, "precompute_shutdown() must be called on exit/background"
+    assert "precompute_get_snapshot(" in overlay_mm, "perf_overlay.mm must display precompute snapshot"
+    print("  -> PASS: Runtime wiring, version sync, and forensic evaluation checks verified.")
+
 if __name__ == '__main__':
     print("===================================================================")
     print("ATELIER RYZA ROOT-CAUSE FIXES — REGRESSION & VERIFICATION HARNESS")
@@ -278,4 +309,5 @@ if __name__ == '__main__':
     test_zero_binding_integer_safety()
     test_kwait_lost_wakeup_guard()
     test_dynamic_texture_throttle_budget()
+    test_runtime_wiring_and_version_sync()
     print("\n>>> ALL REGRESSION & VALIDATION TESTS PASSED SUCCESSFULLY! <<<")

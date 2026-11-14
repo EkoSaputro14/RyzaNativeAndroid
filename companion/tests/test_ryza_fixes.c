@@ -70,8 +70,8 @@ static void test_vertex_attributes(void) {
         uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
         if (i >= st.nattrib || fmt == 0 || stream >= 16) {
             k.attr_fmt[i] = 100; // VK_FORMAT_R32G32B32A32_SFLOAT
-            k.attr_bind[i] = ZERO_BINDING;
-            k.used_streams |= 1u << ZERO_BINDING;
+            k.attr_bind[i] = ZERO_BINDING_FLOAT;
+            k.used_streams |= 1u << ZERO_BINDING_FLOAT;
             continue;
         }
         k.attr_fmt[i] = fmt;
@@ -92,13 +92,13 @@ static void test_vertex_attributes(void) {
     // Attribute 16:
     assert(k.attr_bind[16] == 0); // (16 % 16 = stream 0)
     assert(k.attr_off[16] == 16 * 16);
-    assert(k.attr_bind[16] != ZERO_BINDING);
+    assert(k.attr_bind[16] != ZERO_BINDING_FLOAT);
     // Attribute 17:
     assert(k.attr_bind[17] == 1);
-    assert(k.attr_bind[17] != ZERO_BINDING);
+    assert(k.attr_bind[17] != ZERO_BINDING_FLOAT);
     // Attribute 31:
     assert(k.attr_bind[31] == 15);
-    assert(k.attr_bind[31] != ZERO_BINDING);
+    assert(k.attr_bind[31] != ZERO_BINDING_FLOAT);
 
     // VERIFY UNBOUND FALLBACK (Attribute index >= st.nattrib)
     st.nattrib = 16; // Game binds only 16 attributes
@@ -110,8 +110,8 @@ static void test_vertex_attributes(void) {
         uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
         if (i >= st.nattrib || fmt == 0 || stream >= 16) {
             k.attr_fmt[i] = 100; // VK_FORMAT_R32G32B32A32_SFLOAT
-            k.attr_bind[i] = ZERO_BINDING;
-            k.used_streams |= 1u << ZERO_BINDING;
+            k.attr_bind[i] = ZERO_BINDING_FLOAT;
+            k.used_streams |= 1u << ZERO_BINDING_FLOAT;
             continue;
         }
         k.attr_fmt[i] = fmt;
@@ -119,13 +119,13 @@ static void test_vertex_attributes(void) {
         k.attr_bind[i] = stream;
         k.used_streams |= 1u << stream;
     }
-    // Now attribute 16..31 MUST safely route to ZERO_BINDING
+    // Now attribute 16..31 MUST safely route to ZERO_BINDING_FLOAT
     for (int i = 16; i < 32; i++) {
-        assert(k.attr_bind[i] == ZERO_BINDING);
+        assert(k.attr_bind[i] == ZERO_BINDING_FLOAT);
     }
-    assert((k.used_streams & (1u << ZERO_BINDING)) != 0);
+    assert((k.used_streams & (1u << ZERO_BINDING_FLOAT)) != 0);
 
-    printf("  -> PASS: All boundary cases (16, 17, 31, 32) and ZERO_BINDING fallbacks verified.\n");
+    printf("  -> PASS: All boundary cases (16, 17, 31, 32) and ZERO_BINDING_FLOAT fallbacks verified.\n");
 }
 
 // =========================================================================

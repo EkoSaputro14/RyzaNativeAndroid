@@ -45,22 +45,26 @@ RyzaTestResult g_ryza_test_result = {
     .bytes_read = 0
 };
 
+#ifndef RYZA_BUILD_COMMIT
+#define RYZA_BUILD_COMMIT "local"
+#endif
+#ifndef RYZA_VERSION_CODE
+#define RYZA_VERSION_CODE "39"
+#endif
+#ifndef RYZA_VERSION_NAME
+#define RYZA_VERSION_NAME "0.3.2-forensic-p6"
+#endif
+#ifndef RYZA_BUILD_VARIANT
+#define RYZA_BUILD_VARIANT "precomputed-render-pipeline"
+#endif
+
 const char *ryza_get_build_fingerprint(void) {
-    static char buf[160];
+    static char buf[192];
     static bool init = false;
     if (!init) {
-#ifdef RYZA_BUILD_COMMIT
-        snprintf(buf, sizeof(buf), "%s-p4 (vc=37, %s %s) [%s]",
-                 RYZA_BUILD_COMMIT, __DATE__, __TIME__,
-#ifdef RYZA_BUILD_VARIANT
-                 RYZA_BUILD_VARIANT
-#else
-                 "precomputed-render-pipeline"
-#endif
-        );
-#else
-        snprintf(buf, sizeof(buf), "8640960-p4 (vc=37, %s %s) [precomputed-render-pipeline]", __DATE__, __TIME__);
-#endif
+        snprintf(buf, sizeof(buf), "%s (%s, vc=%s, %s %s) [%s]",
+                 RYZA_BUILD_COMMIT, RYZA_VERSION_NAME, RYZA_VERSION_CODE,
+                 __DATE__, __TIME__, RYZA_BUILD_VARIANT);
         init = true;
     }
     return buf;
@@ -288,7 +292,7 @@ static void serialize_forensics_to_file(FILE *f, const char *path, time_t now) {
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
 
     fprintf(f, "=======================================================\n");
-    fprintf(f, "RYZA NATIVE ANDROID RUNTIME SKINNING FORENSIC DUMP (P3)\n");
+    fprintf(f, "RYZA NATIVE ANDROID RUNTIME SKINNING FORENSIC DUMP (%s)\n", RYZA_VERSION_NAME);
     fprintf(f, "Build Fingerprint: %s\n", ryza_get_build_fingerprint());
     fprintf(f, "Session ID:        %s\n", g_ryza_session_id[0] ? g_ryza_session_id : "SESSION-RUNTIME");
     fprintf(f, "Dump Timestamp:    %s\n", time_str);

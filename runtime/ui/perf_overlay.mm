@@ -25,6 +25,7 @@ void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws)
 uint64_t vk_cum_wait_ns(void);  // vulkan/exec.c
 const char *vk_gpu_desc(void);  // vulkan/device.c
 #include "../nvn/vulkan/ryza_forensics.h"
+#include "../nvn/vulkan/precompute.h"
 }
 
 #define FT_N 120  // frame times in the graph
@@ -217,6 +218,14 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                        (unsigned long long)g_ryza_3d_draw_count,
                        (unsigned long long)g_ryza_character_draw_count,
                        g_ryza_captured_draw_count);
+    {
+        char pbuf[160];
+        PrecomputeSnapshot ps;
+        precompute_get_loading_progress(NULL, pbuf, sizeof(pbuf));
+        precompute_get_snapshot(&ps);
+        ImGui::TextDisabled("%s | Shaders: %u/%u | Pipes: %u",
+                            pbuf, ps.shaders_compiled, ps.shaders_registered, ps.pipelines_manifest_total);
+    }
 
     // ACTION BUTTONS
     if (ImGui::Button("Force Dump Log Now")) {
@@ -313,10 +322,11 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             ImGui::Text("Bones: [%u, %u, %u, %u] W: (%.2f, %.2f, %.2f, %.2f)",
                         s->bone_indices[0], s->bone_indices[1], s->bone_indices[2], s->bone_indices[3],
                         s->bone_weights[0], s->bone_weights[1], s->bone_weights[2], s->bone_weights[3]);
-            ImGui::TextColored(s->w_valid ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                               "ClipPos: (%.2f, %.2f, %.2f, W=%.2f) X/W=%.2f",
+            ImGui::TextColored((s->w_valid && !s->is_corrupted) ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) : ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                               "ClipPos: (%.2f, %.2f, %.2f, W=%.2f) X/W=%.2f%s",
                                s->clip_pos[0], s->clip_pos[1], s->clip_pos[2], s->clip_pos[3],
-                               s->clip_pos[3] != 0.0f ? s->clip_pos[0] / s->clip_pos[3] : 9999.0f);
+                               s->clip_pos[3] != 0.0f ? s->clip_pos[0] / s->clip_pos[3] : 9999.0f,
+                               s->is_corrupted ? " [CORRUPT]" : "");
         }
     }
     record();

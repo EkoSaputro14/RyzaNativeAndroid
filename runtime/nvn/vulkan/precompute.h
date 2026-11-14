@@ -5,12 +5,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#ifndef __cplusplus
 // Real-time telemetry & benchmark metrics for Precomputed Render Pipeline
 typedef struct {
     // Shaders
@@ -53,6 +56,18 @@ typedef struct {
 } PrecomputeTelemetry;
 
 extern PrecomputeTelemetry g_precompute_stats;
+#endif
+
+typedef struct {
+    uint32_t shaders_registered;
+    uint32_t shaders_translated;
+    uint32_t shaders_compiled;
+    uint32_t pipelines_manifest_total;
+    uint32_t pipelines_prewarmed;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    bool is_warmup_active;
+} PrecomputeSnapshot;
 
 // Lifecycle & Control
 void precompute_init(void);
@@ -86,6 +101,7 @@ void precompute_bump_generation(void);
 // Frame Metrics & Telemetry
 void precompute_record_frame_latency(uint64_t cpu_render_ns, uint64_t gpu_ns);
 void precompute_get_loading_progress(float *out_percent, char *out_status, size_t status_len);
+void precompute_get_snapshot(PrecomputeSnapshot *out);
 
 #ifdef __cplusplus
 }

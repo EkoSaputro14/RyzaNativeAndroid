@@ -24,6 +24,7 @@
 #include "../../settings.h"
 #include "../../paths.h"
 #include "ryza_forensics.h"
+#include "precompute.h"
 
 // LARECOMP_AB (vk_ab, below): AB() costs no call while it is not set - it is asked per constant buffer and per pass
 static int ab_n = -1;  // (LARECOMP_AB's frame count; 0: no A/B)
@@ -1320,9 +1321,21 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // (LARECOMP_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
-    if (!prof) return;
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
     uint64_t now = SDL_GetTicksNS();
+    if (last_t) {
+        uint64_t ex = cum_exec - l_exec;
+        uint64_t wt = cum_wait - l_wait;
+        precompute_record_frame_latency(ex, wt);
+    }
+    if (atomic_load(&g_precompute_stats.is_warmup_active)) {
+        if (frame >= 120) precompute_warmup_end();
+        else precompute_warmup_tick();
+    }
+    if (!prof) {
+        last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
+        return;
+    }
     if (last_t && now - last_t > 50000000) {
         uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;
         LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + other %.1f; %llu draws, "
@@ -1471,6 +1484,8 @@ void vk_exec_init(void) {
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
     }
     st_defaults();
+    ryza_forensics_init();
+    precompute_init();
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);
@@ -2582,6 +2597,11 @@ static void compile_program(void *arg) {
     }
 #endif
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    if (p->vs && p->fs) {
+        atomic_fetch_add(&g_precompute_stats.shaders_compiled, 1);
+        if (!atomic_load(&g_precompute_stats.is_warmup_active))
+            atomic_fetch_add(&g_precompute_stats.gameplay_shaders_compiled, 1);
+    }
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
@@ -2718,6 +2738,7 @@ static void translate_program(void *arg) {
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     LOG("[shader] VS+FS translated: vs=%llx fs=%llx\n", (unsigned long long)p->code[0], (unsigned long long)p->code[1]);
+    atomic_fetch_add(&g_precompute_stats.shaders_translated, 1);
     run_job(compile_program, p);
 }
 
@@ -3155,7 +3176,9 @@ static void build_pipeline(void *arg) {
     }
 #endif
     atomic_fetch_add(&stat_compiles, 1);
-    if (r != VK_SUCCESS) {  // (each failing key once: its draws are dropped)
+    if (r == VK_SUCCESS) {
+        precompute_record_pipeline_hash(pp->hash);
+    } else {  // (each failing key once: its draws are dropped)
         static int n;
         if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
                           (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
@@ -6699,6 +6722,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!pp) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
+            pp->hash = ph;
+            (void)precompute_has_pipeline_cached(ph);
             pipe_tab[pslot].key = ph;
             pipe_tab[pslot].pipe = pp;
             run_job(build_pipeline, pp);
@@ -7050,7 +7075,93 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
+static float ryza_f16_to_f32(uint16_t h) {
+    uint32_t s = ((uint32_t)(h & 0x8000u)) << 16;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t m = h & 0x03FFu;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) {
+            f = s;
+        } else {
+            e = 1;
+            while ((m & 0x0400u) == 0) { m <<= 1; e--; }
+            m &= 0x03FFu;
+            f = s | ((e + (127 - 15)) << 23) | (m << 13);
+        }
+    } else if (e == 31) {
+        f = s | 0x7F800000u | (m << 13);
+    } else {
+        f = s | ((e + (127 - 15)) << 23) | (m << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+static uint32_t ryza_fmt_byte_size(uint32_t fmt) {
+    switch (fmt) {
+    case 0x22: case 0x23: case 0x24: return 12;
+    case 0x2E: case 0x2F: case 0x30: return 16;
+    case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: return 8;
+    case 0x1D: case 0x1E: case 0x1F: case 0x20: case 0x21: return 6;
+    case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
+    case 0x25: case 0x26: case 0x27: case 0x28: return 4;
+    default: return 16;
+    }
+}
+
+static bool ryza_decode_pos(uint32_t fmt, const void *ptr, float out[4]) {
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (fmt == 0x2D) { // R16G16B16A16_SINT
+        const int16_t *p = (const int16_t *)ptr;
+        out[0] = (float)p[0]; out[1] = (float)p[1]; out[2] = (float)p[2]; out[3] = (float)p[3];
+        return true;
+    }
+    if (fmt == 0x2B) { // R16G16B16A16_SNORM
+        const int16_t *p = (const int16_t *)ptr;
+        out[0] = (float)p[0] / 32767.0f; out[1] = (float)p[1] / 32767.0f;
+        out[2] = (float)p[2] / 32767.0f; out[3] = (float)p[3] / 32767.0f;
+        return true;
+    }
+    if (fmt == 0x29 || fmt == 0x1D) { // R16G16B16A16_SFLOAT / R16G16B16_SFLOAT
+        const uint16_t *p = (const uint16_t *)ptr;
+        out[0] = ryza_f16_to_f32(p[0]); out[1] = ryza_f16_to_f32(p[1]); out[2] = ryza_f16_to_f32(p[2]);
+        out[3] = (fmt == 0x29) ? ryza_f16_to_f32(p[3]) : 1.0f;
+        return true;
+    }
+    if (fmt == 0x22 || fmt == 0x2E) { // R32G32B32_SFLOAT / R32G32B32A32_SFLOAT
+        const float *p = (const float *)ptr;
+        out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+        out[3] = (fmt == 0x2E) ? p[3] : 1.0f;
+        return true;
+    }
+    return false;
+}
+
+static bool ryza_mat4_finite_nonzero(const float m[16]) {
+    float sum = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        if (!isfinite(m[i])) return false;
+        sum += fabsf(m[i]);
+    }
+    return sum > 1e-4f;
+}
+
+static void ryza_mat4_mul_vec(const float m[16], const float v[4], bool row_major, float out[4]) {
+    for (int i = 0; i < 4; i++) {
+        if (row_major) {
+            out[i] = m[i * 4 + 0] * v[0] + m[i * 4 + 1] * v[1] + m[i * 4 + 2] * v[2] + m[i * 4 + 3] * v[3];
+        } else {
+            out[i] = m[0 * 4 + i] * v[0] + m[1 * 4 + i] * v[1] + m[2 * 4 + i] * v[2] + m[3 * 4 + i] * v[3];
+        }
+    }
+}
+
 static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
+    (void)r;
+    (void)count;
     if (!use_index || icount < 30 || !pr || !pr->vi) return;
     if (g_ryza_capture_freeze) return;
 
@@ -7058,7 +7169,9 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
 
     bool has_bones = false;
     bool is_character = false;
+    int pos_attr_hint = -1;
     for (int i = 0; i < 32 && i < st.nattrib; i++) {
+        if (!(pr->vi->attr_mask & (1u << i))) continue;
         uint32_t a = st.attrib[i];
         uint32_t fmt = a & 0xFF;
         uint32_t sn = (a >> 8) & 0x1F;
@@ -7067,21 +7180,28 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
 
         if (fmt == 0x27 || fmt == 0x25 || fmt == 0x2A || fmt == 0x0F || fmt == 0x0D) has_bones = true;
         if (stride == 124 || stride == 64 || (fmt == 0x22 && off == 28)) is_character = true;
+        if (pos_attr_hint < 0 && off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D)) {
+            pos_attr_hint = i;
+        }
     }
     if (has_bones) is_character = true;
     if (is_character) g_ryza_character_draw_count++;
 
-    // Cepat deteksi deformasi dari vertex pertama sebelum alokasi
+    // Format-aware deformation pre-check on vertex 0 before slot allocation
     bool is_deformed = false;
-    for (int i = 0; i < 32 && i < st.nattrib; i++) {
-        uint32_t a = st.attrib[i];
+    if (pos_attr_hint >= 0) {
+        uint32_t a = st.attrib[pos_attr_hint];
+        uint32_t fmt = a & 0xFF;
         uint32_t sn = (a >> 8) & 0x1F;
         uint32_t off = a >> 13;
-        if (off == 0 && sn < 16 && st.vbuf[sn].addr && st.vbuf[sn].size >= 16) {
-            const float *flt = (const float *)(uintptr_t)st.vbuf[sn].addr;
-            if (fabsf(flt[0]) > 1000.0f) {
-                is_deformed = true;
-                break;
+        uint32_t elem_sz = ryza_fmt_byte_size(fmt);
+        if (sn < 16 && st.vbuf[sn].addr && (uint64_t)off + elem_sz <= st.vbuf[sn].size) {
+            float p0[4];
+            if (ryza_decode_pos(fmt, (const void *)(uintptr_t)(st.vbuf[sn].addr + off), p0)) {
+                if (!isfinite(p0[0]) || !isfinite(p0[1]) || !isfinite(p0[2]) ||
+                    fabsf(p0[0]) > 50000.0f || fabsf(p0[1]) > 50000.0f || fabsf(p0[2]) > 50000.0f) {
+                    is_deformed = true;
+                }
             }
         }
     }
@@ -7122,20 +7242,19 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         if (sn < 16) {
             d->attrs[i].buf_addr = st.vbuf[sn].addr;
             d->attrs[i].buf_size = st.vbuf[sn].size;
-            if (st.vbuf[sn].addr && st.vbuf[sn].size >= d->attrs[i].off + 16) {
-                const uint32_t *raw = (const uint32_t *)(uintptr_t)(st.vbuf[sn].addr + d->attrs[i].off);
-                const float *flt = (const float *)raw;
-                for (int k = 0; k < 4; k++) {
-                    d->attrs[i].raw_data[k] = raw[k];
-                    d->attrs[i].float_data[k] = flt[k];
-                }
+            uint32_t elem_sz = ryza_fmt_byte_size(fmt);
+            if (st.vbuf[sn].addr && st.vbuf[sn].size >= (uint64_t)d->attrs[i].off + elem_sz) {
+                uint64_t avail = st.vbuf[sn].size - d->attrs[i].off;
+                size_t cp = avail >= 16 ? 16 : (size_t)avail;
+                memcpy(d->attrs[i].raw_data, (const void *)(uintptr_t)(st.vbuf[sn].addr + d->attrs[i].off), cp);
+                memcpy(d->attrs[i].float_data, d->attrs[i].raw_data, sizeof(d->attrs[i].float_data));
             }
         }
-        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B)) {
+        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D)) {
             pos_attr = i;
         }
     }
-    if (pos_attr < 0) pos_attr = (pr->vi->attr_mask & 2u) ? 1 : 0;
+    if (pos_attr < 0) pos_attr = pos_attr_hint >= 0 ? pos_attr_hint : ((pr->vi->attr_mask & 2u) ? 1 : 0);
 
     d->cull_mode = (uint32_t)st.poly[0];
     d->front_face = (uint32_t)st.poly[1];
@@ -7143,24 +7262,37 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     d->depth_write = (uint32_t)st.ds[1];
     d->depth_compare_op = (uint32_t)st.ds[2];
 
-    // Constant buffer capture (View/Proj matrix & Bone palette)
+    // Constant buffer capture: prefer game VS UBOs (st.ubuf[0][0..3]) for transforms & bone palette,
+    // falling back to compiler const pool (vss->const_offset) if no game UBO is bound.
     NvnShaderStage *vss = st_stage(0);
-    if (vss && vss->const_size >= 64) {
+    if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 64) {
+        d->cbuf1_addr = st.ubuf[0][0].addr;
+        d->cbuf1_size = (uint32_t)st.ubuf[0][0].size;
+        memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
+    } else if (vss && vss->const_size >= 64) {
         d->cbuf1_addr = vss->code_addr + vss->const_offset;
         d->cbuf1_size = vss->const_size;
-        const float *c1 = (const float *)(uintptr_t)d->cbuf1_addr;
-        if (c1) {
-            for (int k = 0; k < 16; k++) d->cbuf1_sample[k] = c1[k];
+        memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
+    }
+
+    int bone_ubuf = -1;
+    for (int u = 1; u < 4; u++) {
+        if (st.ubuf[0][u].addr && st.ubuf[0][u].size >= 128) {
+            if (bone_ubuf < 0 || st.ubuf[0][u].size > st.ubuf[0][bone_ubuf].size) {
+                bone_ubuf = u;
+            }
         }
     }
-    if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128) {
-        d->cbuf3_addr = st.ubuf[0][0].addr;
-        d->cbuf3_size = st.ubuf[0][0].size;
-        const float *c3 = (const float *)(uintptr_t)d->cbuf3_addr;
-        if (c3) {
-            for (int k = 0; k < 32; k++) d->cbuf3_sample[k] = c3[k];
-        }
+    if (bone_ubuf < 0 && st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128) {
+        bone_ubuf = 0;
     }
+    if (bone_ubuf >= 0) {
+        d->cbuf3_addr = st.ubuf[0][bone_ubuf].addr;
+        d->cbuf3_size = (uint32_t)st.ubuf[0][bone_ubuf].size;
+        memcpy(d->cbuf3_sample, (const void *)(uintptr_t)d->cbuf3_addr, sizeof(d->cbuf3_sample));
+    }
+
+    bool has_mvp = d->cbuf1_addr && d->cbuf1_size >= 64 && ryza_mat4_finite_nonzero(d->cbuf1_sample);
 
     const void *isrc = (const void *)(uintptr_t)iaddr;
     if (isrc) {
@@ -7190,9 +7322,11 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
 
         d->num_samples = 6;
         for (uint32_t s = 0; s < 6; s++) {
-            uint32_t vidx = sample_indices[s];
+            int64_t real_vidx = (int64_t)sample_indices[s] + (int64_t)base_vertex;
+            uint32_t vidx = real_vidx > 0 ? (uint32_t)real_vidx : 0u;
             RyzaVertexSample *vs = &d->samples[s];
             vs->vertex_idx = vidx;
+            vs->pos[3] = 1.0f;
 
             for (int a = 0; a < 8 && a < st.nattrib; a++) {
                 if (!(pr->vi->attr_mask & (1u << a))) continue;
@@ -7200,26 +7334,17 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 uint32_t off = st.attrib[a] >> 13;
                 uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
                 uint32_t afmt = st.attrib[a] & 0xFF;
+                uint32_t elem_sz = ryza_fmt_byte_size(afmt);
                 if (sn < 16 && st.vbuf[sn].addr && stride > 0) {
                     uint64_t attr_addr = st.vbuf[sn].addr + off + (uint64_t)vidx * stride;
-                    if (attr_addr + 16 <= st.vbuf[sn].addr + st.vbuf[sn].size) {
-                        const float *pf = (const float *)(uintptr_t)attr_addr;
-                        for (int k = 0; k < 4; k++) vs->attr_raw[a][k] = pf[k];
+                    if (attr_addr + elem_sz <= st.vbuf[sn].addr + st.vbuf[sn].size) {
+                        uint64_t avail = (st.vbuf[sn].addr + st.vbuf[sn].size) - attr_addr;
+                        size_t cp = avail >= 16 ? 16 : (size_t)avail;
+                        memcpy(vs->attr_raw[a], (const void *)(uintptr_t)attr_addr, cp);
 
                         if (a == pos_attr) {
-                            if (afmt == 0x2D) { // R16G16B16A16_SINT (pos raw int16)
-                                const int16_t *p16 = (const int16_t *)(uintptr_t)attr_addr;
-                                vs->pos[0] = (float)p16[0];
-                                vs->pos[1] = (float)p16[1];
-                                vs->pos[2] = (float)p16[2];
-                                vs->pos[3] = (float)p16[3];
-                            } else if (afmt == 0x2B) { // R16G16B16A16_SNORM
-                                const int16_t *p16 = (const int16_t *)(uintptr_t)attr_addr;
-                                vs->pos[0] = (float)p16[0] / 32767.0f;
-                                vs->pos[1] = (float)p16[1] / 32767.0f;
-                                vs->pos[2] = (float)p16[2] / 32767.0f;
-                                vs->pos[3] = (float)p16[3] / 32767.0f;
-                            } else {
+                            if (!ryza_decode_pos(afmt, (const void *)(uintptr_t)attr_addr, vs->pos)) {
+                                const float *pf = (const float *)(uintptr_t)attr_addr;
                                 vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
                             }
                         }
@@ -7227,11 +7352,15 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                             const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
                             vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
                             vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                        } else if (afmt == 0x2C) { // R16G16B16A16_UINT bone indices
+                            const uint16_t *b = (const uint16_t *)(uintptr_t)attr_addr;
+                            vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                            vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
                         } else if (afmt == 0x25) { // R8G8B8A8_UNORM bone weights
                             const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
                             vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
                             vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
-                        } else if (afmt == 0x2A) { // R16G16B16A16_UNORM
+                        } else if (afmt == 0x2A) { // R16G16B16A16_UNORM bone weights
                             const uint16_t *w = (const uint16_t *)(uintptr_t)attr_addr;
                             vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
                             vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
@@ -7240,12 +7369,59 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 }
             }
 
-            vs->clip_pos[0] = vs->pos[0];
-            vs->clip_pos[1] = vs->pos[1];
-            vs->clip_pos[2] = vs->pos[2];
-            vs->clip_pos[3] = 1.0f;
-            vs->w_valid = (vs->clip_pos[3] > 0.0001f && !isnan(vs->clip_pos[3]) && !isinf(vs->clip_pos[3]));
-            vs->is_corrupted = (fabsf(vs->pos[0]) > 50000.0f);
+            // Optional CPU-side skinning & clip-space evaluation using captured UBOs
+            float eval_pos[4] = { vs->pos[0], vs->pos[1], vs->pos[2], 1.0f };
+            bool bone_oob = false;
+            if (has_bones && d->cbuf3_addr && d->cbuf3_size >= 64) {
+                uint32_t max_bones = d->cbuf3_size / 48u;
+                float wsum = 0.0f;
+                float skinned[3] = { 0.0f, 0.0f, 0.0f };
+                const float *palette = (const float *)(uintptr_t)d->cbuf3_addr;
+                for (int k = 0; k < 4; k++) {
+                    float w = vs->bone_weights[k];
+                    if (w > 0.0001f) {
+                        uint32_t bidx = vs->bone_indices[k];
+                        if (bidx >= max_bones) {
+                            bone_oob = true;
+                        } else {
+                            // Standard 3x4 row-major bone matrix (3 vec4s = 12 floats)
+                            const float *bm = palette + (size_t)bidx * 12u;
+                            if (isfinite(bm[0]) && isfinite(bm[3]) && isfinite(bm[5]) && isfinite(bm[7]) && isfinite(bm[10]) && isfinite(bm[11])) {
+                                skinned[0] += w * (bm[0] * eval_pos[0] + bm[1] * eval_pos[1] + bm[2] * eval_pos[2] + bm[3]);
+                                skinned[1] += w * (bm[4] * eval_pos[0] + bm[5] * eval_pos[1] + bm[6] * eval_pos[2] + bm[7]);
+                                skinned[2] += w * (bm[8] * eval_pos[0] + bm[9] * eval_pos[1] + bm[10] * eval_pos[2] + bm[11]);
+                                wsum += w;
+                            }
+                        }
+                    }
+                }
+                if (!bone_oob && wsum > 0.5f && wsum < 1.5f && isfinite(skinned[0]) && isfinite(skinned[1]) && isfinite(skinned[2])) {
+                    eval_pos[0] = skinned[0];
+                    eval_pos[1] = skinned[1];
+                    eval_pos[2] = skinned[2];
+                }
+            }
+
+            if (has_mvp) {
+                float col_res[4], row_res[4];
+                ryza_mat4_mul_vec(d->cbuf1_sample, eval_pos, false, col_res);
+                ryza_mat4_mul_vec(d->cbuf1_sample, eval_pos, true, row_res);
+                bool use_row = (!isfinite(col_res[3]) || col_res[3] <= 0.0001f) && isfinite(row_res[3]) && row_res[3] > 0.0001f;
+                const float *chosen = use_row ? row_res : col_res;
+                memcpy(vs->clip_pos, chosen, sizeof(vs->clip_pos));
+            } else {
+                vs->clip_pos[0] = eval_pos[0];
+                vs->clip_pos[1] = eval_pos[1];
+                vs->clip_pos[2] = eval_pos[2];
+                vs->clip_pos[3] = 1.0f;
+            }
+
+            bool pos_finite = isfinite(vs->pos[0]) && isfinite(vs->pos[1]) && isfinite(vs->pos[2]);
+            bool clip_finite = isfinite(vs->clip_pos[0]) && isfinite(vs->clip_pos[1]) && isfinite(vs->clip_pos[2]) && isfinite(vs->clip_pos[3]);
+            vs->w_valid = pos_finite && clip_finite && (vs->clip_pos[3] > 0.0001f);
+            bool extreme_pos = !pos_finite || fabsf(vs->pos[0]) > 50000.0f || fabsf(vs->pos[1]) > 50000.0f || fabsf(vs->pos[2]) > 50000.0f;
+            bool extreme_ndc = has_mvp && vs->w_valid && fabsf(vs->clip_pos[0] / vs->clip_pos[3]) > 250.0f;
+            vs->is_corrupted = extreme_pos || bone_oob || !clip_finite || extreme_ndc;
             if (vs->is_corrupted) d->is_deformed = true;
         }
     }

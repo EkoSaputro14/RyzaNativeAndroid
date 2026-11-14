@@ -46,11 +46,23 @@ static uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+extern const char *rt_data_root(void);
+
+static const char *get_cache_dir(void) {
+    static char dir[512];
+    const char *cdir = getenv("LARECOMP_CACHE_DIR");
+    if (cdir && *cdir) return cdir;
+    const char *root = rt_data_root();
+    if (root && *root) {
+        snprintf(dir, sizeof(dir), "%s/cache", root);
+        return dir;
+    }
+    return "cache";
+}
+
 static const char *get_manifest_path(void) {
     static char path[512];
-    const char *cdir = getenv("LARECOMP_CACHE_DIR");
-    if (!cdir || !*cdir) cdir = "cache";
-    snprintf(path, sizeof(path), "%s/pipe_manifest.bin", cdir);
+    snprintf(path, sizeof(path), "%s/pipe_manifest.bin", get_cache_dir());
     return path;
 }
 
@@ -70,8 +82,7 @@ static void load_manifest(void) {
 }
 
 static void save_manifest(void) {
-    const char *cdir = getenv("LARECOMP_CACHE_DIR");
-    if (!cdir || !*cdir) cdir = "cache";
+    const char *cdir = get_cache_dir();
     mkdir_p(cdir);
 
     char tmp_path[512];
@@ -313,4 +324,16 @@ void precompute_get_loading_progress(float *out_percent, char *out_status, size_
                      (unsigned long long)atomic_load(&g_precompute_stats.cache_misses));
         }
     }
+}
+
+void precompute_get_snapshot(PrecomputeSnapshot *out) {
+    if (!out) return;
+    out->shaders_registered = atomic_load(&g_precompute_stats.shaders_registered);
+    out->shaders_translated = atomic_load(&g_precompute_stats.shaders_translated);
+    out->shaders_compiled = atomic_load(&g_precompute_stats.shaders_compiled);
+    out->pipelines_manifest_total = atomic_load(&g_precompute_stats.pipelines_manifest_total);
+    out->pipelines_prewarmed = atomic_load(&g_precompute_stats.pipelines_prewarmed);
+    out->cache_hits = atomic_load(&g_precompute_stats.cache_hits);
+    out->cache_misses = atomic_load(&g_precompute_stats.cache_misses);
+    out->is_warmup_active = atomic_load(&g_precompute_stats.is_warmup_active);
 }

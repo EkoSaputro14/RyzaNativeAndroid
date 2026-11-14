@@ -57,13 +57,25 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 if(NOT RYZA_GIT_COMMIT)
-    set(RYZA_GIT_COMMIT "d74432b")
+    set(RYZA_GIT_COMMIT "unknown")
+endif()
+
+file(READ "${R}/android/botwrecompandroid/app/build.gradle.kts" RYZA_GRADLE_CFG)
+set(RYZA_VERSION_CODE "39")
+set(RYZA_VERSION_NAME "0.3.2-forensic-p6")
+if(RYZA_GRADLE_CFG MATCHES "versionCode[ \t]*=[ \t]*([0-9]+)")
+    set(RYZA_VERSION_CODE "${CMAKE_MATCH_1}")
+endif()
+if(RYZA_GRADLE_CFG MATCHES "versionName[ \t]*=[ \t]*\"([^\"]+)\"")
+    set(RYZA_VERSION_NAME "${CMAKE_MATCH_1}")
 endif()
 
 target_include_directories(main PRIVATE ${R}/runtime ${R}/runtime/nvn ${IMGUI} ${IMGUI}/backends ${DEPS}/include
                            ${DEPS}/volk ${BOTW_GEN_DIR} ${R}/third_party/smaa/Textures ${R}/android/common)
 target_compile_definitions(main PRIVATE
     RYZA_BUILD_COMMIT="${RYZA_GIT_COMMIT}"
+    RYZA_VERSION_CODE="${RYZA_VERSION_CODE}"
+    RYZA_VERSION_NAME="${RYZA_VERSION_NAME}"
     RYZA_BUILD_VARIANT="precomputed-render-pipeline"
     VK_NO_PROTOTYPES VK_USE_PLATFORM_ANDROID_KHR IMGUI_IMPL_VULKAN_USE_VOLK   # Vulkan from the loaded driver (volk)
     VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)

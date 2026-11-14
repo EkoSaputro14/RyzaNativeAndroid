@@ -17,6 +17,7 @@
 #include "../../ui/menu.h"
 #include "vk.h"
 #include "timing_trace.h"
+#include "precompute.h"
 #include "device_compat.h"
 #include "../output_scale.h"
 #include "../renderer.h"
@@ -1869,6 +1870,7 @@ static void quick_exit_handler(void) {
 #endif
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
+        precompute_shutdown();
     }
     if (trace) LOG("[vk] exit: terminating\n");
     fflush(stdout);
@@ -2126,7 +2128,7 @@ int ui_run(void) {
         while (SDL_WaitEventTimeout(&e, 16)) {
 #endif
 #ifdef __ANDROID__
-            if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND && g_vk.dev) vk_pipeline_cache_save();  // (may not come back)
+            if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND && g_vk.dev) { vk_pipeline_cache_save(); precompute_shutdown(); }  // (may not come back)
 #endif
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
