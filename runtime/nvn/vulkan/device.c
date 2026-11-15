@@ -49,8 +49,12 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 }
 
 // LARECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
+#ifdef __ANDROID__
+extern void vk_android_setup_shader_cache(void);
+#endif
 static void create_instance(void) {
 #ifdef __ANDROID__
+    vk_android_setup_shader_cache();
     vk_android_load();
 #endif
     Uint32 n_sdl = 0;

@@ -136,6 +136,15 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             File gen = new File(getFilesDir(), "gen");
             unpackGen(gen);
             setenv("LARECOMP_GEN_DIR", gen.getAbsolutePath());
+            File extFiles = getExternalFilesDir(null);
+            File cacheRoot = extFiles != null ? new File(extFiles, "cache") : getCacheDir();
+            if (!cacheRoot.isDirectory() && !cacheRoot.mkdirs()) cacheRoot = getCacheDir();
+            File mesaCache = new File(cacheRoot, "mesa_shader_cache");
+            if (!mesaCache.isDirectory()) mesaCache.mkdirs();
+            setenv("XDG_CACHE_HOME", cacheRoot.getAbsolutePath());
+            setenv("MESA_SHADER_CACHE_DIR", mesaCache.getAbsolutePath());
+            setenv("MESA_GLSL_CACHE_DIR", mesaCache.getAbsolutePath());
+            setenv("MESA_SHADER_CACHE_MAX_SIZE", "512M");
             if (getIntent() != null && SYSTEM_DRIVER.equals(getIntent().getAction())) dropCustomDriver();
             File driver = customDriver();
             setenv("LARECOMP_VK_DRIVER", driver != null ? driver.getAbsolutePath() : "");

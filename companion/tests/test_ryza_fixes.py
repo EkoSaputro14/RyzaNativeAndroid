@@ -480,7 +480,17 @@ def _verify_p13_visual_perf_fixes():
     # 5. Verify forensic non-aliasing UBO, throttling, normal decode, and no fake >250 NDC alarms
     assert "d->cbuf1_bank = 3;" in exec_c
     assert "st.ubuf[0][u].addr != d->cbuf1_addr" in exec_c
-    assert "cap_in_frame >= 2" in exec_c and "cur_frame - cap_seen[c].frame < 300" in exec_c
+    assert "cap_char_in_frame >= 4" in exec_c and "cap_env_in_frame >= 2" in exec_c and "cur_frame - cap_seen[c].frame < 300" in exec_c
+    # 7. Verify Turnip shader cache setup, LDC register aliasing fix, gres_direct, and multi-stream scan_src fix
+    android_driver_c = (repo_root / "runtime/nvn/vulkan/android_driver.c").read_text(encoding="utf-8")
+    java_act = (repo_root / "android/botwrecompandroid/app/src/main/java/com/botwrecompandroid/BOTWRecompAndroidActivity.java").read_text(encoding="utf-8")
+    assert "MESA_SHADER_CACHE_DIR" in android_driver_c and "XDG_CACHE_HOME" in android_driver_c
+    assert "vk_android_setup_shader_cache()" in android_driver_c and "vk_android_setup_shader_cache()" in device_c
+    assert "MESA_SHADER_CACHE_DIR" in java_act and "XDG_CACHE_HOME" in java_act
+    translate_c = (repo_root / "runtime/nvn/maxwell/translate.c").read_text(encoding="utf-8")
+    assert "uint cba_ = (%s + %lldu) & 0xFFFFu;" in translate_c and "int n = sz == 5 ? 2 : sz >= 6 ? 4 : 1;" in translate_c
+    assert "gres_direct(" in exec_c and "VK_BUFFER_USAGE_VERTEX_BUFFER_BIT" in exec_c
+    assert "has_bone_idx" in exec_c and "DEFORMED Static/Env Submesh" in forensics_c
     assert "norm_attr_hint" in exec_c and "memcpy(vs->norm, decoded" in exec_c
     assert "extreme_ndc" not in exec_c
     assert "VS_UBO_Primary" in forensics_c and "VS_UBO_Secondary" in forensics_c

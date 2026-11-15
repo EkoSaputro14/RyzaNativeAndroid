@@ -2825,13 +2825,15 @@ static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, Shad
 // ================================================================== vertex formats / fixed function tables
 static int attr_kind(uint32_t fmt) {
     switch (fmt) {
+    // Pure unsigned integer vertex formats (shader reads uvec4; note: 0x55/0x5B/0x61/0x67 are UI2F float formats)
     case 0x03: case 0x08: case 0x0B: case 0x0F: case 0x14: case 0x17: case 0x1B: case 0x20: case 0x23:
     case 0x27: case 0x2C: case 0x2F: case 0x3E:
-    case 0x55: case 0x5B: case 0x61: case 0x67: // UINT
+    case 0x6F: case 0x74: case 0x77: // UINT (+RGBX8/16/32_UINT)
         return 2;
+    // Pure signed integer vertex formats (shader reads ivec4; note: 0x56/0x5C/0x62/0x68 are I2F float formats)
     case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18: case 0x1C: case 0x21: case 0x24:
     case 0x28: case 0x2D: case 0x30: case 0x6A:
-    case 0x56: case 0x5C: case 0x62: case 0x68: // SINT
+    case 0x70: case 0x75: case 0x78: // SINT (+RGBX8/16/32_SINT)
         return 1;
     default: return 0;
     }
@@ -2925,6 +2927,19 @@ static VkFormat vertex_format(uint32_t f) {
     case 0x66: return VK_FORMAT_R16G16B16A16_SSCALED;
     case 0x67: return VK_FORMAT_R32G32B32A32_UINT;
     case 0x68: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x6D: return VK_FORMAT_R8G8B8A8_UNORM;
+    case 0x6E: return VK_FORMAT_R8G8B8A8_SNORM;
+    case 0x6F: return VK_FORMAT_R8G8B8A8_UINT;
+    case 0x70: return VK_FORMAT_R8G8B8A8_SINT;
+    case 0x71: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case 0x72: return VK_FORMAT_R16G16B16A16_UNORM;
+    case 0x73: return VK_FORMAT_R16G16B16A16_SNORM;
+    case 0x74: return VK_FORMAT_R16G16B16A16_UINT;
+    case 0x75: return VK_FORMAT_R16G16B16A16_SINT;
+    case 0x76: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case 0x77: return VK_FORMAT_R32G32B32A32_UINT;
+    case 0x78: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x98: case 0x99: return VK_FORMAT_B8G8R8A8_UNORM;
     default: {
         static uint8_t told[256];
         if (!told[f & 255]++) LOG("[vk] vertex format nvn %#x not mapped: read as RGBA32F\n", f);
@@ -3164,6 +3179,20 @@ static bool ryza_decode_attr_typed(uint32_t fmt, int dst_kind, const void *ptr, 
     case 0x66: { int16_t v[4]; memcpy(v, ptr, 8); f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
     case 0x67: { uint32_t v[4]; memcpy(v, ptr, 16); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; ui[3] = v[3]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
     case 0x68: { int32_t v[4]; memcpy(v, ptr, 16); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; si[3] = v[3]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
+    case 0x6D: f[0] = u8[0] / 255.0f; f[1] = u8[1] / 255.0f; f[2] = u8[2] / 255.0f; f[3] = 1.0f; break;
+    case 0x6E: f[0] = ryza_snorm8(s8[0]); f[1] = ryza_snorm8(s8[1]); f[2] = ryza_snorm8(s8[2]); f[3] = 1.0f; break;
+    case 0x6F: is_int_src = true; ui[0] = u8[0]; ui[1] = u8[1]; ui[2] = u8[2]; ui[3] = 1; break;
+    case 0x70: is_int_src = is_signed_int_src = true; si[0] = s8[0]; si[1] = s8[1]; si[2] = s8[2]; si[3] = 1; break;
+    case 0x71: { uint16_t v[3]; memcpy(v, ptr, 6); f[0] = ryza_f16_to_f32(v[0]); f[1] = ryza_f16_to_f32(v[1]); f[2] = ryza_f16_to_f32(v[2]); f[3] = 1.0f; break; }
+    case 0x72: { uint16_t v[3]; memcpy(v, ptr, 6); f[0] = v[0] / 65535.0f; f[1] = v[1] / 65535.0f; f[2] = v[2] / 65535.0f; f[3] = 1.0f; break; }
+    case 0x73: { int16_t v[3]; memcpy(v, ptr, 6); f[0] = ryza_snorm16(v[0]); f[1] = ryza_snorm16(v[1]); f[2] = ryza_snorm16(v[2]); f[3] = 1.0f; break; }
+    case 0x74: { uint16_t v[3]; memcpy(v, ptr, 6); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; ui[3] = 1; break; }
+    case 0x75: { int16_t v[3]; memcpy(v, ptr, 6); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; si[3] = 1; break; }
+    case 0x76: memcpy(f, ptr, 12); f[3] = 1.0f; break;
+    case 0x77: is_int_src = true; memcpy(ui, ptr, 12); ui[3] = 1; break;
+    case 0x78: is_int_src = is_signed_int_src = true; memcpy(si, ptr, 12); si[3] = 1; break;
+    case 0x98: f[0] = u8[2] / 255.0f; f[1] = u8[1] / 255.0f; f[2] = u8[0] / 255.0f; f[3] = 1.0f; break;
+    case 0x99: f[0] = u8[2] / 255.0f; f[1] = u8[1] / 255.0f; f[2] = u8[0] / 255.0f; f[3] = u8[3] / 255.0f; break;
     default: ok = false; break;
     }
     if (is_int_src && !nvn_fmt_is_i2f_32(fmt)) {
@@ -4985,7 +5014,8 @@ static bool gres_init(void) {
     if (g_vk.props.limits.maxStorageBufferRange < GA_SIZE) return false;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GA_SIZE,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
     // (cached: the CPU reads the GPU's stores back. Adreno's Turnip has a cached coherent type; Mali's cached one
     // isn't coherent - flushed and invalidated by hand, ga_noncoherent)
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -5819,12 +5849,31 @@ void vc_flush(void) {
 // device-local cache above, else read in place - no per-draw copy, no index scan for the copy size. The game fences its
 // CPU writes as on the Switch. Falls back to copies outside the heap or without the import; LARECOMP_VK_COPY_VERTICES=1
 // forces copies.
+#ifdef __ANDROID__
+static bool gres_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    if (!ga_buf || addr < HEAP_BASE || !size || addr - HEAP_BASE + size > HEAP_MAX) return false;
+    uint64_t lo = addr - HEAP_BASE, hi = lo + size;
+    for (int i = 0; i < ga_nres; i++) {
+        GaRes *e = &ga_res[i];
+        if (e->live && e->stored && e->lo <= lo && hi <= e->hi) {
+            gres_sync(e);
+            *buf = ga_buf;
+            *off = e->off + (lo - e->lo);
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     static int copy = -1;
     if (copy < 0) copy = getenv("LARECOMP_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
 #ifdef __ANDROID__
-    if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
+    if (gcopy_mode && !gmem_buf)
+        return addr + size <= HEAP_BASE + HEAP_MAX &&
+               (vcache_lookup(addr, size, buf, off) || gres_direct(addr, size, buf, off));
 #endif
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
@@ -7372,22 +7421,23 @@ static void draw_(CmdRec *r, bool indexed) {
                 continue;
             }
             uint64_t stride = pp->k.stride[s], need = 0;
-            if (scan_src) {  // copying after all: the index scan bounds the copy
-                if (v.size && v.size <= 65536) {
-                    need = v.size;
-                    scan_src = NULL;
-                } else {
+            if (!stride) {
+                need = 256;
+            } else if (pp->k.divisor[s]) {
+                need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
+            } else if (v.size && v.size <= 65536) {
+                // Do not clear scan_src here: a subsequent stream in the same draw with v.size > 65536
+                // still requires the deferred index scan to compute max_index.
+                need = v.size;
+            } else {
+                if (scan_src) {  // copying a large/unsized vertex stream after all: the index scan bounds the copy
                     if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != (uint16_t)scan_restart) max_index = q[i]; }
                     else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != scan_restart) max_index = q[i]; }
                     max_index += 1;
                     if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                     scan_src = NULL;
                 }
-            }
-            if (!need) {
-                if (!stride) need = 256;
-                else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
-                else need = (uint64_t)max_index * stride + 256;
+                need = (uint64_t)max_index * stride + 256;
             }
             if (v.size && need > v.size) need = v.size;
             uint64_t copy_sz = need ? need : 16;
@@ -7462,10 +7512,14 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
     if (g_ryza_capture_freeze) return;
     g_ryza_3d_draw_count++;
 
-    bool has_bones = false;
+    bool has_bone_idx = false;
+    bool has_bone_wgt = false;
     bool is_character = false;
     int pos_attr_hint = -1;
     int norm_attr_hint = -1;
+    int fallback_norm_attr = -1;
+    int bone_idx_attr = -1;
+    int bone_wgt_attr = -1;
     uint32_t natt = st.nattrib < 32 ? (uint32_t)st.nattrib : 32u;
     for (uint32_t i = 0; i < natt; i++) {
         if (!(pr->vi->attr_mask & (1u << i))) continue;
@@ -7474,20 +7528,57 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
         uint32_t sn = (a >> 8) & 0x1F;
         uint32_t off = a >> 13;
         uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
-        if (fmt == 0x27 || fmt == 0x25 || fmt == 0x2A || fmt == 0x0F || fmt == 0x0D) has_bones = true;
-        if (stride == 124 || stride == 64 || (fmt == 0x22 && off == 28)) is_character = true;
+
+        // Genuine bone index formats: UINT8/SINT8/UINT16/SINT16/UINT32/SINT32 or UI2F/I2F
+        if (fmt == 0x27 || fmt == 0x28 || fmt == 0x2C || fmt == 0x0F || fmt == 0x10 ||
+            fmt == 0x14 || fmt == 0x15 || fmt == 0x03 || fmt == 0x04 || fmt == 0x08 ||
+            fmt == 0x09 || fmt == 0x63 || fmt == 0x64 || fmt == 0x65 || fmt == 0x66 ||
+            fmt == 0x57 || fmt == 0x58 || fmt == 0x59 || fmt == 0x5A || fmt == 0x51 ||
+            fmt == 0x52 || fmt == 0x53 || fmt == 0x54 || (fmt == 0x2D && off > 0)) {
+            has_bone_idx = true;
+            if (bone_idx_attr < 0) bone_idx_attr = (int)i;
+        }
+        // Genuine bone weight candidates (only valid when paired with bone indices)
+        if (fmt == 0x25 || fmt == 0x2A || fmt == 0x0D || fmt == 0x12) {
+            has_bone_wgt = true;
+            if (bone_wgt_attr < 0) bone_wgt_attr = (int)i;
+        }
+        if (stride >= 48 || (fmt == 0x22 && off >= 24)) is_character = true;
+
         if (pos_attr_hint < 0 && off == 0 &&
             (fmt == 0x22 || fmt == 0x2E || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D || fmt == 0x1F)) {
             pos_attr_hint = (int)i;
         } else if (norm_attr_hint < 0 && (int)i != pos_attr_hint &&
                    (fmt == 0x69 || fmt == 0x22 || fmt == 0x1F || fmt == 0x1D || fmt == 0x29 || fmt == 0x2B || fmt == 0x26 || fmt == 0x1A)) {
             norm_attr_hint = (int)i;
+        } else if (fallback_norm_attr < 0 && (int)i != pos_attr_hint && fmt == 0x25) {
+            fallback_norm_attr = (int)i;
+        }
+    }
+    if (norm_attr_hint < 0 && fallback_norm_attr >= 0) norm_attr_hint = fallback_norm_attr;
+
+    bool has_bones = has_bone_idx;
+    if (!has_bones) {
+        bone_idx_attr = -1;
+        bone_wgt_attr = -1;
+    } else if (bone_wgt_attr < 0) {
+        // Look for float4/half4 bone weights on skinned meshes
+        for (uint32_t i = 0; i < natt; i++) {
+            if (!(pr->vi->attr_mask & (1u << i)) || (int)i == pos_attr_hint || (int)i == norm_attr_hint || (int)i == bone_idx_attr) continue;
+            uint32_t fmt = st.attrib[i] & 0xFF;
+            if (fmt == 0x2E || fmt == 0x29 || fmt == 0x2B || fmt == 0x22) {
+                bone_wgt_attr = (int)i;
+                break;
+            }
         }
     }
     if (has_bones) is_character = true;
     if (is_character) g_ryza_character_draw_count++;
 
-    // Fast deformation pre-check on vertex 0 before taking any lock or copying 8KB GLSL
+    // Fast deformation pre-check on vertex 0 before taking any lock or copying 8KB GLSL.
+    // Note: KTGL static world-space environment meshes use centimeter/millimeter units (e.g. |pos| ~ 55,000 = 55m),
+    // whereas character/skinned meshes are in local model space (|pos| < 5,000).
+    float pos_limit = is_character ? 10000.0f : 500000.0f;
     bool is_deformed = false;
     if (pos_attr_hint >= 0) {
         uint32_t a = st.attrib[pos_attr_hint];
@@ -7500,42 +7591,52 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
             float p0[4];
             if (ryza_decode_pos(fmt, (const void *)(uintptr_t)(st.vbuf[sn].addr + off), p0)) {
                 if (!isfinite(p0[0]) || !isfinite(p0[1]) || !isfinite(p0[2]) ||
-                    fabsf(p0[0]) > 50000.0f || fabsf(p0[1]) > 50000.0f || fabsf(p0[2]) > 50000.0f) {
+                    fabsf(p0[0]) > pos_limit || fabsf(p0[1]) > pos_limit || fabsf(p0[2]) > pos_limit) {
                     is_deformed = true;
                 }
             }
         }
     }
 
-    // Throttle heavy slot capture: capture each unique (vs, fs, attr_mask) at most once per 300 frames,
-    // max 2 captures per frame, unless a genuine non-finite/extreme vertex anomaly is detected.
+    // Throttle heavy slot capture: separate per-frame quotas for character vs static draws
+    // so early-frame static meshes (Stride=16) never starve character draws later in the frame.
     uint64_t cur_frame = renderer_present_count();
-    static struct { uint64_t vs, fs, frame; uint32_t mask; } cap_seen[32];
+    static struct { uint64_t vs, fs, frame; uint32_t mask; } cap_seen[64];
     static uint64_t cap_cur_frame = ~0ull;
-    static uint32_t cap_in_frame = 0;
+    static uint32_t cap_char_in_frame = 0;
+    static uint32_t cap_env_in_frame = 0;
     if (g_ryza_captured_draw_count == 0) memset(cap_seen, 0, sizeof(cap_seen));
-    if (cap_cur_frame != cur_frame) { cap_cur_frame = cur_frame; cap_in_frame = 0; }
+    if (cap_cur_frame != cur_frame) {
+        cap_cur_frame = cur_frame;
+        cap_char_in_frame = 0;
+        cap_env_in_frame = 0;
+    }
     if (!is_deformed) {
-        if (cap_in_frame >= 2) return;
+        if (is_character) {
+            if (cap_char_in_frame >= 4) return;
+        } else {
+            if (cap_env_in_frame >= 2) return;
+        }
         uint64_t vs_c = (uint64_t)pr->code[0], fs_c = (uint64_t)pr->code[1];
         uint32_t am = pr->vi->attr_mask;
-        for (int c = 0; c < 32; c++) {
+        for (int c = 0; c < 64; c++) {
             if (cap_seen[c].vs == vs_c && cap_seen[c].fs == fs_c && cap_seen[c].mask == am &&
                 cur_frame - cap_seen[c].frame < 300) {
                 return;
             }
         }
         int dst_c = -1;
-        for (int c = 0; c < 32; c++) {
+        for (int c = 0; c < 64; c++) {
             if (cap_seen[c].vs == vs_c && cap_seen[c].fs == fs_c && cap_seen[c].mask == am) { dst_c = c; break; }
             if (dst_c < 0 && (!cap_seen[c].vs || cur_frame - cap_seen[c].frame >= 300)) dst_c = c;
         }
-        if (dst_c < 0) dst_c = (int)(g_ryza_3d_draw_count & 31u);
+        if (dst_c < 0) dst_c = (int)(g_ryza_3d_draw_count & 63u);
         cap_seen[dst_c].vs = vs_c;
         cap_seen[dst_c].fs = fs_c;
         cap_seen[dst_c].mask = am;
         cap_seen[dst_c].frame = cur_frame;
-        cap_in_frame++;
+        if (is_character) cap_char_in_frame++;
+        else cap_env_in_frame++;
     }
 
     ryza_capture_lock();
@@ -7688,25 +7789,37 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
                             float decoded[4];
                             ryza_decode_attr_typed(afmt, 0, ap, decoded);
                             if (a < 8) memcpy(vs->attr_raw[a], decoded, sizeof(decoded));
-                            if ((int)a == pos_attr) memcpy(vs->pos, decoded, sizeof(vs->pos));
-                            else if ((int)a == norm_attr) memcpy(vs->norm, decoded, sizeof(vs->norm));
+                            if ((int)a == pos_attr) {
+                                memcpy(vs->pos, decoded, sizeof(vs->pos));
+                            } else if ((int)a == norm_attr) {
+                                if (afmt == 0x25) {
+                                    // Unpack R8G8B8A8_UNORM packed normal [0..1] -> [-1..1]
+                                    vs->norm[0] = decoded[0] * 2.0f - 1.0f;
+                                    vs->norm[1] = decoded[1] * 2.0f - 1.0f;
+                                    vs->norm[2] = decoded[2] * 2.0f - 1.0f;
+                                    vs->norm[3] = decoded[3];
+                                } else {
+                                    memcpy(vs->norm, decoded, sizeof(vs->norm));
+                                }
+                            }
 
-                            if (afmt == 0x27 && avail >= 4) {
-                                const uint8_t *b = (const uint8_t *)ap;
-                                vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
-                                vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                            } else if (afmt == 0x2C && avail >= 8) {
-                                const uint16_t *b = (const uint16_t *)ap;
-                                vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
-                                vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                            } else if (afmt == 0x25 && avail >= 4) {
-                                const uint8_t *w = (const uint8_t *)ap;
-                                vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
-                                vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
-                            } else if (afmt == 0x2A && avail >= 8) {
-                                const uint16_t *w = (const uint16_t *)ap;
-                                vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
-                                vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
+                            if ((int)a == bone_idx_attr) {
+                                if ((afmt == 0x27 || afmt == 0x28 || afmt == 0x63 || afmt == 0x64) && avail >= 4) {
+                                    const uint8_t *b = (const uint8_t *)ap;
+                                    vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                                    vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                                } else if ((afmt == 0x2C || afmt == 0x2D || afmt == 0x65 || afmt == 0x66) && avail >= 8) {
+                                    const uint16_t *b = (const uint16_t *)ap;
+                                    vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
+                                    vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
+                                } else {
+                                    vs->bone_indices[0] = (uint32_t)(decoded[0] >= 0.0f ? decoded[0] + 0.5f : 0.0f);
+                                    vs->bone_indices[1] = (uint32_t)(decoded[1] >= 0.0f ? decoded[1] + 0.5f : 0.0f);
+                                    vs->bone_indices[2] = (uint32_t)(decoded[2] >= 0.0f ? decoded[2] + 0.5f : 0.0f);
+                                    vs->bone_indices[3] = (uint32_t)(decoded[3] >= 0.0f ? decoded[3] + 0.5f : 0.0f);
+                                }
+                            } else if ((int)a == bone_wgt_attr) {
+                                memcpy(vs->bone_weights, decoded, sizeof(vs->bone_weights));
                             }
                         }
                     }
@@ -7729,7 +7842,12 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
             bool pos_finite = isfinite(vs->pos[0]) && isfinite(vs->pos[1]) && isfinite(vs->pos[2]);
             bool clip_finite = isfinite(vs->clip_pos[0]) && isfinite(vs->clip_pos[1]) && isfinite(vs->clip_pos[2]) && isfinite(vs->clip_pos[3]);
             vs->w_valid = pos_finite && clip_finite && (vs->clip_pos[3] > 0.0001f);
-            bool extreme_pos = !pos_finite || fabsf(vs->pos[0]) > 50000.0f || fabsf(vs->pos[1]) > 50000.0f || fabsf(vs->pos[2]) > 50000.0f;
+            float ndc_x = vs->w_valid ? fabsf(vs->clip_pos[0] / vs->clip_pos[3]) : 0.0f;
+            float ndc_y = vs->w_valid ? fabsf(vs->clip_pos[1] / vs->clip_pos[3]) : 0.0f;
+            bool clip_sane = !has_mvp || (vs->w_valid && ndc_x <= 25.0f && ndc_y <= 25.0f);
+            bool extreme_pos = !pos_finite ||
+                               fabsf(vs->pos[0]) > pos_limit || fabsf(vs->pos[1]) > pos_limit || fabsf(vs->pos[2]) > pos_limit ||
+                               (!is_character && !clip_sane && (fabsf(vs->pos[0]) > 50000.0f || fabsf(vs->pos[1]) > 50000.0f || fabsf(vs->pos[2]) > 50000.0f));
             vs->is_corrupted = extreme_pos;
             if (vs->is_corrupted) d->is_deformed = true;
         }

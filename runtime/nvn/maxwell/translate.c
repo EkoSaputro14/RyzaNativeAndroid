@@ -1335,17 +1335,47 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         for (int i = 0; i < n; i++) attr_store(c, d + i, addr + 4 * i);
     } else if (OPM(0xef90000000000000ull, 0xfff8000000000000ull)) {  // LD c[idx][reg + imm]
         int idx = (int)bits(w, 36, 5);
-        int64_t off = (int64_t)bits(w, 20, 16);  // unsigned (Ryujinx InstLdc.CbufOffset)
+        int64_t off = (int64_t)bits(w, 20, 16);  // 16-bit offset within 64KB constant buffer bank
         int sz = (int)bits(w, 48, 3);
-        int n = sz == 5 ? 2 : 1;
+        int n = sz == 5 ? 2 : sz >= 6 ? 4 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
-        for (int i = 0; i < n; i++) {
-            char cb[256];
-            cbuf_ref(c, idx, off + 4 * i, dyn, cb);
-            if (!dyn && (off + 4 * i) & 0) {}
-            if (dyn) c->info->cbuf_size[idx] = 0x10000;
-            set_reg(c, d + i, cb);
+        if (dyn) c->info->cbuf_size[idx] = 0x10000;
+        if (sz < 4) {
+            char cb[256], addr_expr[128], expr[320];
+            if (dyn) snprintf(addr_expr, sizeof addr_expr, "((%s + %lldu) & 0xFFFFu)", dyn, (long long)off);
+            else snprintf(addr_expr, sizeof addr_expr, "%lldu", (long long)(off & 0xFFFF));
+            cbuf_ref(c, idx, dyn ? 0 : (off & ~3ll), dyn ? addr_expr : NULL, cb);
+            if (sz == 0) snprintf(expr, sizeof expr, "((%s >> ((%s & 3u) * 8u)) & 0xFFu)", cb, addr_expr);
+            else if (sz == 1) snprintf(expr, sizeof expr, "uint(int(%s << (24u - (%s & 3u) * 8u)) >> 24)", cb, addr_expr);
+            else if (sz == 2) snprintf(expr, sizeof expr, "((%s >> ((%s & 2u) * 8u)) & 0xFFFFu)", cb, addr_expr);
+            else snprintf(expr, sizeof expr, "uint(int(%s << (16u - (%s & 2u) * 8u)) >> 16)", cb, addr_expr);
+            set_reg(c, d, expr);
+        } else if (dyn && n > 1) {
+            // Preserve base register `a` in `cba_` before writing `d..d+n-1` so `LDC.64 R4, c[b][R4+imm]`
+            // never clobbers `R4` on word 0 before loading word 1..n-1.
+            sp(&c->body, "    { uint cba_ = (%s + %lldu) & 0xFFFFu;\n", dyn, (long long)off);
+            for (int i = 0; i < n; i++) {
+                char cb[256];
+                cbuf_ref(c, idx, 4 * i, "cba_", cb);
+                if (d != RZ && d + i < RZ) {
+                    c->reg_used[d + i] = 1;
+                    sp(&c->body, "      r%d = %s;\n", d + i, cb);
+                }
+            }
+            sp(&c->body, "    }\n");
+        } else {
+            char dyn_wrap[64];
+            const char *dyn_use = dyn;
+            if (dyn) {
+                snprintf(dyn_wrap, sizeof dyn_wrap, "((%s + %lldu) & 0xFFFFu)", dyn, (long long)off);
+                dyn_use = dyn_wrap;
+            }
+            for (int i = 0; i < n; i++) {
+                char cb[256];
+                cbuf_ref(c, idx, (dyn ? 0 : off) + 4 * i, dyn_use, cb);
+                set_reg(c, d + i, cb);
+            }
         }
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);

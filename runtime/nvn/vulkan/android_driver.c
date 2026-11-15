@@ -7,8 +7,64 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 #include "vk.h"
+
+extern const char *rt_data_root(void);
+#if defined(__ANDROID__)
+extern const char *SDL_GetAndroidExternalStoragePath(void);
+extern const char *SDL_GetAndroidInternalStoragePath(void);
+#endif
+
+static void ensure_dir_recursive(const char *path) {
+    if (!path || !path[0]) return;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0777);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0777);
+}
+
+void vk_android_setup_shader_cache(void) {
+    const char *existing_mesa = getenv("MESA_SHADER_CACHE_DIR");
+    if (existing_mesa && existing_mesa[0] && strncmp(existing_mesa, "/data/.cache", 12) != 0) {
+        ensure_dir_recursive(existing_mesa);
+        const char *existing_xdg = getenv("XDG_CACHE_HOME");
+        if (existing_xdg && existing_xdg[0]) ensure_dir_recursive(existing_xdg);
+        return;
+    }
+
+    const char *base = NULL;
+#if defined(__ANDROID__)
+    base = SDL_GetAndroidExternalStoragePath();
+    if (!base || !base[0]) base = SDL_GetAndroidInternalStoragePath();
+#endif
+    if (!base || !base[0]) base = rt_data_root();
+    if (!base || !base[0]) base = "/storage/emulated/0/Android/data/com.botwrecomp.android/files";
+
+    char xdg_dir[512];
+    char mesa_dir[512];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/cache", base);
+    snprintf(mesa_dir, sizeof(mesa_dir), "%s/cache/mesa_shader_cache", base);
+
+    ensure_dir_recursive(xdg_dir);
+    ensure_dir_recursive(mesa_dir);
+
+    setenv("XDG_CACHE_HOME", xdg_dir, 1);
+    setenv("MESA_SHADER_CACHE_DIR", mesa_dir, 1);
+    setenv("MESA_GLSL_CACHE_DIR", mesa_dir, 1);
+    setenv("MESA_SHADER_CACHE_MAX_SIZE", "512M", 0);
+    fprintf(stderr, "[vk] Turnip/Mesa shader cache dir configured: MESA_SHADER_CACHE_DIR=%s XDG_CACHE_HOME=%s\n",
+            mesa_dir, xdg_dir);
+}
 
 // Does this driver offer a Vulkan GPU at all? (Turnip v26.0.0 R8, built for the A7xx: none on an Adreno 830 - the app
 // stopped at "no Vulkan device" on every start, its settings out of reach.) 1.1 and up: below 1.3 device.c checks the
@@ -46,6 +102,7 @@ static char g_rejected[128];
 const char *vk_driver_rejected(void) { return g_rejected; }
 
 void vk_android_load(void) {
+    vk_android_setup_shader_cache();
     void *lib = NULL;
     const char *drv = getenv("LARECOMP_VK_DRIVER"), *hooks = getenv("LARECOMP_NATIVE_LIB_DIR");
     if (drv && *drv && hooks && *hooks) {

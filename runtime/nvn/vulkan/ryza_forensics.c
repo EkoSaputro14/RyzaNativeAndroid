@@ -144,13 +144,17 @@ RyzaDrawForensic *ryza_allocate_capture_slot(uint32_t icount, uint32_t attr_mask
     d->is_locked = is_deformed; // Automatically lock deformed submesh slot
 
     if (is_deformed) {
-        snprintf(d->body_part, sizeof(d->body_part), "DEFORMED Ryza Submesh");
+        if (has_bones || is_character) {
+            snprintf(d->body_part, sizeof(d->body_part), "DEFORMED Ryza Submesh");
+        } else {
+            snprintf(d->body_part, sizeof(d->body_part), "DEFORMED Static/Env Submesh");
+        }
     } else if (has_bones) {
         snprintf(d->body_part, sizeof(d->body_part), "Ryza Skinned Body / Bones");
     } else if (is_character) {
         snprintf(d->body_part, sizeof(d->body_part), "Ryza Character Submesh");
     } else {
-        snprintf(d->body_part, sizeof(d->body_part), "Environment Mesh #%u", slot - 24);
+        snprintf(d->body_part, sizeof(d->body_part), "Environment Mesh #%u", slot >= 24 ? (slot - 24) : slot);
     }
 
     if (slot + 1 > g_ryza_captured_draw_count) {
