@@ -585,6 +585,7 @@ extern "C" void android_view_log_file(const char *name);
 extern "C" void android_export_log_file(const char *name);
 extern "C" void android_delete_log_file(const char *name);
 #endif
+extern "C" bool vk_adreno_6xx(const char *name);
 extern "C" bool vk_adreno_8xx(const char *name);  // (Driver compatibility's Automatic: runtime/nvn/vulkan/device.c)
 extern "C" bool vk_turnip_heap_on(int setting);
 extern "C" bool vk_lrz_at_start(void);
@@ -1622,7 +1623,8 @@ static void prelaunch_tab(float sc) {
                                   "GPUs, off for the others. Applies when the game starts."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Turnip low-resolution Z (LRZ)"));
-        changed |= tri("lrz", &g_settings.turnip_lrz, a8);
+        const bool lrz_auto = a8 || vk_adreno_6xx(vk_gpu_name());
+        changed |= tri("lrz", &g_settings.turnip_lrz, lrz_auto);
         ImGui::TextDisabled("%s", tr("Turnip's early depth test, a little faster. Off can fix missing or broken drawing on "
                                   "some Adreno GPUs. Automatic: on for Adreno 8xx GPUs, off for the others. Applies when "
                                   "BOTWRecompAndroid restarts."));
@@ -1634,7 +1636,7 @@ static void prelaunch_tab(float sc) {
         ImGui::TextDisabled("%s", tr("Advanced: switches the Vulkan driver reads when it starts, as NAME=value, separated by "
                                   "spaces. Leave it empty unless a guide for your phone tells you which ones. Applies when "
                                   "BOTWRecompAndroid restarts."));
-        bool lrz_now = g_settings.turnip_lrz < 0 ? a8 : g_settings.turnip_lrz != 0;
+        bool lrz_now = g_settings.turnip_lrz < 0 ? lrz_auto : g_settings.turnip_lrz != 0;
         if (lrz_now != vk_lrz_at_start() || strcmp(g_settings.driver_env, vk_driver_env_at_start())) {  // (read once, at the start)
             ImGui::Text("%s", tr("Restart BOTWRecompAndroid to apply it."));
             ImGui::SameLine();

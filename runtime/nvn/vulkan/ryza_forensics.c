@@ -345,28 +345,29 @@ static void serialize_forensics_to_file(FILE *f, const char *path, time_t now) {
                 d->itype, d->icount, (unsigned long long)d->iaddr, d->min_idx, d->max_idx, d->base_vertex);
 
         if (d->cbuf1_addr) {
-            fprintf(f, "  ConstantBuffer1 (View/Proj Matrix @ 0x%llx, sz=%u):\n",
-                    (unsigned long long)d->cbuf1_addr, d->cbuf1_size);
+            fprintf(f, "  VS_UBO_Primary (hw c%u @ 0x%llx, sz=%u):\n",
+                    d->cbuf1_bank ? d->cbuf1_bank : 3, (unsigned long long)d->cbuf1_addr, d->cbuf1_size);
             fprintf(f, "    [%.4f, %.4f, %.4f, %.4f]\n", d->cbuf1_sample[0], d->cbuf1_sample[1], d->cbuf1_sample[2], d->cbuf1_sample[3]);
             fprintf(f, "    [%.4f, %.4f, %.4f, %.4f]\n", d->cbuf1_sample[4], d->cbuf1_sample[5], d->cbuf1_sample[6], d->cbuf1_sample[7]);
             fprintf(f, "    [%.4f, %.4f, %.4f, %.4f]\n", d->cbuf1_sample[8], d->cbuf1_sample[9], d->cbuf1_sample[10], d->cbuf1_sample[11]);
             fprintf(f, "    [%.4f, %.4f, %.4f, %.4f]\n", d->cbuf1_sample[12], d->cbuf1_sample[13], d->cbuf1_sample[14], d->cbuf1_sample[15]);
         }
         if (d->cbuf3_addr) {
-            fprintf(f, "  ConstantBuffer3 (Bone Matrix Palette @ 0x%llx, sz=%u): sample first 2 bones\n",
-                    (unsigned long long)d->cbuf3_addr, d->cbuf3_size);
+            fprintf(f, "  VS_UBO_Secondary (hw c%u @ 0x%llx, sz=%u): sample first 2 vec4 blocks\n",
+                    d->cbuf3_bank ? d->cbuf3_bank : 4, (unsigned long long)d->cbuf3_addr, d->cbuf3_size);
             for (int b = 0; b < 2; b++) {
-                fprintf(f, "    Bone[%d] row0: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+0], d->cbuf3_sample[b*16+1], d->cbuf3_sample[b*16+2], d->cbuf3_sample[b*16+3]);
-                fprintf(f, "    Bone[%d] row1: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+4], d->cbuf3_sample[b*16+5], d->cbuf3_sample[b*16+6], d->cbuf3_sample[b*16+7]);
-                fprintf(f, "    Bone[%d] row2: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+8], d->cbuf3_sample[b*16+9], d->cbuf3_sample[b*16+10], d->cbuf3_sample[b*16+11]);
+                fprintf(f, "    Block[%d] r0: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+0], d->cbuf3_sample[b*16+1], d->cbuf3_sample[b*16+2], d->cbuf3_sample[b*16+3]);
+                fprintf(f, "    Block[%d] r1: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+4], d->cbuf3_sample[b*16+5], d->cbuf3_sample[b*16+6], d->cbuf3_sample[b*16+7]);
+                fprintf(f, "    Block[%d] r2: [%.4f, %.4f, %.4f, %.4f]\n", b, d->cbuf3_sample[b*16+8], d->cbuf3_sample[b*16+9], d->cbuf3_sample[b*16+10], d->cbuf3_sample[b*16+11]);
             }
         }
 
         fprintf(f, "  Attributes Layout:\n");
         for (uint32_t a = 0; a < RYZA_MAX_ATTRS; a++) {
             if (d->attr_mask & (1u << a)) {
-                fprintf(f, "    Attr[%2u]: stream=%u, nvn_fmt=0x%02x, vk_fmt=%u, kind=%u, off=%u, stride=%u, buf=0x%llx (sz=%llu)\n",
+                fprintf(f, "    Attr[%2u]: stream=%u, nvn_fmt=0x%02x, vk_fmt=%u%s, kind=%u, off=%u, stride=%u, buf=0x%llx (sz=%llu)\n",
                         a, d->attrs[a].stream, d->attrs[a].nvn_fmt, d->attrs[a].vk_fmt,
+                        d->attrs[a].was_converted ? "(CPU-conv)" : "",
                         d->attrs[a].kind, d->attrs[a].off, d->attrs[a].stride,
                         (unsigned long long)d->attrs[a].buf_addr, (unsigned long long)d->attrs[a].buf_size);
                 fprintf(f, "              raw=[0x%08x, 0x%08x, 0x%08x, 0x%08x] flt=[%.4f, %.4f, %.4f, %.4f]\n",

@@ -75,6 +75,7 @@ void precompute_shutdown(void);
 void precompute_warmup_start(void);
 void precompute_warmup_tick(void);
 void precompute_warmup_end(void);
+void precompute_tick(void);
 
 // Program Registration & Early Compilation
 void precompute_register_program(void *nvn_program);

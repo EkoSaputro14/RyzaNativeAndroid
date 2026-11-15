@@ -25,6 +25,8 @@ PrecomputeTelemetry g_precompute_stats = {0};
 static uint64_t s_manifest_hashes[MAX_MANIFEST_PIPELINES];
 static uint32_t s_manifest_count = 0;
 static pthread_mutex_t s_manifest_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool s_manifest_dirty = false;
+static _Atomic uint64_t s_last_manifest_save_ns = 0;
 
 // Static pass table for pre-recorded secondary / template command buffers
 #define MAX_STATIC_PASSES 256
@@ -101,6 +103,8 @@ static void save_manifest(void) {
         fclose(f);
         remove(get_manifest_path());
         rename(tmp_path, get_manifest_path());
+        atomic_store(&s_manifest_dirty, false);
+        atomic_store(&s_last_manifest_save_ns, get_time_ns());
     }
     pthread_mutex_unlock(&s_manifest_lock);
 }
@@ -141,6 +145,15 @@ void precompute_warmup_end(void) {
     save_manifest();
 }
 
+void precompute_tick(void) {
+    if (!atomic_load(&s_manifest_dirty)) return;
+    if (atomic_load(&g_precompute_stats.is_warmup_active)) return;
+    uint64_t now = get_time_ns();
+    uint64_t last = atomic_load(&s_last_manifest_save_ns);
+    if (last && now - last < 5000000000ull) return;
+    save_manifest();
+}
+
 void precompute_register_program(void *nvn_program) {
     if (!nvn_program) return;
     atomic_fetch_add(&g_precompute_stats.shaders_registered, 1);
@@ -168,6 +181,7 @@ void precompute_record_pipeline_hash(uint64_t hash) {
     if (s_manifest_count < MAX_MANIFEST_PIPELINES) {
         s_manifest_hashes[s_manifest_count++] = hash;
         atomic_store(&g_precompute_stats.pipelines_manifest_total, s_manifest_count);
+        atomic_store(&s_manifest_dirty, true);
     }
     pthread_mutex_unlock(&s_manifest_lock);
 }

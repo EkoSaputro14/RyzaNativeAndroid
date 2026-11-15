@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -911,9 +912,11 @@ static void create_device(void) {
 }
 
 void vk_pipeline_cache_save(void) {
-    if (getenv("LARECOMP_VK_NO_PIPELINE_CACHE")) return;
+    if (getenv("LARECOMP_VK_NO_PIPELINE_CACHE") || !g_vk.dev || !g_vk.pcache) return;
+    static pthread_mutex_t pcache_save_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&pcache_save_lock);
     size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
+    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) { pthread_mutex_unlock(&pcache_save_lock); return; }
     void *data = malloc(sz);
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         mkdir("cache", 0755);
@@ -925,6 +928,7 @@ void vk_pipeline_cache_save(void) {
         }
     }
     free(data);
+    pthread_mutex_unlock(&pcache_save_lock);
 }
 
 // ================================================================== swapchain
@@ -1884,11 +1888,20 @@ static void quick_exit_handler(void) {
 // Driver compatibility's Automatic (settings.h gpu_heap / inplace_reads / turnip_lrz, from LASRecompAndroid): the
 // fastest paths on the Adreno 8xx GPUs they were made on, the compatible ones elsewhere (an Adreno 750 drew LAS's text
 // and colors wrong with them). name: Vulkan's "Adreno (TM) 830v1" or the kernel's "Adreno830v2".
-bool vk_adreno_8xx(const char *name) {
+static int vk_adreno_gen_num(const char *name) {
     const char *a = name ? strstr(name, "Adreno") : NULL;
-    if (!a) return false;
+    if (!a) return 0;
     while (*a && (*a < '0' || *a > '9')) a++;
-    int n = atoi(a);
+    return atoi(a);
+}
+
+bool vk_adreno_6xx(const char *name) {
+    int n = vk_adreno_gen_num(name);
+    return n >= 600 && n < 700;
+}
+
+bool vk_adreno_8xx(const char *name) {
+    int n = vk_adreno_gen_num(name);
     return n >= 800 && n < 900;
 }
 // A Turnip path's setting (-1 Automatic, 1 on, 0 off) for this GPU
@@ -1947,7 +1960,7 @@ void ui_window_init(void) {
                 model[strcspn(model, "\r\n")] = 0;
             }
             if (!model[0]) snprintf(model, sizeof model, "%s", g_settings.gpu_model);
-            lrz = !model[0] || vk_adreno_8xx(model);
+            lrz = !model[0] || vk_adreno_6xx(model) || vk_adreno_8xx(model);
         }
         g_lrz_at_start = lrz != 0;
         if (!lrz && !getenv("TU_DEBUG")) setenv("TU_DEBUG", "nolrz", 1);

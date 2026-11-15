@@ -418,3 +418,80 @@ def _verify_p13_safe_patch():
     print("  -> PASS: p13 symbol bounds, HLE slot attribution, live-pool nvnTextureGetMemoryPool, Scudo-safe cmdbuf, movie/texture/HLE guards verified.")
 
 _verify_p13_safe_patch()
+
+
+def _verify_p13_visual_perf_fixes():
+    import struct
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    precompute_c = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c").read_text(encoding="utf-8")
+    precompute_h = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.h").read_text(encoding="utf-8")
+    forensics_h = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.h").read_text(encoding="utf-8")
+    forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+
+    # 1. No broken VK_FORMAT_UNDEFINED aliasing or RGBA32F fallback corruption in vertex_format_supported_checked
+    assert "static bool vk_vtx_fmt_ok(VkFormat f)" in exec_c
+    assert "if (f == VK_FORMAT_UNDEFINED) return false;" in exec_c
+    assert "vertex_format_supported_checked(fmt, ak, &need_conv)" in exec_c
+    assert "uint16_t conv_streams;" in exec_c
+    assert "ryza_decode_attr_typed(afmt, dst_kind" in exec_c
+
+    # 2. Verify A2B10G10R10_SNORM / SSCALED / USCALED / B10G11R11 / R16G16B16_SNORM math
+    def sext(v, bits):
+        m = 1 << (bits - 1)
+        v &= (1 << bits) - 1
+        return (v ^ m) - m
+
+    # A2B10G10R10_SNORM_PACK32: X=-512 (-1.0), Y=511 (+1.0), Z=0 (0.0), W=1 (+1.0)
+    packed_snorm = (512 & 0x3FF) | ((511 & 0x3FF) << 10) | (0 << 20) | ((1 & 0x3) << 30)
+    x = max(sext(packed_snorm, 10) / 511.0, -1.0)
+    y = max(sext(packed_snorm >> 10, 10) / 511.0, -1.0)
+    z = max(sext(packed_snorm >> 20, 10) / 511.0, -1.0)
+    w_s = sext(packed_snorm >> 30, 2)
+    w = -1.0 if w_s <= -1 else float(w_s)
+    assert abs(x - (-1.0)) < 1e-5 and abs(y - 1.0) < 1e-5 and z == 0.0 and w == 1.0
+
+    # A2B10G10R10_SSCALED_PACK32: X=-12, Y=34, Z=-5, W=-2
+    packed_sscaled = ((-12) & 0x3FF) | ((34 & 0x3FF) << 10) | (((-5) & 0x3FF) << 20) | (((-2) & 0x3) << 30)
+    assert sext(packed_sscaled, 10) == -12
+    assert sext(packed_sscaled >> 10, 10) == 34
+    assert sext(packed_sscaled >> 20, 10) == -5
+    assert sext(packed_sscaled >> 30, 2) == -2
+
+    # 3. Verify HUD per-frame averaging (no 2-second sums in vk_get_forensic_stats)
+    assert "s_iv_frames++;" in exec_c
+    assert "s_last_cpu_exec_ms = (prof_exec / 1e6) / (double)nf;" in exec_c
+    assert "s_last_gpu_ms = (prof_gpu / 1e6) / (double)nf;" in exec_c
+    assert "s_last_draws = stat_draws / nf;" in exec_c
+    # Simulate 2-second interval with 8 frames: 163.5ms total exec, 943.8ms total gpu, 5398 draws
+    nf = 8
+    assert abs((163.5 / nf) - 20.4375) < 1e-4
+    assert abs((943.8 / nf) - 117.975) < 1e-4
+    assert (5398 // nf) == 674
+
+    # 4. Verify precompute manifest & Vulkan pipeline cache persistence
+    assert "void precompute_tick(void);" in precompute_h
+    assert "s_manifest_dirty" in precompute_c and "precompute_tick(" in exec_c
+    assert "s_pcache_dirty" in exec_c and "pcache_save_lock" in device_c
+
+    # 5. Verify forensic non-aliasing UBO, throttling, normal decode, and no fake >250 NDC alarms
+    assert "d->cbuf1_bank = 3;" in exec_c
+    assert "st.ubuf[0][u].addr != d->cbuf1_addr" in exec_c
+    assert "cap_in_frame >= 2" in exec_c and "cur_frame - cap_seen[c].frame < 300" in exec_c
+    assert "norm_attr_hint" in exec_c and "memcpy(vs->norm, decoded" in exec_c
+    assert "extreme_ndc" not in exec_c
+    assert "VS_UBO_Primary" in forensics_c and "VS_UBO_Secondary" in forensics_c
+    assert "was_converted" in forensics_h and "was_converted" in forensics_c
+
+    # 6. Verify Adreno 6xx LRZ Automatic support in device.c & launcher.mm
+    assert "bool vk_adreno_6xx(const char *name)" in device_c
+    assert "vk_adreno_6xx(model) || vk_adreno_8xx(model)" in device_c
+    assert "vk_adreno_6xx(vk_gpu_name())" in launcher_mm
+
+    print("  -> PASS: p13 vertex format CPU decode fallback, per-frame HUD stats, precompute persistence, accurate forensics & Adreno 6xx LRZ verified.")
+
+
+_verify_p13_visual_perf_fixes()

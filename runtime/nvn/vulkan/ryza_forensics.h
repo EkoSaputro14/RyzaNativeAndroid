@@ -70,6 +70,7 @@ typedef struct {
         uint8_t nvn_fmt;
         uint8_t vk_fmt;
         uint8_t kind; // 0: float, 1: sint, 2: uint
+        uint8_t was_converted;
         uint32_t off;
         uint32_t stride;
         uint64_t buf_addr;
@@ -94,12 +95,14 @@ typedef struct {
     char vs_glsl[8192];
 
     // Bone matrices / constant buffer samples
+    uint8_t cbuf1_bank;
+    uint8_t cbuf3_bank;
     uint64_t cbuf1_addr;
     uint32_t cbuf1_size;
-    float cbuf1_sample[16]; // View/Proj matrix
+    float cbuf1_sample[16]; // First VS UBO (hardware bank c3+ / compiler c1)
     uint64_t cbuf3_addr;
     uint32_t cbuf3_size;
-    float cbuf3_sample[32]; // Bone matrices sample
+    float cbuf3_sample[32]; // Secondary distinct VS UBO sample
 
     // Rasterization / Depth state
     uint32_t cull_mode;

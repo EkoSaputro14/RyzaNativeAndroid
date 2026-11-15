@@ -69,6 +69,7 @@ uint64_t prof_up_cum;  // (the same, never reset)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static _Atomic bool s_pcache_dirty;
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -1328,6 +1329,8 @@ static inline NvnShaderStage *st_stage(int stage) {
     return np ? &np->stages[stage] : NULL;
 }
 
+static uint64_t s_iv_frames;
+static bool s_has_iv_stats;
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
 bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
@@ -1337,6 +1340,7 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
     uint64_t now = SDL_GetTicksNS();
+    s_iv_frames++;
     if (last_t) {
         uint64_t ex = cum_exec - l_exec;
         uint64_t wt = cum_wait - l_wait;
@@ -1345,6 +1349,15 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     if (atomic_load(&g_precompute_stats.is_warmup_active)) {
         if (frame >= 120) precompute_warmup_end();
         else precompute_warmup_tick();
+    } else {
+        precompute_tick();
+        static uint64_t s_last_pcache_save_ns;
+        if (atomic_load(&s_pcache_dirty) && (!s_last_pcache_save_ns || now - s_last_pcache_save_ns >= 15000000000ull)) {
+            extern void vk_pipeline_cache_save(void);
+            atomic_store(&s_pcache_dirty, false);
+            s_last_pcache_save_ns = now;
+            vk_pipeline_cache_save();
+        }
     }
     if (!prof) {
         last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
@@ -1446,9 +1459,12 @@ const char *renderer_stats(void) {
         pthread_mutex_unlock(&wait_tab_lock);
         prof_views_created = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
-        s_last_cpu_exec_ms = prof_exec / 1e6;
-        s_last_gpu_ms = prof_gpu / 1e6;
-        s_last_draws = stat_draws;
+        uint64_t nf = s_iv_frames ? s_iv_frames : 1;
+        s_last_cpu_exec_ms = (prof_exec / 1e6) / (double)nf;
+        s_last_gpu_ms = (prof_gpu / 1e6) / (double)nf;
+        s_last_draws = stat_draws / nf;
+        s_has_iv_stats = true;
+        s_iv_frames = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_dchained = stat_flushes = stat_wait_ns = 0;
@@ -1456,9 +1472,10 @@ const char *renderer_stats(void) {
 }
 
 void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws) {
-    if (cpu_exec_ms) *cpu_exec_ms = s_last_cpu_exec_ms ? s_last_cpu_exec_ms : (prof_exec / 1e6);
-    if (gpu_ms) *gpu_ms = s_last_gpu_ms ? s_last_gpu_ms : (prof_gpu / 1e6);
-    if (draws) *draws = s_last_draws ? s_last_draws : stat_draws;
+    uint64_t nf = s_iv_frames ? s_iv_frames : 1;
+    if (cpu_exec_ms) *cpu_exec_ms = s_has_iv_stats ? s_last_cpu_exec_ms : ((prof_exec / 1e6) / (double)nf);
+    if (gpu_ms) *gpu_ms = s_has_iv_stats ? s_last_gpu_ms : ((prof_gpu / 1e6) / (double)nf);
+    if (draws) *draws = s_has_iv_stats ? s_last_draws : (stat_draws / nf);
 }
 
 // Baked state changes and pass restarts invalidate the last pipeline; dynamic state does not.
@@ -2916,33 +2933,256 @@ static VkFormat vertex_format(uint32_t f) {
     }
 }
 
-// 3-component 8/16-bit vertex formats aren't universally supported: read 4 components instead.
-static VkFormat vertex_format_supported(VkFormat f) {
+static bool vk_vtx_fmt_ok(VkFormat f) {
+    if (f == VK_FORMAT_UNDEFINED) return false;
     static uint8_t known[256];  // 1 ok, 2 not
-    uint32_t i = f < 256 ? f : 0;
-    if (!known[i]) {
-        VkFormatProperties p;
-        vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &p);
-        known[i] = (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : 2;
+    if ((uint32_t)f < 256) {
+        if (!known[f]) {
+            VkFormatProperties p;
+            vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &p);
+            known[f] = (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : 2;
+        }
+        return known[f] == 1;
     }
-    if (known[i] == 1) return f;
-    { static uint8_t told[256]; if (!told[i]++) LOG("[vk] vertex format %d unsupported: read as 4 components\n", f); }
-    switch (f) {
-    case VK_FORMAT_R8G8B8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
-    case VK_FORMAT_R8G8B8_SNORM: return VK_FORMAT_R8G8B8A8_SNORM;
-    case VK_FORMAT_R8G8B8_UINT: return VK_FORMAT_R8G8B8A8_UINT;
-    case VK_FORMAT_R8G8B8_SINT: return VK_FORMAT_R8G8B8A8_SINT;
-    case VK_FORMAT_R16G16B16_SFLOAT: return VK_FORMAT_R16G16B16A16_SFLOAT;
-    case VK_FORMAT_R16G16B16_UNORM: return VK_FORMAT_R16G16B16A16_UNORM;
-    case VK_FORMAT_R16G16B16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
-    case VK_FORMAT_R16G16B16_UINT: return VK_FORMAT_R16G16B16A16_UINT;
-    case VK_FORMAT_R16G16B16_SINT: return VK_FORMAT_R16G16B16A16_SINT;
-    case VK_FORMAT_R8G8B8_USCALED: return VK_FORMAT_R8G8B8A8_USCALED;
-    case VK_FORMAT_R8G8B8_SSCALED: return VK_FORMAT_R8G8B8A8_SSCALED;
-    case VK_FORMAT_R16G16B16_USCALED: return VK_FORMAT_R16G16B16A16_USCALED;
-    case VK_FORMAT_R16G16B16_SSCALED: return VK_FORMAT_R16G16B16A16_SSCALED;
-    default: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormatProperties p;
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &p);
+    return (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+}
+
+static bool nvn_fmt_is_i2f_32(uint32_t fmt) {
+    return fmt == 0x55 || fmt == 0x56 || fmt == 0x5B || fmt == 0x5C ||
+           fmt == 0x61 || fmt == 0x62 || fmt == 0x67 || fmt == 0x68;
+}
+
+static VkFormat vertex_format_supported_checked(uint32_t nvn_fmt, int shader_kind, bool *needs_conv) {
+    VkFormat f = vertex_format(nvn_fmt);
+    // 32-bit UI2F / I2F formats have no Vulkan *SCALED equivalent; if shader expects float, unpack on CPU.
+    if (!(shader_kind == 0 && nvn_fmt_is_i2f_32(nvn_fmt)) && vk_vtx_fmt_ok(f)) {
+        if (needs_conv) *needs_conv = false;
+        return f;
     }
+    if (needs_conv) *needs_conv = true;
+    static uint8_t told[256];
+    if (!told[nvn_fmt & 255]++) {
+        LOG("[vk] vertex format nvn %#x (vk %d, kind %d) unsupported by hardware: CPU decode to RGBA32\n",
+            nvn_fmt, (int)f, shader_kind);
+    }
+    if (shader_kind == 1) return VK_FORMAT_R32G32B32A32_SINT;
+    if (shader_kind == 2) return VK_FORMAT_R32G32B32A32_UINT;
+    return VK_FORMAT_R32G32B32A32_SFLOAT;
+}
+
+static float ryza_f16_to_f32(uint16_t h) {
+    uint32_t s = ((uint32_t)(h & 0x8000u)) << 16;
+    uint32_t e = (h >> 10) & 0x1Fu;
+    uint32_t m = h & 0x03FFu;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) {
+            f = s;
+        } else {
+            e = 1;
+            while ((m & 0x0400u) == 0) { m <<= 1; e--; }
+            m &= 0x03FFu;
+            f = s | ((e + (127 - 15)) << 23) | (m << 13);
+        }
+    } else if (e == 31) {
+        f = s | 0x7F800000u | (m << 13);
+    } else {
+        f = s | ((e + (127 - 15)) << 23) | (m << 13);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+static float ryza_uf11_to_f32(uint32_t v) {
+    uint32_t e = (v >> 6) & 0x1Fu;
+    uint32_t m = v & 0x3Fu;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) f = 0;
+        else {
+            e = 1;
+            while ((m & 0x40u) == 0) { m <<= 1; e--; }
+            m &= 0x3Fu;
+            f = ((e + (127 - 15)) << 23) | (m << 17);
+        }
+    } else if (e == 31) {
+        f = 0x7F800000u | (m << 17);
+    } else {
+        f = ((e + (127 - 15)) << 23) | (m << 17);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+static float ryza_uf10_to_f32(uint32_t v) {
+    uint32_t e = (v >> 5) & 0x1Fu;
+    uint32_t m = v & 0x1Fu;
+    uint32_t f;
+    if (e == 0) {
+        if (m == 0) f = 0;
+        else {
+            e = 1;
+            while ((m & 0x20u) == 0) { m <<= 1; e--; }
+            m &= 0x1Fu;
+            f = ((e + (127 - 15)) << 23) | (m << 18);
+        }
+    } else if (e == 31) {
+        f = 0x7F800000u | (m << 18);
+    } else {
+        f = ((e + (127 - 15)) << 23) | (m << 18);
+    }
+    float out;
+    memcpy(&out, &f, sizeof(out));
+    return out;
+}
+
+static inline float ryza_snorm8(int8_t v) { float f = (float)v / 127.0f; return f < -1.0f ? -1.0f : f; }
+static inline float ryza_snorm16(int16_t v) { float f = (float)v / 32767.0f; return f < -1.0f ? -1.0f : f; }
+static inline int32_t ryza_sext(uint32_t v, unsigned bits) {
+    uint32_t m = 1u << (bits - 1);
+    v &= (1u << bits) - 1u;
+    return (int32_t)((v ^ m) - m);
+}
+
+static uint32_t ryza_fmt_byte_size(uint32_t fmt) {
+    if (fmt == 0) return 0;
+    const FormatInfo *fi = nvn_format_info(fmt);
+    return fi && fi->bpb ? fi->bpb : 16;
+}
+
+static bool ryza_decode_attr_typed(uint32_t fmt, int dst_kind, const void *ptr, void *out16) {
+    float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int32_t si[4] = {0, 0, 0, 1};
+    uint32_t ui[4] = {0, 0, 0, 1};
+    bool is_int_src = false;
+    bool is_signed_int_src = false;
+    bool ok = true;
+    const uint8_t *u8 = (const uint8_t *)ptr;
+    const int8_t *s8 = (const int8_t *)ptr;
+    switch (fmt) {
+    case 0x01: f[0] = u8[0] / 255.0f; break;
+    case 0x02: f[0] = ryza_snorm8(s8[0]); break;
+    case 0x03: is_int_src = true; ui[0] = u8[0]; break;
+    case 0x04: is_int_src = is_signed_int_src = true; si[0] = s8[0]; break;
+    case 0x0D: f[0] = u8[0] / 255.0f; f[1] = u8[1] / 255.0f; break;
+    case 0x0E: f[0] = ryza_snorm8(s8[0]); f[1] = ryza_snorm8(s8[1]); break;
+    case 0x0F: is_int_src = true; ui[0] = u8[0]; ui[1] = u8[1]; break;
+    case 0x10: is_int_src = is_signed_int_src = true; si[0] = s8[0]; si[1] = s8[1]; break;
+    case 0x19: f[0] = u8[0] / 255.0f; f[1] = u8[1] / 255.0f; f[2] = u8[2] / 255.0f; break;
+    case 0x1A: f[0] = ryza_snorm8(s8[0]); f[1] = ryza_snorm8(s8[1]); f[2] = ryza_snorm8(s8[2]); break;
+    case 0x1B: is_int_src = true; ui[0] = u8[0]; ui[1] = u8[1]; ui[2] = u8[2]; break;
+    case 0x1C: is_int_src = is_signed_int_src = true; si[0] = s8[0]; si[1] = s8[1]; si[2] = s8[2]; break;
+    case 0x25: f[0] = u8[0] / 255.0f; f[1] = u8[1] / 255.0f; f[2] = u8[2] / 255.0f; f[3] = u8[3] / 255.0f; break;
+    case 0x26: f[0] = ryza_snorm8(s8[0]); f[1] = ryza_snorm8(s8[1]); f[2] = ryza_snorm8(s8[2]); f[3] = ryza_snorm8(s8[3]); break;
+    case 0x27: is_int_src = true; ui[0] = u8[0]; ui[1] = u8[1]; ui[2] = u8[2]; ui[3] = u8[3]; break;
+    case 0x28: is_int_src = is_signed_int_src = true; si[0] = s8[0]; si[1] = s8[1]; si[2] = s8[2]; si[3] = s8[3]; break;
+    case 0x05: { uint16_t v; memcpy(&v, ptr, 2); f[0] = ryza_f16_to_f32(v); break; }
+    case 0x06: { uint16_t v; memcpy(&v, ptr, 2); f[0] = v / 65535.0f; break; }
+    case 0x07: { int16_t v; memcpy(&v, ptr, 2); f[0] = ryza_snorm16(v); break; }
+    case 0x08: { uint16_t v; memcpy(&v, ptr, 2); is_int_src = true; ui[0] = v; break; }
+    case 0x09: { int16_t v; memcpy(&v, ptr, 2); is_int_src = is_signed_int_src = true; si[0] = v; break; }
+    case 0x11: { uint16_t v[2]; memcpy(v, ptr, 4); f[0] = ryza_f16_to_f32(v[0]); f[1] = ryza_f16_to_f32(v[1]); break; }
+    case 0x12: { uint16_t v[2]; memcpy(v, ptr, 4); f[0] = v[0] / 65535.0f; f[1] = v[1] / 65535.0f; break; }
+    case 0x13: { int16_t v[2]; memcpy(v, ptr, 4); f[0] = ryza_snorm16(v[0]); f[1] = ryza_snorm16(v[1]); break; }
+    case 0x14: { uint16_t v[2]; memcpy(v, ptr, 4); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; break; }
+    case 0x15: { int16_t v[2]; memcpy(v, ptr, 4); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; break; }
+    case 0x1D: { uint16_t v[3]; memcpy(v, ptr, 6); f[0] = ryza_f16_to_f32(v[0]); f[1] = ryza_f16_to_f32(v[1]); f[2] = ryza_f16_to_f32(v[2]); break; }
+    case 0x1E: { uint16_t v[3]; memcpy(v, ptr, 6); f[0] = v[0] / 65535.0f; f[1] = v[1] / 65535.0f; f[2] = v[2] / 65535.0f; break; }
+    case 0x1F: { int16_t v[3]; memcpy(v, ptr, 6); f[0] = ryza_snorm16(v[0]); f[1] = ryza_snorm16(v[1]); f[2] = ryza_snorm16(v[2]); break; }
+    case 0x20: { uint16_t v[3]; memcpy(v, ptr, 6); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; break; }
+    case 0x21: { int16_t v[3]; memcpy(v, ptr, 6); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; break; }
+    case 0x29: { uint16_t v[4]; memcpy(v, ptr, 8); f[0] = ryza_f16_to_f32(v[0]); f[1] = ryza_f16_to_f32(v[1]); f[2] = ryza_f16_to_f32(v[2]); f[3] = ryza_f16_to_f32(v[3]); break; }
+    case 0x2A: { uint16_t v[4]; memcpy(v, ptr, 8); f[0] = v[0] / 65535.0f; f[1] = v[1] / 65535.0f; f[2] = v[2] / 65535.0f; f[3] = v[3] / 65535.0f; break; }
+    case 0x2B: { int16_t v[4]; memcpy(v, ptr, 8); f[0] = ryza_snorm16(v[0]); f[1] = ryza_snorm16(v[1]); f[2] = ryza_snorm16(v[2]); f[3] = ryza_snorm16(v[3]); break; }
+    case 0x2C: { uint16_t v[4]; memcpy(v, ptr, 8); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; ui[3] = v[3]; break; }
+    case 0x2D: { int16_t v[4]; memcpy(v, ptr, 8); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; si[3] = v[3]; break; }
+    case 0x0A: memcpy(&f[0], ptr, 4); break;
+    case 0x0B: is_int_src = true; memcpy(&ui[0], ptr, 4); break;
+    case 0x0C: is_int_src = is_signed_int_src = true; memcpy(&si[0], ptr, 4); break;
+    case 0x16: memcpy(f, ptr, 8); break;
+    case 0x17: is_int_src = true; memcpy(ui, ptr, 8); break;
+    case 0x18: is_int_src = is_signed_int_src = true; memcpy(si, ptr, 8); break;
+    case 0x22: memcpy(f, ptr, 12); break;
+    case 0x23: is_int_src = true; memcpy(ui, ptr, 12); break;
+    case 0x24: is_int_src = is_signed_int_src = true; memcpy(si, ptr, 12); break;
+    case 0x2E: memcpy(f, ptr, 16); break;
+    case 0x2F: is_int_src = true; memcpy(ui, ptr, 16); break;
+    case 0x30: is_int_src = is_signed_int_src = true; memcpy(si, ptr, 16); break;
+    case 0x39: { uint16_t v; memcpy(&v, ptr, 2); f[0] = ((v >> 12) & 0xF) / 15.0f; f[1] = ((v >> 8) & 0xF) / 15.0f; f[2] = ((v >> 4) & 0xF) / 15.0f; f[3] = (v & 0xF) / 15.0f; break; }
+    case 0x3A: { uint16_t v; memcpy(&v, ptr, 2); f[0] = ((v >> 11) & 0x1F) / 31.0f; f[1] = ((v >> 6) & 0x1F) / 31.0f; f[2] = ((v >> 1) & 0x1F) / 31.0f; f[3] = (float)(v & 1u); break; }
+    case 0x3B: { uint16_t v; memcpy(&v, ptr, 2); f[0] = ((v >> 10) & 0x1F) / 31.0f; f[1] = ((v >> 5) & 0x1F) / 31.0f; f[2] = (v & 0x1F) / 31.0f; f[3] = (float)((v >> 15) & 1u); break; }
+    case 0x3C: { uint16_t v; memcpy(&v, ptr, 2); f[0] = ((v >> 11) & 0x1F) / 31.0f; f[1] = ((v >> 5) & 0x3F) / 63.0f; f[2] = (v & 0x1F) / 31.0f; break; }
+    case 0x3D: { uint32_t v; memcpy(&v, ptr, 4); f[0] = (v & 0x3FFu) / 1023.0f; f[1] = ((v >> 10) & 0x3FFu) / 1023.0f; f[2] = ((v >> 20) & 0x3FFu) / 1023.0f; f[3] = ((v >> 30) & 3u) / 3.0f; break; }
+    case 0x3E: { uint32_t v; memcpy(&v, ptr, 4); is_int_src = true; ui[0] = v & 0x3FFu; ui[1] = (v >> 10) & 0x3FFu; ui[2] = (v >> 20) & 0x3FFu; ui[3] = (v >> 30) & 3u; break; }
+    case 0x3F: { uint32_t v; memcpy(&v, ptr, 4); f[0] = ryza_uf11_to_f32(v & 0x7FFu); f[1] = ryza_uf11_to_f32((v >> 11) & 0x7FFu); f[2] = ryza_uf10_to_f32((v >> 22) & 0x3FFu); break; }
+    case 0x40: { uint32_t v; memcpy(&v, ptr, 4); int exp = (int)((v >> 27) & 0x1Fu) - 15 - 9; float sc = ldexpf(1.0f, exp); f[0] = (v & 0x1FFu) * sc; f[1] = ((v >> 9) & 0x1FFu) * sc; f[2] = ((v >> 18) & 0x1FFu) * sc; break; }
+    case 0x69: {
+        uint32_t v; memcpy(&v, ptr, 4);
+        f[0] = ryza_sext(v, 10) / 511.0f; if (f[0] < -1.0f) f[0] = -1.0f;
+        f[1] = ryza_sext(v >> 10, 10) / 511.0f; if (f[1] < -1.0f) f[1] = -1.0f;
+        f[2] = ryza_sext(v >> 20, 10) / 511.0f; if (f[2] < -1.0f) f[2] = -1.0f;
+        int32_t a = ryza_sext(v >> 30, 2); f[3] = a <= -1 ? -1.0f : (float)a;
+        break;
+    }
+    case 0x6A: {
+        uint32_t v; memcpy(&v, ptr, 4);
+        is_int_src = is_signed_int_src = true;
+        si[0] = ryza_sext(v, 10); si[1] = ryza_sext(v >> 10, 10); si[2] = ryza_sext(v >> 20, 10); si[3] = ryza_sext(v >> 30, 2);
+        break;
+    }
+    case 0x6B: { uint32_t v; memcpy(&v, ptr, 4); f[0] = (float)(v & 0x3FFu); f[1] = (float)((v >> 10) & 0x3FFu); f[2] = (float)((v >> 20) & 0x3FFu); f[3] = (float)((v >> 30) & 3u); break; }
+    case 0x6C: {
+        uint32_t v; memcpy(&v, ptr, 4);
+        f[0] = (float)ryza_sext(v, 10); f[1] = (float)ryza_sext(v >> 10, 10); f[2] = (float)ryza_sext(v >> 20, 10); f[3] = (float)ryza_sext(v >> 30, 2);
+        break;
+    }
+    case 0x51: f[0] = (float)u8[0]; break;
+    case 0x52: f[0] = (float)s8[0]; break;
+    case 0x53: { uint16_t v; memcpy(&v, ptr, 2); f[0] = (float)v; break; }
+    case 0x54: { int16_t v; memcpy(&v, ptr, 2); f[0] = (float)v; break; }
+    case 0x55: { uint32_t v; memcpy(&v, ptr, 4); is_int_src = true; ui[0] = v; f[0] = (float)v; break; }
+    case 0x56: { int32_t v; memcpy(&v, ptr, 4); is_int_src = is_signed_int_src = true; si[0] = v; f[0] = (float)v; break; }
+    case 0x57: f[0] = (float)u8[0]; f[1] = (float)u8[1]; break;
+    case 0x58: f[0] = (float)s8[0]; f[1] = (float)s8[1]; break;
+    case 0x59: { uint16_t v[2]; memcpy(v, ptr, 4); f[0] = (float)v[0]; f[1] = (float)v[1]; break; }
+    case 0x5A: { int16_t v[2]; memcpy(v, ptr, 4); f[0] = (float)v[0]; f[1] = (float)v[1]; break; }
+    case 0x5B: { uint32_t v[2]; memcpy(v, ptr, 8); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; f[0] = (float)v[0]; f[1] = (float)v[1]; break; }
+    case 0x5C: { int32_t v[2]; memcpy(v, ptr, 8); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; f[0] = (float)v[0]; f[1] = (float)v[1]; break; }
+    case 0x5D: f[0] = (float)u8[0]; f[1] = (float)u8[1]; f[2] = (float)u8[2]; break;
+    case 0x5E: f[0] = (float)s8[0]; f[1] = (float)s8[1]; f[2] = (float)s8[2]; break;
+    case 0x5F: { uint16_t v[3]; memcpy(v, ptr, 6); f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; break; }
+    case 0x60: { int16_t v[3]; memcpy(v, ptr, 6); f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; break; }
+    case 0x61: { uint32_t v[3]; memcpy(v, ptr, 12); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; break; }
+    case 0x62: { int32_t v[3]; memcpy(v, ptr, 12); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; break; }
+    case 0x63: f[0] = (float)u8[0]; f[1] = (float)u8[1]; f[2] = (float)u8[2]; f[3] = (float)u8[3]; break;
+    case 0x64: f[0] = (float)s8[0]; f[1] = (float)s8[1]; f[2] = (float)s8[2]; f[3] = (float)s8[3]; break;
+    case 0x65: { uint16_t v[4]; memcpy(v, ptr, 8); f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
+    case 0x66: { int16_t v[4]; memcpy(v, ptr, 8); f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
+    case 0x67: { uint32_t v[4]; memcpy(v, ptr, 16); is_int_src = true; ui[0] = v[0]; ui[1] = v[1]; ui[2] = v[2]; ui[3] = v[3]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
+    case 0x68: { int32_t v[4]; memcpy(v, ptr, 16); is_int_src = is_signed_int_src = true; si[0] = v[0]; si[1] = v[1]; si[2] = v[2]; si[3] = v[3]; f[0] = (float)v[0]; f[1] = (float)v[1]; f[2] = (float)v[2]; f[3] = (float)v[3]; break; }
+    default: ok = false; break;
+    }
+    if (is_int_src && !nvn_fmt_is_i2f_32(fmt)) {
+        if (is_signed_int_src) {
+            for (int c = 0; c < 4; c++) { f[c] = (float)si[c]; ui[c] = (uint32_t)si[c]; }
+        } else {
+            for (int c = 0; c < 4; c++) { f[c] = (float)ui[c]; si[c] = (int32_t)ui[c]; }
+        }
+    } else if (!is_int_src && dst_kind != 0) {
+        for (int c = 0; c < 4; c++) { si[c] = (int32_t)f[c]; ui[c] = (uint32_t)f[c]; }
+    }
+    if (dst_kind == 1) memcpy(out16, si, 16);
+    else if (dst_kind == 2) memcpy(out16, ui, 16);
+    else memcpy(out16, f, 16);
+    return ok;
+}
+
+static bool ryza_decode_pos(uint32_t fmt, const void *ptr, float out[4]) {
+    return ryza_decode_attr_typed(fmt, 0, ptr, out);
 }
 
 static VkBlendFactor blend_factor(uint8_t f) {
@@ -3045,6 +3285,7 @@ typedef struct {
     uint32_t attr_fmt[32], attr_off[32], attr_bind[32];
     uint32_t attr_mask;
     uint32_t stride[NUM_STREAMS], divisor[NUM_STREAMS], used_streams;
+    uint16_t conv_streams;
     uint8_t blend[8][8];
     uint8_t blend_on, a2c, topo_class, poly_fill, depth_clamp;
     uint8_t prim_restart;  // (no extended dynamic state 2 only: primitive restart is pipeline state then)
@@ -3194,6 +3435,7 @@ static void build_pipeline(void *arg) {
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) {
         precompute_record_pipeline_hash(pp->hash);
+        atomic_store(&s_pcache_dirty, true);
     } else {  // (each failing key once: its draws are dropped)
         static int n;
         if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
@@ -6059,7 +6301,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 
 // ================================================================== draws
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed);
-static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex);
+static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex);
 
 // Quads / fans / polygons as a 32-bit triangle index list.
 static uint32_t *expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first, uint32_t *out_count) {
@@ -6681,16 +6923,32 @@ static void draw_(CmdRec *r, bool indexed) {
                 k.used_streams |= 1u << k.attr_bind[i];
                 continue;
             }
-            k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
+            int ak = (i < 32 && pr && pr->vkey.attr_kind[i]) ? pr->vkey.attr_kind[i] : 0;
+            bool need_conv = false;
+            k.attr_fmt[i] = vertex_format_supported_checked(fmt, ak, &need_conv);
             k.attr_off[i] = off;
             k.attr_bind[i] = stream;
             k.used_streams |= 1u << stream;
+            if (need_conv) k.conv_streams |= (uint16_t)(1u << stream);
         }
         for (int s = 0; s < 16; s++) {
             if (!(k.used_streams & (1u << s))) continue;
             k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
             k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
             if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
+            if (k.conv_streams & (1u << s)) {
+                uint32_t slot = 0;
+                for (int i = 0; i < 32; i++) {
+                    if (!(k.attr_mask & (1u << i)) || k.attr_bind[i] != (uint32_t)s) continue;
+                    int ak = (i < 32 && pr && pr->vkey.attr_kind[i]) ? pr->vkey.attr_kind[i] : 0;
+                    k.attr_fmt[i] = ak == 1 ? VK_FORMAT_R32G32B32A32_SINT
+                                  : ak == 2 ? VK_FORMAT_R32G32B32A32_UINT
+                                            : VK_FORMAT_R32G32B32A32_SFLOAT;
+                    k.attr_off[i] = slot * 16u;
+                    slot++;
+                }
+                if (k.stride[s] != 0) k.stride[s] = slot * 16u;
+            }
         }
         k.stride[ZERO_BINDING_FLOAT] = 0;
         k.divisor[ZERO_BINDING_FLOAT] = 0;
@@ -7033,6 +7291,58 @@ static void draw_(CmdRec *r, bool indexed) {
         } else if (s == ZERO_BINDING_INT) {
             static const uint32_t zero_i[4] = {0, 0, 0, 0};
             sp = vk_transient_copy(zero_i, 16, 16);
+        } else if (s < 16 && (pp->k.conv_streams & (1u << s))) {
+            Range v = st.vbuf[s];
+            uint32_t raw_stride = s < st.nstream ? st.stream[s][0] : 0;
+            uint32_t conv_stride = pp->k.stride[s];
+            if (use_index && scan_src) {
+                if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != (uint16_t)scan_restart) max_index = q[i]; }
+                else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > max_index && q[i] != scan_restart) max_index = q[i]; }
+                max_index += 1;
+                if (base_vertex > 0) max_index += (uint32_t)base_vertex;
+                scan_src = NULL;
+            }
+            uint64_t nverts = 1;
+            uint64_t v_start = 0;
+            if (raw_stride == 0) {
+                nverts = 1;
+            } else if (pp->k.divisor[s]) {
+                nverts = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s];
+                v_start = (uint64_t)(base_inst / pp->k.divisor[s]);
+            } else if (!use_index) {
+                nverts = (uint64_t)first + count;
+                v_start = (uint64_t)first;
+            } else {
+                nverts = max_index ? max_index : 1;
+            }
+            if (nverts == 0) nverts = 1;
+            if (nverts > (1u << 22)) nverts = (1u << 22);
+            if (v_start > nverts) v_start = nverts;
+            uint32_t nat_s = 0;
+            for (int i = 0; i < 32; i++) if ((pp->k.attr_mask & (1u << i)) && pp->k.attr_bind[i] == (uint32_t)s) nat_s++;
+            uint64_t total_bytes = conv_stride ? nverts * conv_stride : (uint64_t)nat_s * 16u;
+            if (!total_bytes) total_bytes = 16;
+            sp = vk_transient(total_bytes, 16);
+            memset(sp.ptr, 0, (size_t)total_bytes);
+            for (int i = 0; i < 32; i++) {
+                if (!(pp->k.attr_mask & (1u << i)) || pp->k.attr_bind[i] != (uint32_t)s) continue;
+                uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+                uint32_t afmt = a & 0xFF, raw_off = a >> 13;
+                uint32_t dst_off = pp->k.attr_off[i];
+                uint32_t elem_sz = ryza_fmt_byte_size(afmt);
+                int dst_kind = (i < 32 && pr && pr->vkey.attr_kind[i]) ? pr->vkey.attr_kind[i] : 0;
+                for (uint64_t vi = v_start; vi < nverts; vi++) {
+                    uint8_t *dst = (uint8_t *)sp.ptr + (conv_stride ? vi * conv_stride : 0) + dst_off;
+                    uint64_t rel = (uint64_t)raw_off + vi * raw_stride;
+                    if (v.addr && (!v.size || (rel <= v.size && elem_sz <= v.size - rel)) &&
+                        ryza_guest_readable(v.addr + rel, elem_sz)) {
+                        ryza_decode_attr_typed(afmt, dst_kind, (const void *)(uintptr_t)(v.addr + rel), dst);
+                    } else if (dst_kind == 0) {
+                        static const float def_f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                        memcpy(dst, def_f, 16);
+                    }
+                }
+            }
         } else {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
@@ -7098,7 +7408,7 @@ static void draw_(CmdRec *r, bool indexed) {
     else {
         vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
         if (indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFFFu)) {
-            ryza_forensic_inspect_draw(pr, r, true, count, icount, (uint32_t)r->x[1], r->x[3], base_vertex);
+            ryza_forensic_inspect_draw(pr, &pp->k, r, true, count, icount, (uint32_t)r->x[1], r->x[3], base_vertex);
         }
     }
     if (g_debug_frame) pick_after_draw();
@@ -7121,71 +7431,6 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
-static float ryza_f16_to_f32(uint16_t h) {
-    uint32_t s = ((uint32_t)(h & 0x8000u)) << 16;
-    uint32_t e = (h >> 10) & 0x1Fu;
-    uint32_t m = h & 0x03FFu;
-    uint32_t f;
-    if (e == 0) {
-        if (m == 0) {
-            f = s;
-        } else {
-            e = 1;
-            while ((m & 0x0400u) == 0) { m <<= 1; e--; }
-            m &= 0x03FFu;
-            f = s | ((e + (127 - 15)) << 23) | (m << 13);
-        }
-    } else if (e == 31) {
-        f = s | 0x7F800000u | (m << 13);
-    } else {
-        f = s | ((e + (127 - 15)) << 23) | (m << 13);
-    }
-    float out;
-    memcpy(&out, &f, sizeof(out));
-    return out;
-}
-
-static uint32_t ryza_fmt_byte_size(uint32_t fmt) {
-    switch (fmt) {
-    case 0x22: case 0x23: case 0x24: return 12;
-    case 0x2E: case 0x2F: case 0x30: return 16;
-    case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: return 8;
-    case 0x1D: case 0x1E: case 0x1F: case 0x20: case 0x21: return 6;
-    case 0x11: case 0x12: case 0x13: case 0x14: case 0x15:
-    case 0x25: case 0x26: case 0x27: case 0x28: return 4;
-    default: return 16;
-    }
-}
-
-static bool ryza_decode_pos(uint32_t fmt, const void *ptr, float out[4]) {
-    out[0] = out[1] = out[2] = 0.0f;
-    out[3] = 1.0f;
-    if (fmt == 0x2D) { // R16G16B16A16_SINT
-        const int16_t *p = (const int16_t *)ptr;
-        out[0] = (float)p[0]; out[1] = (float)p[1]; out[2] = (float)p[2]; out[3] = (float)p[3];
-        return true;
-    }
-    if (fmt == 0x2B) { // R16G16B16A16_SNORM
-        const int16_t *p = (const int16_t *)ptr;
-        out[0] = (float)p[0] / 32767.0f; out[1] = (float)p[1] / 32767.0f;
-        out[2] = (float)p[2] / 32767.0f; out[3] = (float)p[3] / 32767.0f;
-        return true;
-    }
-    if (fmt == 0x29 || fmt == 0x1D) { // R16G16B16A16_SFLOAT / R16G16B16_SFLOAT
-        const uint16_t *p = (const uint16_t *)ptr;
-        out[0] = ryza_f16_to_f32(p[0]); out[1] = ryza_f16_to_f32(p[1]); out[2] = ryza_f16_to_f32(p[2]);
-        out[3] = (fmt == 0x29) ? ryza_f16_to_f32(p[3]) : 1.0f;
-        return true;
-    }
-    if (fmt == 0x22 || fmt == 0x2E) { // R32G32B32_SFLOAT / R32G32B32A32_SFLOAT
-        const float *p = (const float *)ptr;
-        out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
-        out[3] = (fmt == 0x2E) ? p[3] : 1.0f;
-        return true;
-    }
-    return false;
-}
-
 static bool ryza_mat4_finite_nonzero(const float m[16]) {
     float sum = 0.0f;
     for (int i = 0; i < 16; i++) {
@@ -7205,41 +7450,44 @@ static void ryza_mat4_mul_vec(const float m[16], const float v[4], bool row_majo
     }
 }
 
-
 static uint32_t ryza_read_index(const void *isrc, uint32_t isz, uint32_t idx) {
     if (isz == 1) return ((const uint8_t *)isrc)[idx];
     if (isz == 2) return ((const uint16_t *)isrc)[idx];
     return ((const uint32_t *)isrc)[idx];
 }
 
-static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
+static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
     (void)r;
     if (!use_index || count == 0 || icount < 30 || !pr || !pr->vi) return;
     if (g_ryza_capture_freeze) return;
-
     g_ryza_3d_draw_count++;
 
     bool has_bones = false;
     bool is_character = false;
     int pos_attr_hint = -1;
-    for (int i = 0; i < 32 && i < st.nattrib; i++) {
+    int norm_attr_hint = -1;
+    uint32_t natt = st.nattrib < 32 ? (uint32_t)st.nattrib : 32u;
+    for (uint32_t i = 0; i < natt; i++) {
         if (!(pr->vi->attr_mask & (1u << i))) continue;
         uint32_t a = st.attrib[i];
         uint32_t fmt = a & 0xFF;
         uint32_t sn = (a >> 8) & 0x1F;
         uint32_t off = a >> 13;
         uint32_t stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
-
         if (fmt == 0x27 || fmt == 0x25 || fmt == 0x2A || fmt == 0x0F || fmt == 0x0D) has_bones = true;
         if (stride == 124 || stride == 64 || (fmt == 0x22 && off == 28)) is_character = true;
-        if (pos_attr_hint < 0 && off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D)) {
-            pos_attr_hint = i;
+        if (pos_attr_hint < 0 && off == 0 &&
+            (fmt == 0x22 || fmt == 0x2E || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D || fmt == 0x1F)) {
+            pos_attr_hint = (int)i;
+        } else if (norm_attr_hint < 0 && (int)i != pos_attr_hint &&
+                   (fmt == 0x69 || fmt == 0x22 || fmt == 0x1F || fmt == 0x1D || fmt == 0x29 || fmt == 0x2B || fmt == 0x26 || fmt == 0x1A)) {
+            norm_attr_hint = (int)i;
         }
     }
     if (has_bones) is_character = true;
     if (is_character) g_ryza_character_draw_count++;
 
-    // Format-aware deformation pre-check on vertex 0 before slot allocation
+    // Fast deformation pre-check on vertex 0 before taking any lock or copying 8KB GLSL
     bool is_deformed = false;
     if (pos_attr_hint >= 0) {
         uint32_t a = st.attrib[pos_attr_hint];
@@ -7259,6 +7507,37 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         }
     }
 
+    // Throttle heavy slot capture: capture each unique (vs, fs, attr_mask) at most once per 300 frames,
+    // max 2 captures per frame, unless a genuine non-finite/extreme vertex anomaly is detected.
+    uint64_t cur_frame = renderer_present_count();
+    static struct { uint64_t vs, fs, frame; uint32_t mask; } cap_seen[32];
+    static uint64_t cap_cur_frame = ~0ull;
+    static uint32_t cap_in_frame = 0;
+    if (g_ryza_captured_draw_count == 0) memset(cap_seen, 0, sizeof(cap_seen));
+    if (cap_cur_frame != cur_frame) { cap_cur_frame = cur_frame; cap_in_frame = 0; }
+    if (!is_deformed) {
+        if (cap_in_frame >= 2) return;
+        uint64_t vs_c = (uint64_t)pr->code[0], fs_c = (uint64_t)pr->code[1];
+        uint32_t am = pr->vi->attr_mask;
+        for (int c = 0; c < 32; c++) {
+            if (cap_seen[c].vs == vs_c && cap_seen[c].fs == fs_c && cap_seen[c].mask == am &&
+                cur_frame - cap_seen[c].frame < 300) {
+                return;
+            }
+        }
+        int dst_c = -1;
+        for (int c = 0; c < 32; c++) {
+            if (cap_seen[c].vs == vs_c && cap_seen[c].fs == fs_c && cap_seen[c].mask == am) { dst_c = c; break; }
+            if (dst_c < 0 && (!cap_seen[c].vs || cur_frame - cap_seen[c].frame >= 300)) dst_c = c;
+        }
+        if (dst_c < 0) dst_c = (int)(g_ryza_3d_draw_count & 31u);
+        cap_seen[dst_c].vs = vs_c;
+        cap_seen[dst_c].fs = fs_c;
+        cap_seen[dst_c].mask = am;
+        cap_seen[dst_c].frame = cur_frame;
+        cap_in_frame++;
+    }
+
     ryza_capture_lock();
     RyzaDrawForensic *d = ryza_allocate_capture_slot(icount, pr->vi->attr_mask, has_bones, is_character, is_deformed);
     if (!d) {
@@ -7266,7 +7545,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         return;
     }
 
-    d->frame = renderer_present_count();
+    d->frame = cur_frame;
     d->draw_idx = (uint32_t)stat_draws;
     d->vs_code = (uint64_t)pr->code[0];
     d->fs_code = (uint64_t)pr->code[1];
@@ -7278,22 +7557,23 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     d->icount = icount;
     d->iaddr = iaddr;
     d->base_vertex = base_vertex;
-
     if (pr->vi->msl) {
         strncpy(d->vs_glsl, pr->vi->msl, sizeof(d->vs_glsl) - 1);
         d->vs_glsl[sizeof(d->vs_glsl) - 1] = '\0';
     }
 
     int pos_attr = -1;
-    for (int i = 0; i < 32 && i < st.nattrib; i++) {
+    int norm_attr = norm_attr_hint;
+    for (uint32_t i = 0; i < natt; i++) {
         if (!(pr->vi->attr_mask & (1u << i))) continue;
         uint32_t a = st.attrib[i];
         uint32_t sn = (a >> 8) & 0x1F;
         uint32_t fmt = a & 0xFF;
-        d->attrs[i].stream = sn;
-        d->attrs[i].nvn_fmt = fmt;
-        d->attrs[i].vk_fmt = (uint8_t)vertex_format(fmt);
+        d->attrs[i].stream = (uint8_t)sn;
+        d->attrs[i].nvn_fmt = (uint8_t)fmt;
+        d->attrs[i].vk_fmt = pk ? (uint8_t)pk->attr_fmt[i] : (uint8_t)vertex_format(fmt);
         d->attrs[i].kind = (uint8_t)attr_kind(fmt);
+        d->attrs[i].was_converted = (pk && sn < 16 && ((pk->conv_streams >> sn) & 1u)) ? 1 : 0;
         d->attrs[i].off = a >> 13;
         d->attrs[i].stride = sn < (uint32_t)st.nstream ? st.stream[sn][0] : 0;
         if (sn < 16) {
@@ -7306,12 +7586,13 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 uint64_t src_addr = st.vbuf[sn].addr + d->attrs[i].off;
                 if (ryza_guest_readable(src_addr, cp)) {
                     memcpy(d->attrs[i].raw_data, (const void *)(uintptr_t)src_addr, cp);
-                    memcpy(d->attrs[i].float_data, d->attrs[i].raw_data, sizeof(d->attrs[i].float_data));
+                    ryza_decode_attr_typed(fmt, 0, (const void *)(uintptr_t)src_addr, d->attrs[i].float_data);
                 }
             }
         }
-        if (d->attrs[i].off == 0 && (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D)) {
-            pos_attr = i;
+        if (pos_attr < 0 && d->attrs[i].off == 0 &&
+            (fmt == 0x22 || fmt == 0x2E || fmt == 0x21 || fmt == 0x2D || fmt == 0x29 || fmt == 0x2B || fmt == 0x1D || fmt == 0x1F)) {
+            pos_attr = (int)i;
         }
     }
     if (pos_attr < 0) pos_attr = pos_attr_hint >= 0 ? pos_attr_hint : ((pr->vi->attr_mask & 2u) ? 1 : 0);
@@ -7322,35 +7603,34 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     d->depth_write = (uint32_t)st.ds[1];
     d->depth_compare_op = (uint32_t)st.ds[2];
 
-    // Constant buffer capture: prefer game VS UBOs (st.ubuf[0][0..3]) for transforms & bone palette,
-    // falling back to compiler const pool (vss->const_offset) if no game UBO is bound.
+    // Accurate Maxwell constant bank recording (c1 = compiler consts, c3+u = st.ubuf[0][u]).
+    // Never alias cbuf1_addr onto cbuf3_addr.
     NvnShaderStage *vss = st_stage(0);
     if (st.ubuf[0][0].addr && st.ubuf[0][0].size >= 64 &&
         ryza_guest_readable(st.ubuf[0][0].addr, sizeof(d->cbuf1_sample))) {
+        d->cbuf1_bank = 3;
         d->cbuf1_addr = st.ubuf[0][0].addr;
         d->cbuf1_size = (uint32_t)st.ubuf[0][0].size;
         memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
     } else if (vss && vss->code_addr && vss->const_offset && vss->const_size >= 64 &&
                ryza_guest_readable(vss->code_addr + vss->const_offset, sizeof(d->cbuf1_sample))) {
+        d->cbuf1_bank = 1;
         d->cbuf1_addr = vss->code_addr + vss->const_offset;
         d->cbuf1_size = vss->const_size;
         memcpy(d->cbuf1_sample, (const void *)(uintptr_t)d->cbuf1_addr, sizeof(d->cbuf1_sample));
     }
 
     int bone_ubuf = -1;
-    for (int u = 1; u < 4; u++) {
-        if (st.ubuf[0][u].addr && st.ubuf[0][u].size >= 128 &&
+    for (int u = 1; u < 6; u++) {
+        if (st.ubuf[0][u].addr && st.ubuf[0][u].addr != d->cbuf1_addr && st.ubuf[0][u].size >= 128 &&
             ryza_guest_readable(st.ubuf[0][u].addr, sizeof(d->cbuf3_sample))) {
             if (bone_ubuf < 0 || st.ubuf[0][u].size > st.ubuf[0][bone_ubuf].size) {
                 bone_ubuf = u;
             }
         }
     }
-    if (bone_ubuf < 0 && st.ubuf[0][0].addr && st.ubuf[0][0].size >= 128 &&
-        ryza_guest_readable(st.ubuf[0][0].addr, sizeof(d->cbuf3_sample))) {
-        bone_ubuf = 0;
-    }
     if (bone_ubuf >= 0) {
+        d->cbuf3_bank = (uint8_t)(3 + bone_ubuf);
         d->cbuf3_addr = st.ubuf[0][bone_ubuf].addr;
         d->cbuf3_size = (uint32_t)st.ubuf[0][bone_ubuf].size;
         memcpy(d->cbuf3_sample, (const void *)(uintptr_t)d->cbuf3_addr, sizeof(d->cbuf3_sample));
@@ -7367,7 +7647,6 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         for (uint32_t i = 0; i < scan_count && i < 16; i++) {
             d->raw_indices[i] = ryza_read_index(isrc, isz, i);
         }
-        // Bounded scan up to 256 raw indices to avoid reading past unexpanded guest IB or stalling CPU
         for (uint32_t i = 0; i < scan_count; i++) {
             uint32_t val = ryza_read_index(isrc, isz, i);
             if (st.prim_restart && val == restart_val) continue;
@@ -7382,14 +7661,9 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
         uint32_t first1 = (1 < scan_count && !(st.prim_restart && d->raw_indices[1] == restart_val)) ? d->raw_indices[1] : first0;
         uint32_t first2 = (2 < scan_count && !(st.prim_restart && d->raw_indices[2] == restart_val)) ? d->raw_indices[2] : first0;
 
-        uint32_t sample_indices[6];
-        sample_indices[0] = min_idx;
-        sample_indices[1] = min_idx + (max_idx - min_idx) / 2u;
-        sample_indices[2] = max_idx;
-        sample_indices[3] = first0;
-        sample_indices[4] = first1;
-        sample_indices[5] = first2;
-
+        uint32_t sample_indices[6] = {
+            min_idx, min_idx + (max_idx - min_idx) / 2u, max_idx, first0, first1, first2
+        };
         d->num_samples = 6;
         for (uint32_t s = 0; s < 6; s++) {
             int64_t real_vidx = (int64_t)sample_indices[s] + (int64_t)base_vertex;
@@ -7397,8 +7671,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
             RyzaVertexSample *vs = &d->samples[s];
             vs->vertex_idx = vidx;
             vs->pos[3] = 1.0f;
-
-            for (int a = 0; a < 8 && a < st.nattrib; a++) {
+            for (uint32_t a = 0; a < natt; a++) {
                 if (!(pr->vi->attr_mask & (1u << a))) continue;
                 uint32_t sn = (st.attrib[a] >> 8) & 0x1F;
                 uint32_t off = st.attrib[a] >> 13;
@@ -7410,30 +7683,28 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                     if (rel <= st.vbuf[sn].size && elem_sz <= st.vbuf[sn].size - rel) {
                         uint64_t attr_addr = st.vbuf[sn].addr + rel;
                         uint64_t avail = st.vbuf[sn].size - rel;
-                        size_t cp = avail >= 16 ? 16 : (size_t)avail;
-                        if (ryza_guest_readable(attr_addr, cp)) {
-                            memcpy(vs->attr_raw[a], (const void *)(uintptr_t)attr_addr, cp);
+                        if (ryza_guest_readable(attr_addr, elem_sz)) {
+                            const void *ap = (const void *)(uintptr_t)attr_addr;
+                            float decoded[4];
+                            ryza_decode_attr_typed(afmt, 0, ap, decoded);
+                            if (a < 8) memcpy(vs->attr_raw[a], decoded, sizeof(decoded));
+                            if ((int)a == pos_attr) memcpy(vs->pos, decoded, sizeof(vs->pos));
+                            else if ((int)a == norm_attr) memcpy(vs->norm, decoded, sizeof(vs->norm));
 
-                            if (a == pos_attr) {
-                                if (!ryza_decode_pos(afmt, (const void *)(uintptr_t)attr_addr, vs->pos) && avail >= 12) {
-                                    const float *pf = (const float *)(uintptr_t)attr_addr;
-                                    vs->pos[0] = pf[0]; vs->pos[1] = pf[1]; vs->pos[2] = pf[2]; vs->pos[3] = 1.0f;
-                                }
-                            }
-                            if (afmt == 0x27 && avail >= 4) { // R8G8B8A8_UINT bone indices
-                                const uint8_t *b = (const uint8_t *)(uintptr_t)attr_addr;
+                            if (afmt == 0x27 && avail >= 4) {
+                                const uint8_t *b = (const uint8_t *)ap;
                                 vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
                                 vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                            } else if (afmt == 0x2C && avail >= 8) { // R16G16B16A16_UINT bone indices
-                                const uint16_t *b = (const uint16_t *)(uintptr_t)attr_addr;
+                            } else if (afmt == 0x2C && avail >= 8) {
+                                const uint16_t *b = (const uint16_t *)ap;
                                 vs->bone_indices[0] = b[0]; vs->bone_indices[1] = b[1];
                                 vs->bone_indices[2] = b[2]; vs->bone_indices[3] = b[3];
-                            } else if (afmt == 0x25 && avail >= 4) { // R8G8B8A8_UNORM bone weights
-                                const uint8_t *w = (const uint8_t *)(uintptr_t)attr_addr;
+                            } else if (afmt == 0x25 && avail >= 4) {
+                                const uint8_t *w = (const uint8_t *)ap;
                                 vs->bone_weights[0] = w[0] / 255.0f; vs->bone_weights[1] = w[1] / 255.0f;
                                 vs->bone_weights[2] = w[2] / 255.0f; vs->bone_weights[3] = w[3] / 255.0f;
-                            } else if (afmt == 0x2A && avail >= 8) { // R16G16B16A16_UNORM bone weights
-                                const uint16_t *w = (const uint16_t *)(uintptr_t)attr_addr;
+                            } else if (afmt == 0x2A && avail >= 8) {
+                                const uint16_t *w = (const uint16_t *)ap;
                                 vs->bone_weights[0] = w[0] / 65535.0f; vs->bone_weights[1] = w[1] / 65535.0f;
                                 vs->bone_weights[2] = w[2] / 65535.0f; vs->bone_weights[3] = w[3] / 65535.0f;
                             }
@@ -7441,40 +7712,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                     }
                 }
             }
-
-            // Optional CPU-side skinning & clip-space evaluation using captured UBOs
             float eval_pos[4] = { vs->pos[0], vs->pos[1], vs->pos[2], 1.0f };
-            bool bone_oob = false;
-            if (has_bones && d->cbuf3_addr && d->cbuf3_size >= 64) {
-                uint32_t max_bones = d->cbuf3_size / 48u;
-                float wsum = 0.0f;
-                float skinned[3] = { 0.0f, 0.0f, 0.0f };
-                const float *palette = (const float *)(uintptr_t)d->cbuf3_addr;
-                for (int k = 0; k < 4; k++) {
-                    float w = vs->bone_weights[k];
-                    if (w > 0.0001f) {
-                        uint32_t bidx = vs->bone_indices[k];
-                        if (bidx >= max_bones || !ryza_guest_readable(d->cbuf3_addr + (uint64_t)bidx * 48u, 48u)) {
-                            bone_oob = true;
-                        } else {
-                            // Standard 3x4 row-major bone matrix (3 vec4s = 12 floats)
-                            const float *bm = palette + (size_t)bidx * 12u;
-                            if (isfinite(bm[0]) && isfinite(bm[3]) && isfinite(bm[5]) && isfinite(bm[7]) && isfinite(bm[10]) && isfinite(bm[11])) {
-                                skinned[0] += w * (bm[0] * eval_pos[0] + bm[1] * eval_pos[1] + bm[2] * eval_pos[2] + bm[3]);
-                                skinned[1] += w * (bm[4] * eval_pos[0] + bm[5] * eval_pos[1] + bm[6] * eval_pos[2] + bm[7]);
-                                skinned[2] += w * (bm[8] * eval_pos[0] + bm[9] * eval_pos[1] + bm[10] * eval_pos[2] + bm[11]);
-                                wsum += w;
-                            }
-                        }
-                    }
-                }
-                if (!bone_oob && wsum > 0.5f && wsum < 1.5f && isfinite(skinned[0]) && isfinite(skinned[1]) && isfinite(skinned[2])) {
-                    eval_pos[0] = skinned[0];
-                    eval_pos[1] = skinned[1];
-                    eval_pos[2] = skinned[2];
-                }
-            }
-
             if (has_mvp) {
                 float col_res[4], row_res[4];
                 ryza_mat4_mul_vec(d->cbuf1_sample, eval_pos, false, col_res);
@@ -7488,13 +7726,11 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
                 vs->clip_pos[2] = eval_pos[2];
                 vs->clip_pos[3] = 1.0f;
             }
-
             bool pos_finite = isfinite(vs->pos[0]) && isfinite(vs->pos[1]) && isfinite(vs->pos[2]);
             bool clip_finite = isfinite(vs->clip_pos[0]) && isfinite(vs->clip_pos[1]) && isfinite(vs->clip_pos[2]) && isfinite(vs->clip_pos[3]);
             vs->w_valid = pos_finite && clip_finite && (vs->clip_pos[3] > 0.0001f);
             bool extreme_pos = !pos_finite || fabsf(vs->pos[0]) > 50000.0f || fabsf(vs->pos[1]) > 50000.0f || fabsf(vs->pos[2]) > 50000.0f;
-            bool extreme_ndc = has_mvp && vs->w_valid && fabsf(vs->clip_pos[0] / vs->clip_pos[3]) > 250.0f;
-            vs->is_corrupted = extreme_pos || bone_oob || !clip_finite || extreme_ndc;
+            vs->is_corrupted = extreme_pos;
             if (vs->is_corrupted) d->is_deformed = true;
         }
     }
@@ -7503,11 +7739,10 @@ static void ryza_forensic_inspect_draw(Prog *pr, CmdRec *r, bool use_index, uint
     bool trigger_dump = d->is_deformed;
     ryza_capture_unlock();
 
-    // Defer file export to UI/main thread to avoid JNI/SAF stalls or crashes on the Vulkan render thread
     static bool s_auto_dumped = false;
     if (trigger_dump && !s_auto_dumped) {
         s_auto_dumped = true;
-        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP QUEUED: Mesh corruption detected on Draw %u!\n", dump_draw_idx);
+        fprintf(stderr, "[RYZA-FORENSIC] AUTO-DUMP QUEUED: Genuine vertex anomaly on Draw %u!\n", dump_draw_idx);
         ryza_request_auto_dump(dump_draw_idx);
     }
 }
