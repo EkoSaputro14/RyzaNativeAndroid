@@ -244,14 +244,19 @@ static DcEnt *dc_of(Cpu *c) {
 
 static void dispatch_fallback_nop(Cpu *c);
 
+uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset);
+
 // Diagnostik detail saat terjadi fatal error di runtime/recompilation
 static void fatal_recomp_diagnostic(Cpu *c, uint64_t pc, const char *reason) {
+    uint64_t host_fn_off = 0;
+    uint64_t guest_pc = (pc >= GUEST_LO && pc < GUEST_HI) ? pc : rt_host_fn_entry(pc, &host_fn_off);
+    uint64_t lookup_pc = guest_pc ? guest_pc : (c && c->pc >= GUEST_LO && c->pc < GUEST_HI ? c->pc : pc);
     uint64_t sym_off = 0, lr_off = 0;
-    const char *sym_name = loader_symbol_at(pc, &sym_off);
+    const char *sym_name = loader_symbol_at(lookup_pc, &sym_off);
     const char *lr_name = loader_symbol_at(c ? c->x[30] : 0, &lr_off);
     const char *mod_name = "?";
     for (int i = 0; i < g_nmodules; i++) {
-        if (pc >= g_modules[i].base && pc < g_modules[i].base + g_modules[i].size) {
+        if (lookup_pc >= g_modules[i].base && lookup_pc < g_modules[i].base + g_modules[i].size) {
             mod_name = g_modules[i].name;
             break;
         }
@@ -260,11 +265,13 @@ static void fatal_recomp_diagnostic(Cpu *c, uint64_t pc, const char *reason) {
     fprintf(stderr, "\n=======================================================\n");
     fprintf(stderr, "[RECOMP FATAL ERROR] %s\n", reason ? reason : "Unknown Execution Failure");
     fprintf(stderr, "Mode: C Recompilation (Strict - No Fallback)\n");
-    fprintf(stderr, "Guest PC    : 0x%016llx (%s: %s + 0x%llx)\n",
-            (unsigned long long)pc, mod_name, sym_name ? sym_name : "<unknown>", (unsigned long long)sym_off);
+    fprintf(stderr, "Fault PC    : 0x%016llx (guest_fn: 0x%llx + 0x%llx, %s: %s + 0x%llx)\n",
+            (unsigned long long)pc, (unsigned long long)guest_pc, (unsigned long long)host_fn_off,
+            mod_name, sym_name ? sym_name : "<unknown>", (unsigned long long)sym_off);
     if (c) {
-        fprintf(stderr, "Caller LR   : 0x%016llx (%s + 0x%llx)\n",
-                (unsigned long long)c->x[30], lr_name ? lr_name : "<unknown>", (unsigned long long)lr_off);
+        fprintf(stderr, "Cpu GuestPC : 0x%016llx | Cpu x30 (Guest LR): 0x%016llx (%s + 0x%llx)\n",
+                (unsigned long long)c->pc, (unsigned long long)c->x[30],
+                lr_name ? lr_name : "<unknown>", (unsigned long long)lr_off);
         fprintf(stderr, "Stack SP    : 0x%016llx\n", (unsigned long long)c->sp);
         fprintf(stderr, "CPU Registers:\n");
         for (int i = 0; i < 31; i += 4) {
@@ -487,20 +494,26 @@ void rt_host_fn_table_prepare(void) {
     free(old);
 }
 
-const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
-    static __thread char name[32];
+uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset) {
     uint64_t (*byhost)[2] = __atomic_load_n(&g_byhost, __ATOMIC_ACQUIRE);
     uint64_t n = __atomic_load_n(&g_byhost_n, __ATOMIC_ACQUIRE);
-    if (!byhost || !n) return NULL;
+    if (!byhost || !n) return 0;
     uint64_t lo = 0, hi = n;  // last entry with host address <= pc
     while (lo < hi) {
         uint64_t mid = (lo + hi) / 2;
         if (byhost[mid][0] <= pc) lo = mid + 1;
         else hi = mid;
     }
-    if (!lo || pc - byhost[lo - 1][0] > 0x100000) return NULL;
-    snprintf(name, sizeof name, "f_%llx", (unsigned long long)byhost[lo - 1][1]);
+    if (!lo || pc - byhost[lo - 1][0] > 0x100000) return 0;
     if (offset) *offset = pc - byhost[lo - 1][0];
+    return byhost[lo - 1][1];
+}
+
+const char *rt_host_fn_name(uint64_t pc, uint64_t *offset) {
+    static __thread char name[32];
+    uint64_t gfn = rt_host_fn_entry(pc, offset);
+    if (!gfn) return NULL;
+    snprintf(name, sizeof name, "f_%llx", (unsigned long long)gfn);
     return name;
 }
 

@@ -63,7 +63,7 @@ endif()
 
 file(READ "${R}/android/botwrecompandroid/app/build.gradle.kts" RYZA_GRADLE_CFG)
 set(RYZA_VERSION_CODE "42")
-set(RYZA_VERSION_NAME "0.3.2-forensic-p10")
+set(RYZA_VERSION_NAME "0.3.2-forensic-p11")
 if(RYZA_GRADLE_CFG MATCHES "versionCode[ \t]*=[ \t]*([0-9]+)")
     set(RYZA_VERSION_CODE "${CMAKE_MATCH_1}")
 endif()

@@ -665,7 +665,10 @@ void plat_fatal_notice(void) {
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "BOTWRecompAndroid", message, NULL);
 }
 
-const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
+const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);     // runtime/dispatch.c
+uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset);       // runtime/dispatch.c
+const char *loader_symbol_at(uint64_t addr, uint64_t *offset);  // runtime/loader.c
+extern Cpu *kernel_current_cpu(void);                           // runtime/kernel.c
 
 typedef struct { void **pcs; int n, max; } Trace;
 static _Unwind_Reason_Code trace_step(struct _Unwind_Context *ctx, void *arg) {
@@ -679,20 +682,27 @@ void plat_print_backtrace(void) {
     void *bt[64];
     Trace t = {bt, 0, 64};
     _Unwind_Backtrace(trace_step, &t);
-    Dl_info self = {0};
-    dladdr((void *)plat_print_backtrace, &self);
     for (int i = 0; i < t.n; i++) {
         uint64_t pc = (uint64_t)(uintptr_t)bt[i], off = 0;
         Dl_info di = {0};
         if (!dladdr(bt[i], &di)) di.dli_fname = NULL;
-        bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;
-        const char *s = plat_symbol(pc, &off);
-        if (!s && ours) s = rt_host_fn_name(pc, &off);
+        // Resolve recompiled guest functions (f_<guest_addr>) first across all modules
+        // (including botwgame.so, which is a separate shared object from libmain.so).
+        const char *s = rt_host_fn_name(pc, &off);
+        if (!s) s = plat_symbol(pc, &off);
+        uint64_t gfn_off = 0, gsym_off = 0;
+        uint64_t gfn = rt_host_fn_entry(pc, &gfn_off);
+        const char *gsym = gfn ? loader_symbol_at(gfn, &gsym_off) : NULL;
         const char *mod = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
         uint64_t moff = pc - (uint64_t)(uintptr_t)di.dli_fbase;
-        if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx (%s+%llx)\n", i, (unsigned long long)pc, s, (unsigned long long)off,
-                       mod, (unsigned long long)moff);
-        else fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, mod, (unsigned long long)moff);
+        if (s && gsym)
+            fprintf(stderr, "  #%-2d %016llx %s+%llx [%s+%llx] (%s+%llx)\n", i, (unsigned long long)pc,
+                    s, (unsigned long long)off, gsym, (unsigned long long)gsym_off, mod, (unsigned long long)moff);
+        else if (s)
+            fprintf(stderr, "  #%-2d %016llx %s+%llx (%s+%llx)\n", i, (unsigned long long)pc, s, (unsigned long long)off,
+                    mod, (unsigned long long)moff);
+        else
+            fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, mod, (unsigned long long)moff);
     }
 }
 
@@ -712,7 +722,7 @@ static bool null_read(ucontext_t *uc, uint64_t fa, uint64_t pc) {
     }
     if (!game) return false;
     uint32_t in = *(const uint32_t *)(uintptr_t)pc;
-    int rt = in & 31, rt2 = -1;
+    int rt = in & 31, rt2 = -1, rn = (in >> 5) & 31;
     if ((in & 0x3B000000u) == 0x39000000u) {  // (LDR* unsigned offset: opc 01, or 10 / 11 sign-extending but PRFM)
         int opc = (in >> 22) & 3, size = in >> 30;
         if (opc == 0 || (opc == 2 && size == 3)) return false;
@@ -722,20 +732,41 @@ static bool null_read(ucontext_t *uc, uint64_t fa, uint64_t pc) {
     } else if ((in & 0x3BC00000u) == 0x29400000u) {  // (LDP / LDPSW, signed offset: no write-back)
         rt2 = (in >> 10) & 31;
     } else return false;
+    uint64_t base_val = rn < 31 ? uc->uc_mcontext.regs[rn] : uc->uc_mcontext.sp;
     if (rt < 31) uc->uc_mcontext.regs[rt] = 0;
     if (rt2 >= 0 && rt2 < 31) uc->uc_mcontext.regs[rt2] = 0;
     uc->uc_mcontext.pc = pc + 4;
-    static uint64_t seen[32];
+    static uint64_t seen_pc[64], seen_fa[64];
     static int nseen;
     bool known = false;
-    for (int i = 0; i < nseen && !known; i++) known = seen[i] == pc;
-    if (!known && nseen < 32) {
-        seen[nseen++] = pc;
+    for (int i = 0; i < nseen && !known; i++) known = (seen_pc[i] == pc && seen_fa[i] == fa);
+    if (!known && nseen < 64) {
+        int idx = nseen++;
+        seen_pc[idx] = pc;
+        seen_fa[idx] = fa;
         Dl_info di = {0};
         uint64_t mo = dladdr((void *)(uintptr_t)pc, &di) ? pc - (uint64_t)(uintptr_t)di.dli_fbase : pc;
-        fprintf(stderr, "[android] the game's code read address %#llx: zero, and on (%s+%llx, lr %llx)\n",
-                (unsigned long long)fa, game && pc >= GUEST_LO && pc < GUEST_HI ? "guest" : "botwgame.so",
-                (unsigned long long)mo, (unsigned long long)uc->uc_mcontext.regs[30]);
+        uint64_t fn_off = 0, lr_fn_off = 0;
+        const char *fn = rt_host_fn_name(pc, &fn_off);
+        uint64_t hlr = uc->uc_mcontext.regs[30];
+        const char *lr_fn = rt_host_fn_name(hlr, &lr_fn_off);
+        Cpu *c = kernel_current_cpu();
+        fprintf(stderr,
+                "[android] the game's code read address %#llx (base x%d=%#llx -> dst x%d): zero, and on "
+                "(tid=%d, %s+%llx, fn=%s+%#llx, host_lr=%#llx [%s+%#llx], guest_lr=%#llx)\n",
+                (unsigned long long)fa, rn, (unsigned long long)base_val, rt, (int)gettid(),
+                game && pc >= GUEST_LO && pc < GUEST_HI ? "guest" : "botwgame.so",
+                (unsigned long long)mo, fn ? fn : "?", (unsigned long long)fn_off,
+                (unsigned long long)hlr, lr_fn ? lr_fn : "?", (unsigned long long)lr_fn_off,
+                (unsigned long long)(c ? c->x[30] : 0));
+        if (idx < 8 && c) {
+            fprintf(stderr,
+                    "[android] null_read[%d] guest regs: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x8=%#llx x19=%#llx x20=%#llx x21=%#llx\n",
+                    idx, (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+                    (unsigned long long)c->x[2], (unsigned long long)c->x[3],
+                    (unsigned long long)c->x[8], (unsigned long long)c->x[19],
+                    (unsigned long long)c->x[20], (unsigned long long)c->x[21]);
+        }
     }
     return true;
 }

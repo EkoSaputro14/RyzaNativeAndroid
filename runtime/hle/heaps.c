@@ -60,7 +60,11 @@ RT_ON_RESET(heaps_reset) {
 
 static int unit_scale(void) {
     static int s = -1;
-    if (s < 0) { const char *e = ENV("LARECOMP_UNIT_HEAP_SCALE"); s = e ? atoi(e) : 4; if (s < 1) s = 1; }
+    // Default to 1 so nn::lmem::CreateUnitHeap preserves the guest buffer c->x[0]
+    // inside [GUEST_LO, GUEST_HI) and inside sead::UnitHeap [mStart, mStart + mSize).
+    // Allocating via host posix_memalign outside the guest window breaks
+    // sead::HeapMgr::findContainHeap(ptr) -> NULL -> cascading null reads/write at 0x0.
+    if (s < 0) { const char *e = ENV("LARECOMP_UNIT_HEAP_SCALE"); s = e ? atoi(e) : 1; if (s < 1) s = 1; }
     return s;
 }
 

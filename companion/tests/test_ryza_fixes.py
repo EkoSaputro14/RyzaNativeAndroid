@@ -344,3 +344,32 @@ def _verify_p10_transition_guards():
     assert "(!vsz || (uint64_t)off + 16 <= vsz) && ryza_guest_readable(vaddr + off, 16)" in exec_c
 
 _verify_p10_transition_guards()
+
+
+def _verify_p11_crash_root_cause_fixes():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    heaps_c = (repo_root / "runtime" / "hle" / "heaps.c").read_text(encoding="utf-8")
+    movie_c = (repo_root / "runtime" / "hle" / "movie.c").read_text(encoding="utf-8")
+    dispatch_c = (repo_root / "runtime" / "dispatch.c").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+
+    # 1. Verify nn::lmem::CreateUnitHeap preserves guest buffer c->x[0] (default scale = 1)
+    assert "s = e ? atoi(e) : 1;" in heaps_c, "unit_scale() must default to 1 to preserve guest window pointers"
+    assert "s = e ? atoi(e) : 4;" not in heaps_c, "unit_scale() must not default to 4 (host posix_memalign hijack)"
+
+    # 2. Verify movie.c allocates MediaData strings & Buffer(size_t) in guest window, preserves full Cpu state on SignalEvent, and packs NV12
+    assert "movie_guest_strdup" in movie_c, "movie.c must allocate MediaData strings inside [GUEST_LO, GUEST_HI)"
+    assert "b->base = (uint64_t)(uintptr_t)hle_alloc(c->x[1] + 64);" in movie_c, "buf_ctor_alloc must allocate inside [GUEST_LO, GUEST_HI)"
+    assert "Cpu saved = *c;" in movie_c, "signal_guest_event and dec_stop must preserve full Cpu state (x8..x30, v0..v31, pc, nzcv)"
+    assert "g_movie_queried_nv12_stride" in movie_c, "movie.c must track nv12-y-stride queries and pack NV12 frames"
+
+    # 3. Verify dispatch.c & android.c resolve botwgame.so guest functions and log full null_read diagnostics
+    assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
+    assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
+    assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
+    assert "versionCode = 44" in gradle_kts and "0.3.2-forensic-p11" in gradle_kts
+    print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
+
+_verify_p11_crash_root_cause_fixes()

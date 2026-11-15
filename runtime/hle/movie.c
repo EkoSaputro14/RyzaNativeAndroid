@@ -36,8 +36,31 @@ static MediaData *md(uint64_t guest) {
     if (!*p) *p = calloc(1, sizeof(MediaData));
     return *p;
 }
+static bool g_movie_queried_nv12_stride = false;
+
+// Allocate MediaData string values inside the 39-bit Guest Window [GUEST_LO, GUEST_HI)
+// via hle_alloc so _ZNK5movie9MediaData10FindStringEPKcPS2_ never writes a TBI-tagged
+// Android Scudo host pointer (0xb400007...) into guest memory.
+static char *movie_guest_strdup(const char *v) {
+    const char *s = v ? v : "";
+    static struct { char key[64]; char *gptr; } pool[32];
+    static int npool = 0;
+    for (int i = 0; i < npool; i++) {
+        if (!strcmp(pool[i].key, s)) return pool[i].gptr;
+    }
+    size_t len = strlen(s) + 1;
+    char *dst = (char *)hle_alloc(len < 64 ? 64 : len);
+    memcpy(dst, s, len);
+    if (npool < 32 && len <= sizeof(pool[0].key)) {
+        memcpy(pool[npool].key, s, len);
+        pool[npool].gptr = dst;
+        npool++;
+    }
+    return dst;
+}
+
 static void md_clear(MediaData *m) {
-    for (int i = 0; i < m->n; i++) { free(m->e[i].key); free(m->e[i].sval); }
+    for (int i = 0; i < m->n; i++) { free(m->e[i].key); m->e[i].sval = NULL; }
     m->n = 0;
     m->codecpar = NULL;
 }
@@ -52,7 +75,7 @@ static MdEntry *md_slot(MediaData *m, const char *k) {
 static void md_set_int(MediaData *m, const char *k, int64_t v) { MdEntry *e = md_slot(m, k); if (e) { e->ival = v; e->is_str = false; } }
 static void md_set_str(MediaData *m, const char *k, const char *v) {
     MdEntry *e = md_slot(m, k);
-    if (e) { free(e->sval); e->sval = strdup(v); e->is_str = true; }
+    if (e) { e->sval = movie_guest_strdup(v); e->is_str = true; }
 }
 
 HLE_FUNC("_ZN5movie9MediaDataC1Ev", md_ctor) { *(uint64_t *)(uintptr_t)c->x[0] = (uint64_t)(uintptr_t)calloc(1, sizeof(MediaData)); }
@@ -60,7 +83,7 @@ HLE_FUNC("_ZN5movie9MediaDataC1ERKS0_", md_copy) {
     MediaData *src = md(c->x[1]), *dst = calloc(1, sizeof(MediaData));
     for (int i = 0; i < src->n; i++) {
         dst->e[i].key = strdup(src->e[i].key);
-        dst->e[i].sval = src->e[i].sval ? strdup(src->e[i].sval) : NULL;
+        dst->e[i].sval = src->e[i].sval ? movie_guest_strdup(src->e[i].sval) : NULL;
         dst->e[i].ival = src->e[i].ival;
         dst->e[i].is_str = src->e[i].is_str;
     }
@@ -77,6 +100,8 @@ HLE_FUNC("_ZN5movie9MediaData5ClearEv", md_clear_hle) { md_clear(md(c->x[0])); }
 HLE_FUNC("_ZNK5movie9MediaData9FindInt32EPKcPi", md_find_int32) {
     MediaData *m = md(c->x[0]);
     const char *k = (const char *)(uintptr_t)c->x[1];
+    if (k && (!strcmp(k, "nv12-y-stride") || !strcmp(k, "nv12-uv-offset") || !strcmp(k, "stride")))
+        g_movie_queried_nv12_stride = true;
     for (int i = 0; i < m->n; i++)
         if (!m->e[i].is_str && !strcmp(m->e[i].key, k)) { *(int32_t *)(uintptr_t)c->x[2] = (int32_t)m->e[i].ival; c->x[0] = 1; return; }
     c->x[0] = 0;
@@ -132,7 +157,7 @@ HLE_FUNC("_ZN5movie6BufferC1EPvm", buf_ctor_ext) {
 HLE_FUNC("_ZN5movie6BufferC2EPvm", buf_ctor_ext_c2) { buf_ctor_ext(c); }
 HLE_FUNC("_ZN5movie6BufferC1Em", buf_ctor_alloc) {
     MBuffer *b = calloc(1, sizeof(MBuffer));
-    b->base = (uint64_t)(uintptr_t)calloc(1, c->x[1] + 64);
+    b->base = (uint64_t)(uintptr_t)hle_alloc(c->x[1] + 64);
     b->capacity = c->x[1];
     b->size = (int32_t)c->x[1];
     *(MBuffer **)(uintptr_t)c->x[0] = b;
@@ -178,8 +203,8 @@ HLE_FUNC("_ZN5movie6Buffer12SetInt32DataEi", buf_set_i32) { BUF(c->x[0])->i32 = 
 HLE_FUNC("_ZNK5movie6Buffer12GetInt32DataEv", buf_get_i32) { c->x[0] = (uint32_t)BUF(c->x[0])->i32; }
 HLE_FUNC("_ZN5movie6Buffer12GetInt32DataEv", buf_get_i32_old) { buf_get_i32(c); }
 
-HLE_FUNC("_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", movie_set_allocator) { (void)c; }
-HLE_FUNC("_ZN5movie17SetThreadPriorityEi", movie_set_thread_priority) { (void)c; }
+HLE_FUNC("_ZN5movie12SetAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_", movie_set_allocator) { c->x[0] = 0; }
+HLE_FUNC("_ZN5movie17SetThreadPriorityEi", movie_set_thread_priority) { c->x[0] = 0; }
 HLE_FUNC("_ZN5movie17GetThreadPriorityEv", movie_get_thread_priority) { c->x[0] = 16; }
 
 // ------------------------------------------------------------------ helpers
@@ -200,11 +225,12 @@ static void *self_state(Cpu *c) { return (void *)(uintptr_t)((uint64_t *)(uintpt
 
 static void signal_guest_event(Cpu *c, uint64_t event) {
     if (!event) return;
-    uint64_t saved[8];
-    memcpy(saved, c->x, sizeof saved);
+    // Preserve full Cpu register state (including x8..x30, v0..v31, pc, sp, nzcv)
+    // so invoking guest SignalEvent inside an HLE method never clobbers caller/thunk registers.
+    Cpu saved = *c;
     c->x[0] = event;
     guest_call(c, guest_sym("_ZN2nn2os11SignalEventEPNS0_9EventTypeE"));
-    memcpy(c->x, saved, sizeof saved);
+    *c = saved;
 }
 
 static void ok(Cpu *c) { c->x[0] = 0; }
@@ -653,11 +679,10 @@ static void dec_stop(Cpu *c) {
     if (!d->stopped) {
         d->stopped = true;
         LOG("[movie] decoder %s stopped\n", d->video ? "video" : "audio");
-        uint64_t saved[8];
-        memcpy(saved, c->x, sizeof saved);
+        Cpu saved = *c;
         for (int i = 0; i < 4; i++)
             if (d->events[i]) { c->x[0] = d->events[i]; guest_call(c, clear_event); }
-        memcpy(c->x, saved, sizeof saved);
+        *c = saved;
     }
     pthread_mutex_unlock(&d->lock);
     c->x[0] = 0;
@@ -861,16 +886,17 @@ static void dec_get_output_buffer(Cpu *c) {
         // it was - colored noise for the whole movie (the Great Plateau tower's, 2026-10-25).
         uint64_t room = b->capacity - (uint64_t)(b->offset > 0 ? b->offset : 0);
         uint8_t *dst = (uint8_t *)(uintptr_t)(b->base + (uint64_t)(b->offset > 0 ? b->offset : 0));
-        int w = d->width, h = d->height;
+        int w = d->width ? d->width : 1280, h = d->height ? d->height : 720;
+        uint64_t tight_nv12 = (uint64_t)w * h * 3 / 2;
         uint32_t n;
         plat_write_prepare((uint64_t)(uintptr_t)dst, room);
-        if (room == (uint64_t)w * h * 3 / 2) {
-            // BOTW's buffer is width x height x 1.5 (3110400 bytes for its 1920x1080 movies): NV12 without padding -
-            // the luma rows, then the chroma's right after them
+        if (room >= tight_nv12 && (room == tight_nv12 || !g_movie_queried_nv12_stride)) {
+            // When the game did not query nv12-y-stride / nv12-uv-offset (or provided an exact w*h*1.5 buffer),
+            // write tightly-packed NV12 (w*h luma rows followed immediately by w*(h/2) chroma rows).
             const uint8_t *uv = d->out_mem[i] + (size_t)d->stride * ((h + 15) & ~15);
             for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, d->out_mem[i] + (size_t)y * d->stride, w);
             for (int y = 0; y < h / 2; y++) memcpy(dst + (size_t)w * h + (size_t)y * w, uv + (size_t)y * d->stride, w);
-            n = (uint32_t)room;
+            n = (uint32_t)tight_nv12;
         } else {
             n = d->out_size[i] < room ? d->out_size[i] : (uint32_t)room;
             memcpy(dst, d->out_mem[i], n);
@@ -895,14 +921,16 @@ static void dec_get_output_buffer(Cpu *c) {
 
 static void dec_release_output(Cpu *c) {
     Decoder *d = self_state(c);
+    int i = (int)c->x[1];
     n_rel_out++;
     MILESTONE(d, MS_REL_OUT, "first output released\n", d->video ? "video" : "audio");
-    dec_signal(c, d, 0);  // input may be accepted again
-    int i = (int)c->x[1];
+    // Mark output slot free and flush pending frames BEFORE signaling input event
+    // so a woken input thread does not observe stale out_busy[i] == true.
     pthread_mutex_lock(&d->lock);
     if (i >= 0 && i < NOUT) d->out_busy[i] = false;
     bool produced = flush_pending(d);
     pthread_mutex_unlock(&d->lock);
+    dec_signal(c, d, 0);  // input may be accepted again
     if (produced) dec_signal(c, d, 1);
     c->x[0] = 0;
 }
@@ -938,6 +966,7 @@ RT_ON_RESET(movie_reset) {
     g_ex_vt = g_dec_vt = 0;
     g_movie_playing = 0;
     g_nbuf_pool = 0;  // (the HLE heap starts over)
+    g_movie_queried_nv12_stride = false;
     g_skip_held = false, g_skip_pressed_at = 0;
 }
 
