@@ -528,12 +528,14 @@ HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS
     pthread_mutex_lock(&g_klock);
     kernel_signal(ev);
     pthread_mutex_unlock(&g_klock);
+    Cpu saved = *c;
     uint64_t clear_mode = c->x[2];
     c->x[0] = c->x[1];
     c->x[1] = r;
     c->x[2] = 0;
     c->x[3] = clear_mode;
     guest_call(c, guest_sym("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE"));
+    *c = saved;
     LOG("[input] style set update event bound\n");
 }
 

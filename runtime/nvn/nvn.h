@@ -20,9 +20,12 @@ static inline void *host_from_guest(uint64_t guest) {
 #define SET_HOST(guest, p) do {     uint64_t _g = (uint64_t)(uintptr_t)(guest);     if (_g >= GUEST_LO && _g < GUEST_HI) *(uint64_t *)(uintptr_t)_g = (uint64_t)(uintptr_t)(p); } while (0)
 #define G(T, base, off) (*(T *)((uint8_t *)(uintptr_t)(base) + (off)))
 
+#define NVN_POOL_MAGIC 0x504F4F4Cu
 typedef struct NvnPool {
     uint64_t storage, size;
     uint32_t flags;
+    uint32_t magic;
+    uint64_t guest;
 } NvnPool;
 
 typedef struct NvnTexture {

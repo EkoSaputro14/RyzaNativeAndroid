@@ -167,13 +167,19 @@ const char *loader_symbol_at(uint64_t addr, uint64_t *offset) {
         for (uint64_t i = 1; i < m->nsyms; i++) {
             Elf64Sym *s = sym(m, i);
             uint64_t a = m->base + s->value;
-            if (s->shndx && (s->info & 0xF) == 2 && a <= addr && a > best_addr) {
-                best = symname(m, s);
-                best_addr = a;
+            if (!s->shndx || (s->info & 0xF) != 2 || a > addr || a <= best_addr) continue;
+            // Respect ELF STT_FUNC bounds so stripped internal functions are not misattributed
+            // to an unrelated distant exported symbol (e.g. C++ templates like std::uniform_int_distribution).
+            if (s->size > 0) {
+                if (addr >= a + s->size) continue;
+            } else if (addr - a >= 0x4000ull) {
+                continue;
             }
+            best = symname(m, s);
+            best_addr = a;
         }
     }
-    if (offset) *offset = addr - best_addr;
+    if (offset) *offset = best ? (addr - best_addr) : 0;
     return best;
 }
 

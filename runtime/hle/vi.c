@@ -69,7 +69,7 @@ HLE_FUNC("_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE", vi_set
 
 HLE_FUNC("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_get_native_window) {
     if (!g_native_window) g_native_window = (uint64_t)hle_alloc(0x100);
-    *(uint64_t *)(uintptr_t)c->x[0] = g_native_window;
+    if (c->x[0] >= 0x10000ull) *(uint64_t *)(uintptr_t)c->x[0] = g_native_window;
     c->x[0] = 0;
 }
 
@@ -86,10 +86,12 @@ HLE_FUNC("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7Display
         vsync_r = kernel_new_handle(vsync_event);
     }
     // nn::os::AttachReadableHandleToSystemEvent(event, handle, managed=false, clear_mode=AutoClear)
+    Cpu saved = *c;
     c->x[1] = vsync_r;
     c->x[2] = 0;
     c->x[3] = 1;
     guest_call(c, guest_sym("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE"));
+    *c = saved;
     c->x[0] = 0;
 }
 

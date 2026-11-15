@@ -246,19 +246,30 @@ static void dispatch_fallback_nop(Cpu *c);
 
 uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset);
 
+const char *rt_hle_slot_name(uint64_t addr) {
+    if (addr < HLE_BASE || addr >= HLE_BASE + HLE_SIZE) return NULL;
+    uint64_t idx = (addr - HLE_BASE) / 16;
+    if (idx >= (uint64_t)hle_count) return NULL;
+    return hle_slots[idx].name;
+}
+
 // Diagnostik detail saat terjadi fatal error di runtime/recompilation
 static void fatal_recomp_diagnostic(Cpu *c, uint64_t pc, const char *reason) {
     uint64_t host_fn_off = 0;
     uint64_t guest_pc = (pc >= GUEST_LO && pc < GUEST_HI) ? pc : rt_host_fn_entry(pc, &host_fn_off);
     uint64_t lookup_pc = guest_pc ? guest_pc : (c && c->pc >= GUEST_LO && c->pc < GUEST_HI ? c->pc : pc);
     uint64_t sym_off = 0, lr_off = 0;
-    const char *sym_name = loader_symbol_at(lookup_pc, &sym_off);
-    const char *lr_name = loader_symbol_at(c ? c->x[30] : 0, &lr_off);
-    const char *mod_name = "?";
-    for (int i = 0; i < g_nmodules; i++) {
-        if (lookup_pc >= g_modules[i].base && lookup_pc < g_modules[i].base + g_modules[i].size) {
-            mod_name = g_modules[i].name;
-            break;
+    const char *hle_name = rt_hle_slot_name(lookup_pc);
+    const char *sym_name = hle_name ? hle_name : loader_symbol_at(lookup_pc, &sym_off);
+    const char *lr_hle = c ? rt_hle_slot_name(c->x[30]) : NULL;
+    const char *lr_name = lr_hle ? lr_hle : loader_symbol_at(c ? c->x[30] : 0, &lr_off);
+    const char *mod_name = hle_name ? "HLE" : "?";
+    if (!hle_name) {
+        for (int i = 0; i < g_nmodules; i++) {
+            if (lookup_pc >= g_modules[i].base && lookup_pc < g_modules[i].base + g_modules[i].size) {
+                mod_name = g_modules[i].name;
+                break;
+            }
         }
     }
 
@@ -269,8 +280,11 @@ static void fatal_recomp_diagnostic(Cpu *c, uint64_t pc, const char *reason) {
             (unsigned long long)pc, (unsigned long long)guest_pc, (unsigned long long)host_fn_off,
             mod_name, sym_name ? sym_name : "<unknown>", (unsigned long long)sym_off);
     if (c) {
-        fprintf(stderr, "Cpu GuestPC : 0x%016llx | Cpu x30 (Guest LR): 0x%016llx (%s + 0x%llx)\n",
-                (unsigned long long)c->pc, (unsigned long long)c->x[30],
+        const char *cpu_hle = rt_hle_slot_name(c->pc);
+        fprintf(stderr, "Cpu GuestPC : 0x%016llx%s%s | Cpu x30 (Guest LR): 0x%016llx (%s + 0x%llx)\n",
+                (unsigned long long)c->pc,
+                cpu_hle ? " HLE:" : "", cpu_hle ? cpu_hle : "",
+                (unsigned long long)c->x[30],
                 lr_name ? lr_name : "<unknown>", (unsigned long long)lr_off);
         fprintf(stderr, "Stack SP    : 0x%016llx\n", (unsigned long long)c->sp);
         fprintf(stderr, "CPU Registers:\n");
@@ -303,9 +317,9 @@ static GuestFn dispatch_slow(Cpu *c) {
     if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
         g_forensic_hle_calls++;
         rt_unwind_point();  // (HLE calls aren't cached below, so every one passes here: a reboot's safe point)
-        int i = (int)((pc - HLE_BASE) / 16);
-        if (i < hle_count) {
-            if (hle_slots[i].fn) return hle_slots[i].fn;
+        uint64_t idx = (pc - HLE_BASE) / 16;
+        if (idx < (uint64_t)hle_count) {
+            if (hle_slots[idx].fn) return hle_slots[idx].fn;
             unimpl_pc = pc;
             return hle_unimplemented;
         }
@@ -765,7 +779,10 @@ void rt_fault_report(const char *what, uint64_t fa, uint64_t pc, uint64_t lr) {
 #endif
     uint64_t po = 0, lo = 0;
     const char *ps = host_sym(pc, &po), *ls = host_sym(lr, &lo);
-    if (pc >= GUEST_LO && pc < GUEST_HI) {  // (the game's own code, LARECOMP_NATIVE: named by the modules' symbols)
+    if (pc >= HLE_BASE && pc < HLE_BASE + HLE_SIZE) {
+        const char *hs = rt_hle_slot_name(pc);
+        if (hs) { ps = hs; po = 0; }
+    } else if (pc >= GUEST_LO && pc < GUEST_HI) {  // (the game's own code, LARECOMP_NATIVE: named by the modules' symbols)
         ps = loader_symbol_at(pc, &po);
         if (lr >= GUEST_LO && lr < GUEST_HI) ls = loader_symbol_at(lr, &lo);
         fprintf(stderr, "\n*** %s accessing %#llx in the game's code\n    guest pc %llx (main+%llx, %s+%llx)\n",

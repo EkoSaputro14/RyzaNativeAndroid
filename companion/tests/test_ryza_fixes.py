@@ -369,7 +369,52 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 44" in gradle_kts and "0.3.2-forensic-p11" in gradle_kts
+    assert "versionCode = 45" in gradle_kts and "0.3.2-forensic-p13" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
+
+def _verify_p13_safe_patch():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    loader_c = (repo_root / "runtime" / "loader.c").read_text(encoding="utf-8")
+    rt_h = (repo_root / "runtime" / "rt.h").read_text(encoding="utf-8")
+    dispatch_c = (repo_root / "runtime" / "dispatch.c").read_text(encoding="utf-8")
+    nvn_h = (repo_root / "runtime" / "nvn" / "nvn.h").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    cmdbuf_c = (repo_root / "runtime" / "nvn" / "cmdbuf.c").read_text(encoding="utf-8")
+    movie_c = (repo_root / "runtime" / "hle" / "movie.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    vi_c = (repo_root / "runtime" / "hle" / "vi.c").read_text(encoding="utf-8")
+    input_c = (repo_root / "runtime" / "hle" / "input.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+
+    # 1. Version sync (p13 / vc 45)
+    assert "versionCode = 45" in gradle_kts and "0.3.2-forensic-p13" in gradle_kts
+
+    # 2. Symbol lookup & HLE slot attribution
+    assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
+    assert "const char *rt_hle_slot_name(uint64_t addr);" in rt_h
+    assert "rt_hle_slot_name(" in dispatch_c, "dispatch diagnostics must attribute HLE slot names"
+
+    # 3. Safe nvnTextureGetMemoryPool via live pool registry (no NvnTexture->pool_guest)
+    assert "NVN_POOL_MAGIC" in nvn_h
+    assert "pool_guest;" not in nvn_h, "NvnTexture must not store raw shared pool_guest pointer"
+    assert "pool_is_live(" in objects_c and "g_live_pools" in objects_c
+    assert "nvn_guest_ok" not in objects_c, "Over-strict p12 nvn_guest_ok guard must not be reintroduced"
+
+    # 4. cmdbuf.c copy_list must accept Android Scudo host pointers (< 0x6000000000ull)
+    copy_list_body = cmdbuf_c.split("static void copy_list(", 1)[1].split("NVN(nvnCommandBufferCallCommands)", 1)[0]
+    assert "plausible(" not in copy_list_body, "copy_list must never use guest plausible() filter on host malloc pointers"
+    assert "0x6000000000" not in copy_list_body, "copy_list must not reject Scudo addresses below 0x6000000000"
+    assert "size < sizeof(CmdRec)" in cmdbuf_c
+    assert "n <= 0" in cmdbuf_c
+
+    # 5. Movie codecpar deep-copy & NULL guards + texture upload NULL guard + HLE guest_call Cpu save/restore
+    assert "avcodec_parameters_copy" in movie_c
+    assert "movie_ptr_ok(" in movie_c
+    assert "if (!t || !rgba || !w || !h || !stride) return;" in textures_c
+    assert "Cpu saved = *c;" in vi_c and "Cpu saved = *c;" in input_c
+    print("  -> PASS: p13 symbol bounds, HLE slot attribution, live-pool nvnTextureGetMemoryPool, Scudo-safe cmdbuf, movie/texture/HLE guards verified.")
+
+_verify_p13_safe_patch()
