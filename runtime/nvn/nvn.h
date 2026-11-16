@@ -72,7 +72,8 @@ typedef struct {
 typedef struct NvnDescPool {
     uint64_t addr;
     int count;
-    void *entries;  // NvnTexEntry[] or NvnSamplerDesc[]
+    void *entries;     // NvnTexEntry[] or NvnSamplerDesc[] (render-thread owned when async)
+    void *shadow_smp;  // NvnSamplerDesc[] guest-side dedup shadow for sampler pools
     struct NvnDescPool *next;  // all descriptor allocations of this boot
 } NvnDescPool;
 

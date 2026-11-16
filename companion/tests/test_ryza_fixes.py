@@ -725,3 +725,62 @@ def _verify_p13_sd855_sched_and_mem_opts():
 
 
 _verify_p13_sd855_sched_and_mem_opts()
+
+
+def _verify_p13_frame_stall_elimination_sprint():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    stall_h = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.h").read_text(encoding="utf-8")
+    stall_c = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.c").read_text(encoding="utf-8")
+    tegra_c = (repo_root / "runtime" / "nvn" / "tegra.c").read_text(encoding="utf-8")
+    nvn_h = (repo_root / "runtime" / "nvn" / "nvn.h").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+
+    # 1. Phase 2 Stall Instrumentation (>50/100/250/500 ms thresholds, causal linkage, lock/wait ring)
+    assert "STALL_THRESH_WARN_NS" in stall_h and "50000000ull" in stall_h
+    assert "STALL_THRESH_SEVERE_NS" in stall_h and "100000000ull" in stall_h
+    assert "STALL_THRESH_CRIT_NS" in stall_h and "250000000ull" in stall_h
+    assert "STALL_THRESH_EXTREME_NS" in stall_h and "500000000ull" in stall_h
+    assert "[stall] severity=%s frame=%llu" in stall_c
+    assert "[stall-diag] frame=%llu sev=%s link:" in stall_c
+    assert "stall_on_frame_end(&sm);" in exec_c
+    assert "stall_format_summary(" in exec_c
+    assert "stall_note_acquire(nd);" in device_c
+    assert "stall_note_tex_upload(" in textures_c
+    assert "klock_acquire()" in kernel_c and "wait_owner_id" in kernel_c
+
+    # 2. Phase 3 Fix A: Async FIFO descriptor & texture retirement (no synchronous vk_async_drain on guest thread)
+    assert "REQ_TEX_REG" in async_c and "REQ_SMP_REG" in async_c
+    assert "REQ_TEX_POOL_FIN" in async_c and "REQ_TEX_DESTROY" in async_c
+    assert "vk_async_tex_reg(d, id, t, &view, has_view);" in objects_c
+    assert "vk_async_smp_reg(d, id, &v);" in objects_c
+    assert "vk_async_tex_pool_fin(d);" in objects_c
+    assert "vk_async_tex_destroy(dead_t);" in objects_c
+    assert "void *shadow_smp;" in nvn_h
+    assert "snap_pool_acquire(" in async_c and "snap_pool_release(" in async_c
+    assert "vk_async_take_coalesce_ns" in async_c and "vk_async_take_coalesce_ns()" in exec_c
+
+    # 3. Phase 3 Fix B: Write-tracking VMA reopen state-3 preservation & 4-page chunk unprotect
+    assert "wt_state[i] = 3;" in android_c
+    assert "if (wt_state[q] != 3)" in android_c
+    assert "uint64_t base_k = p & ~3ull;" in android_c
+
+    # 4. Phase 3 Fix C: Tegra block-linear 64B GOB row fast path & unified 4MB re-upload budget
+    assert "full_gobs" in tegra_c and "g + 256" in tegra_c and "g + 288" in tegra_c
+    assert "dyn_deswizzle_ops_frame" in textures_c and "b->wgen = prev_wgen;" in textures_c
+    assert "SamplerCacheEnt smp_cache[256];" in textures_c
+    assert "if (ndead >= 64) vk_collect_dead();" in textures_c
+
+    # 5. Phase 3 Fix D: Watchdog thread opt-in via LARECOMP_WATCHDOG
+    assert "const char *e = getenv(\"LARECOMP_WATCHDOG\");" in kernel_c
+
+    print("  -> PASS: p13 Frame Stall Elimination Sprint (Phase 2 instrumentation + Phase 3 async FIFO, wt state-3, GOB fast path & 4MB budget) verified.")
+
+
+_verify_p13_frame_stall_elimination_sprint()

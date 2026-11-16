@@ -6,6 +6,10 @@
 
 #include "hle.h"
 #include "kernel.h"
+#ifdef __ANDROID__
+#include "nvn/vulkan/stall_trace.h"
+extern uint64_t renderer_present_count(void);
+#endif
 
 // ------------------------------------------------------------------ results
 #undef R_OK
@@ -27,6 +31,19 @@
 
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
 static __thread KThread *t_cur;
+
+static inline void klock_acquire(void) {
+    if (pthread_mutex_trylock(&g_klock) == 0) return;
+#ifdef __ANDROID__
+    uint64_t t0 = plat_now_ns();
+    pthread_mutex_lock(&g_klock);
+    uint64_t dt = plat_now_ns() - t0;
+    if (dt >= 1000000ull)
+        stall_record_lock_wait("kernel", "g_klock", dt);
+#else
+    pthread_mutex_lock(&g_klock);
+#endif
+}
 
 // ------------------------------------------------------------------ handle table
 #define MAX_HANDLES 4096
@@ -399,6 +416,8 @@ static void *thread_main(void *arg) {
     t_cur = t;
 #ifdef __ANDROID__
     plat_thread_pin_fast();  // pin main (t80) & guest worker threads together onto Big/Prime cores
+    stall_set_thread_name(t->id == 0x50 ? "guest-main" : "guest-worker", t->id);
+    stall_note_active_work(t->id == 0x50 ? "guest_main_exec" : "guest_worker_exec");
 #endif
     crash_handler_install();
     rt_set_fpcr(0);
@@ -566,6 +585,16 @@ static void waitlist_remove(KThread *t) {
 // Block until wait_kind is cleared by a waker, timeout, or cancel. Caller holds g_klock.
 static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
+#ifdef __ANDROID__
+    int wait_kind_initial = t ? t->wait_kind : WAIT_NONE;
+    uint64_t wait_owner_id = 0;
+    if (t && wait_kind_initial == WAIT_MUTEX && t->wait_addr) {
+        uint32_t mw = __atomic_load_n(u32p(t->wait_addr), __ATOMIC_RELAXED) & ~WAITERS_BIT;
+        KObject *mo = handle_get(mw);
+        if (mo && mo->type == KOBJ_THREAD) wait_owner_id = ((KThread *)mo)->id;
+    }
+    uint64_t wait_t0 = plat_now_ns();
+#endif
     struct timespec ts;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
@@ -617,11 +646,33 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
+#ifdef __ANDROID__
+    uint64_t wait_t1 = plat_now_ns();
+    uint64_t wait_dt = wait_t1 - wait_t0;
+    if (t && wait_dt >= 5000000ull && (t->id == 0x50 || wait_kind_initial == WAIT_MUTEX)) {
+        const char *reason = wait_kind_initial == WAIT_MUTEX ? "WAIT_MUTEX"
+                           : wait_kind_initial == WAIT_CONDVAR ? "WAIT_CONDVAR"
+                           : wait_kind_initial == WAIT_ARBITER ? "WAIT_ARBITER" : "WAIT_KERNEL";
+        char waited_on[32];
+        if (wait_owner_id)
+            snprintf(waited_on, sizeof waited_on, "guest:t%llu", (unsigned long long)wait_owner_id);
+        else
+            snprintf(waited_on, sizeof waited_on, "addr:%#llx", (unsigned long long)(t->wait_addr));
+        if (wait_kind_initial == WAIT_MUTEX) {
+            stall_record_lock_wait("kernel", reason, wait_dt);
+            stall_record_wait_event(renderer_present_count(), wait_t0, wait_t1, "kernel", reason,
+                                    (int)wait_owner_id, waited_on, NULL);
+        } else {
+            stall_record_wait_event(renderer_present_count(), wait_t0, wait_t1, "kernel", reason,
+                                    (int)wait_owner_id, waited_on, NULL);
+        }
+    }
+#endif
     return t->wait_result;
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (v != (owner | WAITERS_BIT)) {
         pthread_mutex_unlock(&g_klock);
@@ -637,14 +688,14 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 }
 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     mutex_release(addr);
     pthread_mutex_unlock(&g_klock);
     return R_OK;
 }
 
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     KThread *t = t_cur;
 #ifdef __ANDROID__
     // the key says "waiters" before the mutex goes: once it's released, a thread that takes it, changes the state
@@ -674,7 +725,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
 }
 
 static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     int woken = 0;
     bool any_left = false;
     for (;;) {
@@ -706,7 +757,7 @@ enum { ARB_WAIT_LESS = 0, ARB_DEC_WAIT_LESS = 1, ARB_WAIT_EQ = 2 };
 enum { ARB_SIGNAL = 0, ARB_SIGNAL_INC_EQ = 1, ARB_SIGNAL_MOD_EQ = 2 };
 
 static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value, int64_t timeout) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     bool wait;
     if (type == ARB_WAIT_LESS) wait = cur < value;
@@ -745,7 +796,7 @@ static int arbiter_wake(uint64_t addr, int32_t count) {
 }
 
 static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t value, int32_t count) {
-    pthread_mutex_lock(&g_klock);
+    klock_acquire();
     uint32_t r = R_OK;
     int32_t cur = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     if (type == ARB_SIGNAL) {
@@ -786,7 +837,10 @@ static uint32_t svc_signal_to_address(uint64_t addr, uint32_t type, int32_t valu
 // ------------------------------------------------------------------ wait synchronization
 
 static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, int64_t timeout, int32_t *index) {
-    pthread_mutex_lock(&g_klock);
+#ifdef __ANDROID__
+    uint64_t sync_t0 = plat_now_ns();
+#endif
+    klock_acquire();
     struct timespec ts;
     if (timeout > 0) deadline(&ts, timeout);
     KThread *t = t_cur;
@@ -823,6 +877,18 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
     }
 out:
     pthread_mutex_unlock(&g_klock);
+#ifdef __ANDROID__
+    uint64_t sync_t1 = plat_now_ns();
+    if (t && t->id == 0x50 && sync_t1 - sync_t0 >= 5000000ull) {
+        extern uint32_t vi_vsync_handle(void);
+        bool is_vsync = false;
+        for (int i = 0; i < count && i < 8; i++)
+            if (hs[i] && hs[i] == vi_vsync_handle()) { is_vsync = true; break; }
+        stall_record_wait_event(renderer_present_count(), sync_t0, sync_t1, "kernel",
+                                is_vsync ? "WAIT_SYNC_VSYNC" : "WAIT_SYNC", 0,
+                                is_vsync ? "vi_vsync" : "kobject", NULL);
+    }
+#endif
     return r;
 }
 
@@ -852,6 +918,7 @@ static void *watchdog_main(void *arg) {
     for (;;) {
         sleep((unsigned)every);
         uint64_t now = plat_now_ns();
+        pthread_mutex_lock(&g_klock);
         LOG("[watchdog] threads:\n");
         for (KThread *t = g_threads; t; t = t->anext) {
             if (t->finished) continue;
@@ -866,6 +933,7 @@ static void *watchdog_main(void *arg) {
                 LOG("[watchdog]  t%llu prio %d: running%s, pc %llx lr %llx\n", (unsigned long long)t->id, t->prio,
                     n ? " (short svc)" : "", (unsigned long long)t->cpu.pc, (unsigned long long)t->cpu.x[30]);
         }
+        pthread_mutex_unlock(&g_klock);
     }
     return NULL;
 }
@@ -874,8 +942,11 @@ static void watchdog_start(void) {
     static int started;
     if (started) return;
     started = 1;
+    const char *e = getenv("LARECOMP_WATCHDOG");
+    int every = e ? atoi(e) : 0;
+    if (every <= 0) return;
     pthread_t th;
-    pthread_create(&th, NULL, watchdog_main, (void *)(uintptr_t)5);
+    pthread_create(&th, NULL, watchdog_main, (void *)(uintptr_t)every);
     pthread_detach(th);
 }
 

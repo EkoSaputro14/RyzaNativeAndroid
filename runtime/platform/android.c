@@ -375,7 +375,13 @@ static uint8_t *wt_state;  // per 4 KB page: 0 not tracked (counts as written), 
                            // (all three: tentative definitions, declared above plat_reset_guest)
 static atomic_flag wt_spin = ATOMIC_FLAG_INIT;  // (taken in the signal handler too: no mutex)
 static bool wt_broken;  // (an mprotect failed - out of memory mappings: no new pages tracked)
-static void wt_lock(void) { while (atomic_flag_test_and_set_explicit(&wt_spin, memory_order_acquire)) {} }
+static void wt_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&wt_spin, memory_order_acquire)) {
+#if defined(__aarch64__) || defined(__arm__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
+}
 static void wt_unlock(void) { atomic_flag_clear_explicit(&wt_spin, memory_order_release); }
 
 void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
@@ -405,7 +411,12 @@ static int wt_odd_repeats;
 static volatile int wt_reopened;  // (times it happened: plat_written_pages logs it)
 static bool wt_reopen_all(void) {
     if (mprotect((void *)(uintptr_t)wt_lo, wt_hi - wt_lo, PROT_READ | PROT_WRITE)) return false;
-    memset(wt_state, 0, (size_t)((wt_hi - wt_lo) >> 12));
+    // Preserve state 2 (written since last query) and convert state 1 (read-only) -> 3 (clean, needs re-arm).
+    // Resetting all pages to 0 previously made every texture and vertex buffer appear modified at once (~858 uploads).
+    size_t np = (size_t)((wt_hi - wt_lo) >> 12);
+    for (size_t i = 0; i < np; i++) {
+        if (wt_state[i] == 1) wt_state[i] = 3;
+    }
     wt_reopened++;
     return true;
 }
@@ -422,9 +433,11 @@ static bool wt_fault(uint64_t a) {
     // (2: another thread's fault on it got there first - writable already. The next page too: a store across the
     // boundary may report its first byte, in the page before the protected one)
     // (the next page only while still read-only: a real fault on this one must not retry forever)
-    for (uint64_t k = p; k < p + 2 && k < np; k++) {
+    // Unprotect in 4-page (16 KB) aligned chunks to cut VMA fragmentation 4x and amortize SIGSEGV faults.
+    uint64_t base_k = p & ~3ull;
+    for (uint64_t k = base_k; k < base_k + 4 && k < np; k++) {
         if (k != p && wt_state[k] != 1) continue;
-        if (k == p && wt_state[k] == 0) {  // (untracked: writable unless mprotect can't make it so - a real fault)
+        if (k == p && (wt_state[k] == 0 || wt_state[k] == 3)) {  // (untracked/reopened: writable unless mprotect fails)
             if (mprotect((void *)(uintptr_t)(wt_lo + (k << 12)), 4096, PROT_READ | PROT_WRITE)) {
                 if (errno == ENOMEM && wt_reopen_all()) ours = true;  // (out of mappings, above)
                 break;
@@ -535,15 +548,20 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         if (wt_state[p] == 1) { p++; continue; }
         uint64_t q = p;
         for (; q < p1 && wt_state[q] != 1; q++) {
-            if (n < max) pages[n] = wt_lo + (q << 12);
-            n++;
+            if (wt_state[q] != 3) {  // state 3: clean page reopened by wt_reopen_all (re-arm without marking dirty)
+                if (n < max) pages[n] = wt_lo + (q << 12);
+                n++;
+            }
         }
         if (!wt_broken) {
             // (state first, then the protection: a write in between lands before the caller copies the page)
             for (uint64_t k = p; k < q; k++) wt_state[k] = 1;
             if (mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ)) {
-                if (errno == ENOMEM && wt_reopen_all()) { wt_unlock(); return -1; }  // (out of mappings: start over - all
-                                                                                    // counts as written, wt_reopen_all)
+                if (errno == ENOMEM && wt_reopen_all()) {
+                    // Range stays writable with state 3/2 intact; return dirty count collected so far without -1 storm
+                    wt_unlock();
+                    return n > max ? max : n;
+                }
                 for (uint64_t k = p; k < q; k++) wt_state[k] = 0;
                 mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ | PROT_WRITE);
                 wt_broken = true;

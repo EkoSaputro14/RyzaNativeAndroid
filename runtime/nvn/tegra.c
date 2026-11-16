@@ -123,16 +123,49 @@ static void copy_surface(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t
     uint32_t width_gobs = (row_bytes + 63) / 64;
     uint32_t gob_rows = 8u << bh_log2;
     uint64_t blocks_rows = (hb + gob_rows - 1) / gob_rows;
+    uint64_t block_size = 512ull << (bh_log2 + bd_log2);
+    uint32_t bh_mask = (1u << bh_log2) - 1;
+    uint32_t bd_mask = (1u << bd_log2) - 1;
+    uint32_t full_gobs = row_bytes >> 6;
+    static const uint32_t sec_off[4] = {0, 32, 256, 288};
     for (uint32_t z = 0; z < d; z++) {
+        uint32_t block_z = z >> bd_log2, z_in_block = z & bd_mask;
+        uint64_t z_base = (uint64_t)block_z * blocks_rows * width_gobs * block_size +
+                          ((uint64_t)z_in_block << bh_log2) * 512;
         for (uint32_t y = 0; y < hb; y++) {
-            uint8_t *lin = dst + ((uint64_t)z * hb + y) * row_bytes;
-            const uint8_t *lin_src = src + ((uint64_t)z * hb + y) * row_bytes;
-            // 16-byte runs are contiguous in both layouts
-            for (uint32_t x = 0; x < row_bytes; x += 16) {
-                uint32_t n = row_bytes - x < 16 ? row_bytes - x : 16;
-                uint64_t o = gob_offset(x, y, z, width_gobs, bh_log2, bd_log2, blocks_rows);
-                if (to_linear) memcpy(lin + x, src + o, n);
-                else memcpy(dst + o, lin_src + x, n);
+            uint32_t gob_y = y >> 3, block_y = gob_y >> bh_log2, gob_in_block_y = gob_y & bh_mask;
+            uint32_t yi = y & 7;
+            uint64_t row_base = z_base + (uint64_t)block_y * width_gobs * block_size +
+                                (uint64_t)gob_in_block_y * 512 + (((yi >> 1) << 6) | ((yi & 1) << 4));
+            uint64_t lin_off = ((uint64_t)z * hb + y) * row_bytes;
+            if (to_linear) {
+                uint8_t *lin = dst + lin_off;
+                const uint8_t *g = src + row_base;
+                for (uint32_t gx = 0; gx < full_gobs; gx++, lin += 64, g += block_size) {
+                    memcpy(lin + 0,  g + 0,   16);
+                    memcpy(lin + 16, g + 32,  16);
+                    memcpy(lin + 32, g + 256, 16);
+                    memcpy(lin + 48, g + 288, 16);
+                }
+                uint32_t tail = row_bytes & 63;
+                for (uint32_t si = 0, tx = 0; tx < tail; tx += 16, si++) {
+                    uint32_t n = tail - tx < 16 ? tail - tx : 16;
+                    memcpy(lin + tx, g + sec_off[si], n);
+                }
+            } else {
+                const uint8_t *lin_src = src + lin_off;
+                uint8_t *g = dst + row_base;
+                for (uint32_t gx = 0; gx < full_gobs; gx++, lin_src += 64, g += block_size) {
+                    memcpy(g + 0,   lin_src + 0,  16);
+                    memcpy(g + 32,  lin_src + 16, 16);
+                    memcpy(g + 256, lin_src + 32, 16);
+                    memcpy(g + 288, lin_src + 48, 16);
+                }
+                uint32_t tail = row_bytes & 63;
+                for (uint32_t si = 0, tx = 0; tx < tail; tx += 16, si++) {
+                    uint32_t n = tail - tx < 16 ? tail - tx : 16;
+                    memcpy(g + sec_off[si], lin_src + tx, n);
+                }
             }
         }
     }

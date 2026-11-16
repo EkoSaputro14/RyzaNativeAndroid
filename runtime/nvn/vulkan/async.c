@@ -8,9 +8,8 @@
 // its command list is), and a wait first waits for the render thread to reach it, then for the GPU as before.
 //
 // Requests: EXEC (a command list), PRESENT (the window's half of backend_present: the game's half - pacing, input,
-// tests - stays on the game's thread), FENCE (nvnQueueFenceSync). Everything else that reaches into the renderer from
-// the game's thread (a texture destroyed, a movie frame, the heap, a reset) first waits for the queue to empty
-// (vk_async_drain): those are rare, and so they run as before, with the render thread idle.
+// tests - stays on the game's thread), FENCE (nvnQueueFenceSync), TEX_REG / SMP_REG / TEX_POOL_FIN / TEX_DESTROY
+// (FIFO-ordered descriptor and texture retirement updates without synchronous guest-thread queue drains).
 #ifdef __ANDROID__
 #include <pthread.h>
 #include <stdbool.h>
@@ -22,9 +21,33 @@
 #include "../nvn.h"
 #include "../../platform.h"
 #include "../../rt.h"
+#include "stall_trace.h"
 
-enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE, REQ_FLUSH };
+enum {
+    REQ_EXEC,
+    REQ_PRESENT,
+    REQ_FENCE,
+    REQ_FLUSH,
+    REQ_TEX_REG,
+    REQ_SMP_REG,
+    REQ_TEX_POOL_FIN,
+    REQ_TEX_DESTROY
+};
 typedef struct { int type; uint64_t a; void *p; uint64_t id; } Req;
+
+typedef struct {
+    NvnDescPool *pool;
+    int id;
+    bool has_view;
+    NvnTexture *tex;
+    NvnTextureView view;
+} AsyncTexReg;
+
+typedef struct {
+    NvnDescPool *pool;
+    int id;
+    NvnSamplerDesc desc;
+} AsyncSmpReg;
 
 #define QN 4096  // requests in flight (a frame has a few dozen)
 static Req q[QN];
@@ -36,6 +59,7 @@ static pthread_cond_t q_more = PTHREAD_COND_INITIALIZER, q_less = PTHREAD_COND_I
 static pthread_mutex_t p_lock = PTHREAD_MUTEX_INITIALIZER;  // producers: an id, its list's fences and its push together
 pthread_t g_vk_render_thread;  // (also read by device.c renderer_present_count, many times a draw)
 bool g_vk_render_started;
+static int g_vk_render_tid;
 static int on = -1;
 
 // The game's thread may run this many frames ahead of the render thread (the translation of one frame overlaps the
@@ -44,10 +68,12 @@ static int ahead = 1;
 
 // The render thread's work for its last frame (requests run between two presents, ns): the frame pacer's other half
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;
-static uint64_t frame_idle_ns;
+static uint64_t frame_idle_ns, frame_coalesce_ns;
 uint64_t vk_async_frame_work_ns(void) { return __atomic_load_n(&last_frame_work, __ATOMIC_RELAXED); }
 uint64_t vk_async_frame_cpu_ns(void) { return __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED); }
 uint64_t vk_async_take_idle_ns(void) { return __atomic_exchange_n(&frame_idle_ns, 0, __ATOMIC_RELAXED); }
+uint64_t vk_async_take_coalesce_ns(void) { return __atomic_exchange_n(&frame_coalesce_ns, 0, __ATOMIC_RELAXED); }
+int vk_async_render_tid(void) { return __atomic_load_n(&g_vk_render_tid, __ATOMIC_RELAXED); }
 
 void kernel_blocking_begin(void);        // kernel.c: core 0 to the game's other threads while a guest thread waits here
 void kernel_blocking_end(void);
@@ -58,6 +84,57 @@ bool vk_has_pending_commands(void);
 void vk_present_now(NvnTexture *t, uint64_t asked);  // device.c: the window's half of backend_present
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
 uint64_t renderer_fence_seq(void);
+uint64_t renderer_present_count(void);
+void nvn_async_apply_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view);
+void nvn_async_apply_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc);
+void nvn_async_apply_tex_pool_fin(NvnDescPool *d);
+void nvn_async_apply_tex_destroy(NvnTexture *t);
+
+// Reusable command-list snapshot pool to avoid per-submit malloc/realloc/free churn.
+#define SNAP_POOL_N 32
+static struct { uint8_t *buf; size_t cap; } snap_pool[SNAP_POOL_N];
+static int snap_pool_count;
+static pthread_mutex_t snap_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint8_t *snap_pool_acquire(size_t min_cap, size_t *out_cap) {
+    pthread_mutex_lock(&snap_pool_lock);
+    for (int i = snap_pool_count - 1; i >= 0; i--) {
+        if (snap_pool[i].cap >= min_cap) {
+            uint8_t *b = snap_pool[i].buf;
+            size_t c = snap_pool[i].cap;
+            snap_pool[i] = snap_pool[--snap_pool_count];
+            pthread_mutex_unlock(&snap_pool_lock);
+            *out_cap = c;
+            return b;
+        }
+    }
+    if (snap_pool_count > 0) {
+        uint8_t *b = snap_pool[--snap_pool_count].buf;
+        size_t c = snap_pool[snap_pool_count].cap;
+        pthread_mutex_unlock(&snap_pool_lock);
+        *out_cap = c;
+        return b;
+    }
+    pthread_mutex_unlock(&snap_pool_lock);
+    *out_cap = min_cap > 0x10000 ? min_cap : 0x10000;
+    return malloc(*out_cap);
+}
+
+static void snap_pool_release(uint8_t *b, size_t cap) {
+    if (!b) return;
+    if (cap <= (4u << 20)) {
+        pthread_mutex_lock(&snap_pool_lock);
+        if (snap_pool_count < SNAP_POOL_N) {
+            snap_pool[snap_pool_count].buf = b;
+            snap_pool[snap_pool_count].cap = cap;
+            snap_pool_count++;
+            pthread_mutex_unlock(&snap_pool_lock);
+            return;
+        }
+        pthread_mutex_unlock(&snap_pool_lock);
+    }
+    free(b);
+}
 
 bool vk_async_on(void) {
     if (on < 0) {
@@ -79,11 +156,17 @@ static uint64_t render_cpu_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static bool req_is_state_or_exec(int type) {
+    return type == REQ_EXEC || type == REQ_TEX_REG || type == REQ_SMP_REG;
+}
+
 static void *render_main(void *arg) {
     (void)arg;
 #ifdef __ANDROID__
     plat_thread_pin_fast();
 #endif
+    stall_set_thread_name("vk-render", 0);
+    __atomic_store_n(&g_vk_render_tid, stall_thread_tid(), __ATOMIC_RELAXED);
     crash_handler_install();
     // Keep the established ADPF signal by default. CPU-only timing is an explicit experiment:
     // excluding descheduling/waits can understate the work seen by Android's frequency governor.
@@ -99,7 +182,9 @@ static void *render_main(void *arg) {
                 if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
                 uint64_t w0 = plat_now_ns();
                 int wr = pthread_cond_timedwait(&q_more, &q_lock, &ts);
-                __atomic_fetch_add(&frame_idle_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
+                uint64_t w1 = plat_now_ns();
+                __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&frame_coalesce_ns, w1 - w0, __ATOMIC_RELAXED);
                 if (wr != 0 && q_head == q_tail) {
                     pthread_mutex_unlock(&q_lock);
                     vk_flush_pending_work();
@@ -108,23 +193,65 @@ static void *render_main(void *arg) {
             } else {
                 uint64_t w0 = plat_now_ns();
                 pthread_cond_wait(&q_more, &q_lock);
-                __atomic_fetch_add(&frame_idle_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
+                uint64_t w1 = plat_now_ns();
+                __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
+                if (w1 - w0 >= 5000000ull) {
+                    stall_record_wait_event(renderer_present_count(), w0, w1, "async",
+                                            "wait_game_queue_empty", 0, "guest-main", "idle");
+                }
             }
         }
         Req r = q[q_head % QN];
-        bool next_needs_submit = (q_head + 1 < q_tail) && (q[(q_head + 1) % QN].type != REQ_EXEC);
+        bool next_needs_submit = false;
+        if (r.type == REQ_EXEC) {
+            for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
+                int nt = q[scan % QN].type;
+                if (nt == REQ_TEX_REG || nt == REQ_SMP_REG) continue;
+                next_needs_submit = (nt != REQ_EXEC);
+                break;
+            }
+        }
         pthread_mutex_unlock(&q_lock);
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
-        vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
-        if (r.type == REQ_EXEC) { vk_execute_list_batch(r.a, next_needs_submit); free(r.p); }  // (r.p: the list copy, vk_async_execute)
-        else if (r.type == REQ_PRESENT) vk_present_now((NvnTexture *)r.p, r.a);
-        else if (r.type == REQ_FLUSH) vk_flush_pending_work();
-        if (r.type != REQ_FENCE) vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
-        else if (r.type == REQ_FENCE) {
+        if (r.type == REQ_EXEC || r.type == REQ_PRESENT || r.type == REQ_FENCE)
+            vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
+        if (r.type == REQ_EXEC) {
+            stall_note_active_work("exec_list");
+            uint8_t *copy_buf = (uint8_t *)r.p;
+            size_t copy_cap = copy_buf ? *(size_t *)copy_buf : 0;
+            uint64_t list_ptr = copy_buf ? (uint64_t)(uintptr_t)(copy_buf + 16) : r.a;
+            vk_execute_list_batch(list_ptr, next_needs_submit);
+            if (copy_buf) snap_pool_release(copy_buf, copy_cap);
+            stall_note_active_work(NULL);
+        } else if (r.type == REQ_PRESENT) {
+            stall_note_active_work("present");
+            vk_present_now((NvnTexture *)r.p, r.a);
+            stall_note_active_work(NULL);
+        } else if (r.type == REQ_FLUSH) {
+            vk_flush_pending_work();
+        } else if (r.type == REQ_FENCE) {
             vk_flush_pending_work();
             nvn_sync_set_seq(r.a, renderer_fence_seq());
+        } else if (r.type == REQ_TEX_REG) {
+            AsyncTexReg *tr = (AsyncTexReg *)r.p;
+            if (tr) {
+                nvn_async_apply_tex_reg(tr->pool, tr->id, tr->tex, &tr->view, tr->has_view);
+                free(tr);
+            }
+        } else if (r.type == REQ_SMP_REG) {
+            AsyncSmpReg *sr = (AsyncSmpReg *)r.p;
+            if (sr) {
+                nvn_async_apply_smp_reg(sr->pool, sr->id, &sr->desc);
+                free(sr);
+            }
+        } else if (r.type == REQ_TEX_POOL_FIN) {
+            nvn_async_apply_tex_pool_fin((NvnDescPool *)r.p);
+        } else if (r.type == REQ_TEX_DESTROY) {
+            nvn_async_apply_tex_destroy((NvnTexture *)r.p);
         }
+        if (r.type == REQ_EXEC || r.type == REQ_PRESENT)
+            vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
         uint64_t elapsed = plat_now_ns() - t0;
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
         frame_work += elapsed;
@@ -152,16 +279,24 @@ static uint64_t push(int type, uint64_t a, void *p) {
         pthread_create(&g_vk_render_thread, NULL, render_main, NULL);
     }
     if (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) {
+        bool pres_wait = (type == REQ_PRESENT && q_presents >= ahead);
         pthread_mutex_unlock(&q_lock);
+        uint64_t w0 = plat_now_ns();
         kernel_blocking_begin();
         pthread_mutex_lock(&q_lock);
         while (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) pthread_cond_wait(&q_less, &q_lock);
         pthread_mutex_unlock(&q_lock);
         kernel_blocking_end();
+        uint64_t w1 = plat_now_ns();
+        if (w1 - w0 >= 5000000ull) {
+            stall_record_wait_event(renderer_present_count(), w0, w1, "async",
+                                    pres_wait ? "async_present_ahead" : "async_ring_full",
+                                    vk_async_render_tid(), "vk-render", "push");
+        }
         pthread_mutex_lock(&q_lock);
     }
     uint64_t id = ++q_tail;  // (ids 1, 2, ...: the request at index id - 1)
-    {
+    if (type == REQ_EXEC || type == REQ_PRESENT || type == REQ_FENCE) {
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);
         vk_tl(type == REQ_EXEC ? "game: list sent" : type == REQ_PRESENT ? "game: present sent" : "game: fence sent", id, 0);
     }
@@ -175,9 +310,15 @@ static uint64_t push(int type, uint64_t a, void *p) {
 // Until the render thread has finished request `id` (0: nothing to wait for).
 void vk_async_wait_id(uint64_t id) {
     if (!id || !g_vk_render_started || vk_async_is_render_thread()) return;
+    uint64_t w0 = plat_now_ns();
     pthread_mutex_lock(&q_lock);
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    uint64_t w1 = plat_now_ns();
+    if (w1 - w0 >= 5000000ull) {
+        stall_record_wait_event(renderer_present_count(), w0, w1, "async",
+                                "vk_async_wait_id", vk_async_render_tid(), "vk-render", NULL);
+    }
 }
 
 // Until every request queued so far has run (the render thread is idle after it).
@@ -186,6 +327,8 @@ void vk_async_drain(void) {
         if (vk_has_pending_commands()) vk_flush_pending_work();
         return;
     }
+    uint64_t w0 = plat_now_ns();
+    kernel_blocking_begin();
     pthread_mutex_lock(&q_lock);
     uint64_t id = q_tail;
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
@@ -195,6 +338,12 @@ void vk_async_drain(void) {
         uint64_t fid = push(REQ_FLUSH, 0, NULL);
         pthread_mutex_unlock(&p_lock);
         vk_async_wait_id(fid);
+    }
+    kernel_blocking_end();
+    uint64_t w1 = plat_now_ns();
+    if (w1 - w0 >= 5000000ull) {
+        stall_record_wait_event(renderer_present_count(), w0, w1, "async",
+                                "vk_async_drain", vk_async_render_tid(), "vk-render", NULL);
     }
 }
 
@@ -221,6 +370,7 @@ static void mark_fences(uint64_t p, uint64_t id, int depth) {
 
 // A copy of a submitted list, the lists it calls inlined: NVN reads the lists (in control memory) when they are
 // submitted, so a game may record over them right after (BOTW does), while the render thread runs them later.
+// Header layout in pooled buffer: first 16 bytes store capacity (size_t) for snap_pool_release; commands start at +16.
 typedef struct { uint8_t *b; size_t n, cap; } Snap;
 static void snap_add(Snap *s, uint64_t p, int depth) {
     for (int guard = 0; guard < 10000000; guard++) {
@@ -232,10 +382,11 @@ static void snap_add(Snap *s, uint64_t p, int depth) {
             const uint64_t *h = (const uint64_t *)r->extra;
             for (uint64_t i = 0; i < r->x[0]; i++) snap_add(s, h[i], depth + 1);
         } else {
-            if (s->n + r->size > s->cap) {
-                s->cap = (s->n + r->size) * 2 > 0x10000 ? (s->n + r->size) * 2 : 0x10000;
+            if (s->n + r->size + sizeof(CmdRec) > s->cap) {
+                s->cap = (s->n + r->size + sizeof(CmdRec)) * 2 > 0x10000 ? (s->n + r->size + sizeof(CmdRec)) * 2 : 0x10000;
                 s->b = realloc(s->b, s->cap);
                 if (!s->b) FATAL("vk: out of memory for a command list copy\n");
+                *(size_t *)s->b = s->cap;
             }
             memcpy(s->b + s->n, r, r->size);
             s->n += r->size;
@@ -245,9 +396,17 @@ static void snap_add(Snap *s, uint64_t p, int depth) {
 }
 static uint8_t *snap_list(uint64_t handle) {
     Snap s = {0};
-    snap_add(&s, handle, 0);
-    s.b = realloc(s.b, s.n + sizeof(CmdRec));
+    s.b = snap_pool_acquire(0x10000, &s.cap);
     if (!s.b) FATAL("vk: out of memory for a command list copy\n");
+    *(size_t *)s.b = s.cap;
+    s.n = 16;
+    snap_add(&s, handle, 0);
+    if (s.n + sizeof(CmdRec) > s.cap) {
+        s.cap = s.n + sizeof(CmdRec);
+        s.b = realloc(s.b, s.cap);
+        if (!s.b) FATAL("vk: out of memory for a command list copy\n");
+        *(size_t *)s.b = s.cap;
+    }
     memset(s.b + s.n, 0, sizeof(CmdRec));  // CMD_END
     ((CmdRec *)(s.b + s.n))->size = sizeof(CmdRec);
     return s.b;
@@ -255,13 +414,13 @@ static uint8_t *snap_list(uint64_t handle) {
 
 void vk_async_execute(uint64_t handle) {
     uint8_t *copy = getenv("LARECOMP_NO_LIST_COPY") ? NULL : snap_list(handle);
-    if (copy) handle = (uint64_t)(uintptr_t)copy;
+    uint64_t list_ptr = copy ? (uint64_t)(uintptr_t)(copy + 16) : handle;
     pthread_mutex_lock(&p_lock);
     pthread_mutex_lock(&q_lock);
     uint64_t next = q_tail + 1;  // (the id the push gets: the list's fences carry it before the render thread sees them)
     pthread_mutex_unlock(&q_lock);
-    mark_fences(handle, next, 0);
-    push(REQ_EXEC, handle, copy);  // (the render thread frees the copy once run)
+    mark_fences(list_ptr, next, 0);
+    push(REQ_EXEC, list_ptr, copy);  // (the render thread recycles the copy once run)
     pthread_mutex_unlock(&p_lock);
 }
 
@@ -276,6 +435,44 @@ uint64_t vk_async_fence(uint64_t guest_sync) {
     uint64_t id = push(REQ_FENCE, guest_sync, NULL);
     pthread_mutex_unlock(&p_lock);
     return id;
+}
+
+void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view) {
+    AsyncTexReg *tr = malloc(sizeof *tr);
+    if (!tr) FATAL("vk: out of memory for async tex reg\n");
+    tr->pool = d;
+    tr->id = id;
+    tr->tex = t;
+    tr->has_view = has_view;
+    if (has_view && view) tr->view = *view;
+    else memset(&tr->view, 0, sizeof tr->view);
+    pthread_mutex_lock(&p_lock);
+    push(REQ_TEX_REG, 0, tr);
+    pthread_mutex_unlock(&p_lock);
+}
+
+void vk_async_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc) {
+    AsyncSmpReg *sr = malloc(sizeof *sr);
+    if (!sr) FATAL("vk: out of memory for async smp reg\n");
+    sr->pool = d;
+    sr->id = id;
+    sr->desc = *desc;
+    sr->desc.backend = NULL;
+    pthread_mutex_lock(&p_lock);
+    push(REQ_SMP_REG, 0, sr);
+    pthread_mutex_unlock(&p_lock);
+}
+
+void vk_async_tex_pool_fin(NvnDescPool *d) {
+    pthread_mutex_lock(&p_lock);
+    push(REQ_TEX_POOL_FIN, 0, d);
+    pthread_mutex_unlock(&p_lock);
+}
+
+void vk_async_tex_destroy(NvnTexture *t) {
+    pthread_mutex_lock(&p_lock);
+    push(REQ_TEX_DESTROY, 0, t);
+    pthread_mutex_unlock(&p_lock);
 }
 #else
 typedef int vk_async_unused;  // (Android only)

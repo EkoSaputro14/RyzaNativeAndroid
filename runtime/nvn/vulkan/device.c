@@ -18,6 +18,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "stall_trace.h"
 #include "timing_trace.h"
 #include "precompute.h"
 #include "device_compat.h"
@@ -1536,8 +1537,12 @@ void backend_present(NvnTexture *t) {
 #endif
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
+    stall_note_active_work("vk_acquire");
     bool have = vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
+    stall_note_acquire(nd);
+    if (nd >= 5000000ull)
+        stall_record_wait_event(total_frames, t0, t0 + nd, "vk-present", "vk_acquire_image", 0, "surfaceflinger", NULL);
     if (nd > 30000000) {
         static int warned;
         if (warned++ < 20) LOG("[vk] acquire blocked %llums\n", (unsigned long long)(nd / 1000000));
@@ -1598,7 +1603,9 @@ void backend_present(NvnTexture *t) {
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
+        stall_note_active_work("vk_present");
         vk_frame_end(shot ? "build/window.png" : NULL);
+        stall_note_active_work("vk_exec");
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
@@ -2151,6 +2158,7 @@ void backend_reset(void) {
     extern void vk_exec_reset(void);
     vk_textures_reset();
     vk_exec_reset();
+    stall_trace_reset();
     g_last_presented = NULL;
 }
 void backend_guest_memory_reset(void) {}  // (exec.c re-imports the heap on first use)

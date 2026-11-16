@@ -19,6 +19,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "stall_trace.h"
 #include "timing_trace.h"
 #include "../renderer.h"
 #include "../../settings.h"
@@ -58,7 +59,7 @@ static int prof = -1;
 static uint64_t prof_dsw, prof_cbuf, prof_set_hits, prof_set_miss;  // (sets: driver writes, cbuf copies, set cache)
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 static VkQueryPool prof_qp;
-static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
+static uint64_t cum_exec, cum_wait, cum_draws, cum_submits, cum_draw_prep;  // (profiling) never reset: hitch log
 #ifdef __ANDROID__
 uint64_t vk_cum_wait_ns(void) { return cum_wait; }  // (the performance overlay: time spent waiting on the GPU)
 #endif
@@ -82,7 +83,7 @@ void vk_record_nvn_sync_wait(uint64_t ns) {
 }
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
-static char stats_text[2048];
+static char stats_text[3072];
 void vk_collect_dead(void);
 
 // ================================================================== submissions
@@ -180,12 +181,15 @@ void vk_wait_seq(uint64_t seq) {
     }
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
+    const char *why_tag = wait_why ? wait_why : "gpu_timeline";
     uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     uint64_t dt = SDL_GetTicksNS() - t0;
     stat_wait_ns += dt;
     cum_wait += dt;
     wait_account(dt);
+    if (dt >= 5000000ull)
+        stall_record_wait_event(renderer_present_count(), t0, t0 + dt, "vk-gpu", why_tag, 0, "gpu_timeline", NULL);
 #ifdef __ANDROID__
     if (vk_timing_trace_on()) vk_timing_trace_wait(VK_TIMING_TIMELINE, dt);
 #endif
@@ -367,6 +371,7 @@ void vk_pace_frame(void) {
     double render_busy = vk_async_on() ? vk_async_frame_work_ns() / 1e6 : 0;
     double game_busy = busy;
     uint64_t game_busy_ns = (uint64_t)(game_busy * 1e6);
+    stall_note_guest_window(game_busy_ns);
     atomic_fetch_add(&s_game_busy_ns_acc, game_busy_ns);
     atomic_fetch_add(&s_game_busy_frames, 1);
     uint64_t prev_max = atomic_load(&s_game_busy_max_ns);
@@ -1239,6 +1244,7 @@ static void *worker(void *a) {
 #ifdef __ANDROID__
     plat_thread_pin_fast();
 #endif
+    stall_set_thread_name("vk-worker", 0);
     crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
@@ -1270,6 +1276,7 @@ static void *translator(void *a) {
 #ifdef __ANDROID__
     plat_thread_pin_fast();
 #endif
+    stall_set_thread_name("vk-translator", 0);
     crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
@@ -1347,7 +1354,10 @@ static void wait_built(_Atomic int *state) {
     pthread_mutex_lock(&build_done_lock);
     while (!atomic_load(state)) pthread_cond_wait(&build_done_cond, &build_done_lock);
     pthread_mutex_unlock(&build_done_lock);
-    stat_build_wait_ns += plat_now_ns() - t0;
+    uint64_t dt = plat_now_ns() - t0;
+    stat_build_wait_ns += dt;
+    if (dt >= 5000000ull)
+        stall_record_wait_event(renderer_present_count(), t0, t0 + dt, "vk-shader", "wait_built_shader", 0, "vk-worker", NULL);
 }
 static bool rt_is_persistent(NvnTexture *t) {
     static int on = -1;
@@ -1440,7 +1450,7 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // (LARECOMP_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
-    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles;
+    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles, l_draw_prep, l_gpu;
     uint64_t now = SDL_GetTicksNS();
 #ifdef __ANDROID__
     {
@@ -1450,16 +1460,52 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
 #endif
 #ifdef __ANDROID__
     extern uint64_t vk_async_take_idle_ns(void);
+    extern uint64_t vk_async_take_coalesce_ns(void);
     uint64_t wait_game_ns = vk_async_take_idle_ns();
+    uint64_t coalesce_ns = vk_async_take_coalesce_ns();
     stat_wait_game_ns += wait_game_ns;
+    uint64_t cur_gpu = atomic_load(&gpu_busy_total);
 #else
     uint64_t wait_game_ns = 0;
+    uint64_t coalesce_ns = 0;
+    uint64_t cur_gpu = prof_gpu;
 #endif
     s_iv_frames++;
+    uint64_t cur_compiles = atomic_load(&cum_compiles);
+    int pending_compiles = atomic_load(&stat_compiles_pending);
     if (last_t) {
+        uint64_t dt = now - last_t;
         uint64_t ex = cum_exec - l_exec;
         uint64_t wt = cum_wait - l_wait;
+        uint64_t dp = cum_draw_prep - l_draw_prep;
+        uint64_t gns = cur_gpu >= l_gpu ? cur_gpu - l_gpu : 0;
         precompute_record_frame_latency(ex, wt);
+        uint64_t tex_up = 0, tex_bytes = 0, tex_desw_ns = 0;
+        stall_take_tex_stats(&tex_up, &tex_bytes, &tex_desw_ns);
+        StallFrameMetrics sm = {
+            .frame_id = frame,
+            .frame_start_ns = last_t,
+            .frame_end_ns = now,
+            .total_ns = dt,
+            .guest_exec_ns = stall_take_guest_exec_ns(),
+            .wait_game_queue_ns = wait_game_ns,
+            .wait_game_coalesce_ns = coalesce_ns,
+            .backend_exec_ns = ex,
+            .vk_cpu_prep_ns = dp,
+            .gpu_ns = gns,
+            .gpu_wait_ns = wt,
+            .acquire_ns = stall_take_acquire_ns(),
+            .present_ns = present_ns,
+            .tex_uploads = tex_up,
+            .tex_upload_bytes = tex_bytes,
+            .tex_deswizzle_ns = tex_desw_ns,
+            .lock_wait_ns = stall_take_lock_wait_ns(),
+            .draws = cum_draws - l_draws,
+            .submits = cum_submits - l_subs,
+            .compiles_delta = cur_compiles - l_compiles,
+            .compiles_pending = pending_compiles,
+        };
+        stall_on_frame_end(&sm);
     }
     if (atomic_load(&g_precompute_stats.is_warmup_active)) {
         if (frame >= 120) precompute_warmup_end();
@@ -1474,9 +1520,9 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             vk_pipeline_cache_save_async();
         }
     }
-    uint64_t cur_compiles = atomic_load(&cum_compiles);
     if (!prof) {
-        last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits; l_compiles = cur_compiles;
+        last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
+        l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_gpu = cur_gpu;
         return;
     }
     if (last_t && now - last_t > 50000000) {
@@ -1488,9 +1534,10 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
         LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + wait_game %.1f + other %.1f; %llu draws, "
             "%llu submits, compiles +%llu done (%d pending)\n", (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
             wg / 1e6, untracked / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
-            (unsigned long long)(cur_compiles - l_compiles), atomic_load(&stat_compiles_pending));
+            (unsigned long long)(cur_compiles - l_compiles), pending_compiles);
     }
-    last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits; l_compiles = cur_compiles;
+    last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
+    l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_gpu = cur_gpu;
 }
 
 static double s_last_cpu_exec_ms, s_last_gpu_ms;
@@ -1590,6 +1637,8 @@ const char *renderer_stats(void) {
                      sw_ns / 1e6, (unsigned long long)sw_n, stat_wait_game_ns / 1e6,
                      atomic_load(&stat_compiles_pending));
             stat_wait_game_ns = 0;
+            n = strlen(stats_text);
+            stall_format_summary(stats_text + n, sizeof stats_text - n);
         }
         prof_views_created = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
@@ -6757,6 +6806,7 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
     PROF_ADD(prof_draw);
+    if (prof) cum_draw_prep += SDL_GetTicksNS() - prof_t0_;
 }
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
