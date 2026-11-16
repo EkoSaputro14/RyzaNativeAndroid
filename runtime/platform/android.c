@@ -1034,7 +1034,8 @@ static void uclamp_min_thread(void) {
     static int want = -1;
     if (want < 0) {
         const char *e = getenv("LARECOMP_UCLAMP_MIN");
-        want = e && atoi(e) > 0 ? (atoi(e) > 1024 ? 1024 : atoi(e)) : 0;
+        // Default 563 (~55% of 1024) prevents Snapdragon 732G / Adreno 618 big cluster from dropping to 1017 MHz during render
+        want = e ? (atoi(e) > 1024 ? 1024 : (atoi(e) < 0 ? 0 : atoi(e))) : 563;
     }
     if (!want) return;
     struct {
@@ -1154,22 +1155,31 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
     if (target_override_us > 0) target_ns = (uint64_t)target_override_us * 1000ull;
     else if (margin_pct > 0 && margin_pct < 100) target_ns = target_ns * (100 - margin_pct) / 100;
 
+    static uint64_t s_last_render_ns;
+    static bool s_uclamp_applied[2];
+    if (!s_uclamp_applied[slot & 1]) {
+        s_uclamp_applied[slot & 1] = true;
+        uclamp_min_thread();
+    }
     if (slot == 0) {  // Presenting thread (game's main loop)
         s_presenting_tid = (int32_t)gettid();
         s_game_cpu = sched_getcpu();
+        if (s_last_render_ns > work_ns) work_ns = s_last_render_ns;
         float gms = (float)(game_ns ? game_ns : work_ns) / 1e6f;
         s_game_ms = s_game_ms > 0 ? s_game_ms * 0.9f + gms * 0.1f : gms;
-        s_work_ms = (float)work_ns / 1e6f;
+        float wms = (float)work_ns / 1e6f;
+        if (s_render_ms > wms) wms = s_render_ms;
+        s_work_ms = wms;
         s_target_ms = (float)target_ns / 1e6f;
     } else {          // Render thread (Vulkan command translation)
         s_render_tid = (int32_t)gettid();
         s_render_cpu = sched_getcpu();
+        s_last_render_ns = work_ns;
         float rms = (float)work_ns / 1e6f;
         s_render_ms = s_render_ms > 0 ? s_render_ms * 0.9f + rms * 0.1f : rms;
+        if (rms > s_work_ms) s_work_ms = rms;
+        if (s_target_ms <= 0.0f) s_target_ms = (float)target_ns / 1e6f;
     }
-
-    // Only the presenting thread owns the unified session; render publishes telemetry.
-    if (!s_split && slot != 0) return;
 
     APerformanceHintManager *m = get_manager();
     if (!m) return;
@@ -1216,7 +1226,9 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
                 }
             }
         }
-        if (slot != 0 || !session[0]) return;  // Render thread doesn't report separately in single-session mode
+        if (!session[0]) return;
+        // Allow render thread (slot 1) to report directly when its work exceeds target_ns so cpu 6 stays boosted
+        if (slot != 0 && work_ns <= target_ns) return;
 
         if (target_ns != target[0]) {
             int r = retarget(session[0], (int64_t)target_ns);

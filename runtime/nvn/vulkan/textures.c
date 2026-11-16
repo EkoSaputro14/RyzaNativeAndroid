@@ -254,7 +254,11 @@ static void bc_decode(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t 
 //             HUD and menus are drawn sharp
 //   RS_SCENE  the 3D scene's targets (1600x900 docked, the game's dynamic sizes down to 1280x720, their fractions):
 //             the internal resolution (Video > Internal resolution)
+#ifdef __ANDROID__
+static float g_rs[3][2] = {{1, 1}, {0.6666667f, 0.6666667f}, {0.68f, 0.68f}};
+#else
 static float g_rs[3][2] = {{1, 1}, {1, 1}, {1, 1}};
+#endif
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
 void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
@@ -1134,6 +1138,23 @@ void vk_make_scalable_like(NvnTexture *t, NvnTexture *like) {
     uint8_t g = tex_backend(like)->rs_group;
     if (b->rs_group || !g || (t->target != 1 && t->target != 4) || t->samples > 1) return;  // (a group stays)
     b->rs_group = g;
+    destroy_image(b);
+    create_image(t, b);
+}
+
+// Promote a 16:9 3D scene render target (e.g. 1280x720 or 640x360 in Atelier Ryza where flags==0) to RS_SCENE
+// when bound as a color/depth attachment in a render pass, so all scene passes scale uniformly.
+void vk_promote_scene_rt(NvnTexture *t) {
+    if (!t || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & 1)) return;
+    if (t->levels > 1 || t->width < 320 || t->height < 180) return;
+    float a = (float)t->width / (float)t->height;
+    if (a < 1.74f || a > 1.81f) return;
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_NO_SCALE") == NULL;
+    if (!on) return;
+    TexBackend *b = tex_backend(t);
+    if (b->rs_group || b->uploaded) return;
+    b->rs_group = RS_SCENE;
     destroy_image(b);
     create_image(t, b);
 }

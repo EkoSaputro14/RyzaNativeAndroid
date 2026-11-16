@@ -505,3 +505,45 @@ def _verify_p13_visual_perf_fixes():
 
 
 _verify_p13_visual_perf_fixes()
+
+
+def _verify_p13_perf_optimizations():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    precompute_c = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c").read_text(encoding="utf-8")
+    output_scale_c = (repo_root / "runtime" / "nvn" / "output_scale.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+
+    # 1. Precomputed render pipeline ASLR-invariant PipeKey hash & cache_hits accounting
+    assert "uint64_t prog_hash;" in exec_c
+    assert "offsetof(PipeKey, prog_hash)" in exec_c
+    assert "if (hit) atomic_fetch_add(&g_precompute_stats.cache_hits, 1);" in exec_c
+    assert "MANIFEST_MAGIC 0x52595A32u" in precompute_c
+
+    # 2. Command list coalescing / batching, SUBS=32, done_seq_cache, and persistent ga_load_copy
+    assert "#define SUBS 32" in exec_c
+    assert "done_seq_cache" in exec_c
+    assert "vk_execute_list_batch(" in exec_c and "vk_execute_list_batch(" in async_c
+    assert "REQ_FLUSH" in async_c
+    assert "ga_seg_gen" in exec_c and "cache[256]" in exec_c
+
+    # 3. Internal resolution scaling (0.68x default on Android / Adreno 618) & scene render target promotion
+    assert "float render_scale;" in settings_h
+    assert ".render_scale = 0.68f" in settings_c
+    assert "g_settings.render_scale" in output_scale_c
+    assert "vk_promote_scene_rt(" in textures_c and "vk_promote_scene_rt(" in exec_c
+
+    # 4. ADPF critical-path work reporting & uclamp.min floor
+    assert "s_last_render_ns" in android_c
+    assert "want = e ? (atoi(e) > 1024 ? 1024 : (atoi(e) < 0 ? 0 : atoi(e))) : 563;" in android_c
+    assert "if (render_busy > hint_busy) hint_busy = render_busy;" in exec_c
+
+    print("  -> PASS: p13 ASLR-free PipeKey hash, command list batching, ga_load_copy reuse, 0.68x resolution scaling & ADPF governor boost verified.")
+
+
+_verify_p13_perf_optimizations()

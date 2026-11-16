@@ -68,15 +68,17 @@ static const char *get_manifest_path(void) {
     return path;
 }
 
+#define MANIFEST_MAGIC 0x52595A32u
+
 static void load_manifest(void) {
     const char *path = get_manifest_path();
     FILE *f = fopen(path, "rb");
     if (!f) return;
 
-    uint32_t count = 0;
-    if (fread(&count, sizeof(count), 1, f) == 1 && count <= MAX_MANIFEST_PIPELINES) {
+    uint32_t hdr[2] = {0, 0};
+    if (fread(hdr, sizeof(uint32_t), 2, f) == 2 && hdr[0] == MANIFEST_MAGIC && hdr[1] <= MAX_MANIFEST_PIPELINES) {
         pthread_mutex_lock(&s_manifest_lock);
-        s_manifest_count = (uint32_t)fread(s_manifest_hashes, sizeof(uint64_t), count, f);
+        s_manifest_count = (uint32_t)fread(s_manifest_hashes, sizeof(uint64_t), hdr[1], f);
         atomic_store(&g_precompute_stats.pipelines_manifest_total, s_manifest_count);
         pthread_mutex_unlock(&s_manifest_lock);
     }
@@ -98,7 +100,8 @@ static void save_manifest(void) {
 
     FILE *f = fopen(tmp_path, "wb");
     if (f) {
-        fwrite(&s_manifest_count, sizeof(uint32_t), 1, f);
+        uint32_t hdr[2] = {MANIFEST_MAGIC, s_manifest_count};
+        fwrite(hdr, sizeof(uint32_t), 2, f);
         fwrite(s_manifest_hashes, sizeof(uint64_t), s_manifest_count, f);
         fclose(f);
         remove(get_manifest_path());
@@ -147,10 +150,9 @@ void precompute_warmup_end(void) {
 
 void precompute_tick(void) {
     if (!atomic_load(&s_manifest_dirty)) return;
-    if (atomic_load(&g_precompute_stats.is_warmup_active)) return;
     uint64_t now = get_time_ns();
     uint64_t last = atomic_load(&s_last_manifest_save_ns);
-    if (last && now - last < 5000000000ull) return;
+    if (last && now - last < 3000000000ull) return;
     save_manifest();
 }
 

@@ -55,7 +55,8 @@ Settings g_settings = {
     .turnip_lrz = -1,
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
-    .res_mode = 1,  // (1x: the Switch's 900p scene, the HUD at the screen's resolution - Match display drew the scene at
+    .res_mode = 1,
+    .render_scale = 0.68f,  // (0.68x internal 3D resolution default on Android: ~870x490, cuts Adreno 618 fragment load by 54%)  // (1x: the Switch's 900p scene, the HUD at the screen's resolution - Match display drew the scene at
                     // 2560x1440 on the POCO F7 Ultra: 22 fps)
 #else
     .show_fps = false,
@@ -318,6 +319,10 @@ void settings_load(void) {
                                   !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
                                   (n >= 1 && n <= 4) ? n : RES_MATCH;  // (5x-8x were removed)
         }
+        else if (!strcmp(key, "render_scale")) {
+            float rs = (float)atof(val);
+            if (rs >= 0.25f && rs <= 2.0f) g_settings.render_scale = rs;
+        }
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
             g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
 #ifndef __APPLE__
@@ -358,6 +363,7 @@ void settings_load(void) {
     g_settings.sync_lag = false;
     g_settings.upscaler = UPSCALE_BILINEAR;
     if (g_settings.out_lines <= 0 || g_settings.out_lines == OUT_AUTO) g_settings.out_lines = 720;
+    if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.68f;
 #endif
     extern int g_exec_mode;
     LOG("[settings] loaded %s (forced sync_lag=%d, upscaler=%d, exec_mode=%d)\n",
@@ -369,6 +375,7 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# BOTWRecompAndroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    if (g_settings.render_scale > 0.0f) fprintf(f, "render_scale = %.2f\n", g_settings.render_scale);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);

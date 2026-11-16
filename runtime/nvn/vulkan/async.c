@@ -23,7 +23,7 @@
 #include "../../platform.h"
 #include "../../rt.h"
 
-enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE };
+enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE, REQ_FLUSH };
 typedef struct { int type; uint64_t a; void *p; uint64_t id; } Req;
 
 #define QN 4096  // requests in flight (a frame has a few dozen)
@@ -50,6 +50,9 @@ uint64_t vk_async_frame_cpu_ns(void) { return __atomic_load_n(&last_frame_cpu, _
 void kernel_blocking_begin(void);        // kernel.c: core 0 to the game's other threads while a guest thread waits here
 void kernel_blocking_end(void);
 void vk_execute_now(uint64_t handle);    // exec.c: translate and submit a command list
+void vk_execute_list_batch(uint64_t handle, bool force_submit);
+void vk_flush_pending_work(void);
+bool vk_has_pending_commands(void);
 void vk_present_now(NvnTexture *t, uint64_t asked);  // device.c: the window's half of backend_present
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
 uint64_t renderer_fence_seq(void);
@@ -85,16 +88,35 @@ static void *render_main(void *arg) {
     bool cpu_timing = timing && atoi(timing) != 0;
     pthread_mutex_lock(&q_lock);
     for (;;) {
-        while (q_head == q_tail) pthread_cond_wait(&q_more, &q_lock);
+        while (q_head == q_tail) {
+            if (vk_has_pending_commands()) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 1500000;  // 1.5 ms batch coalescing window before auto-flushing open command buffer
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+                if (pthread_cond_timedwait(&q_more, &q_lock, &ts) != 0 && q_head == q_tail) {
+                    pthread_mutex_unlock(&q_lock);
+                    vk_flush_pending_work();
+                    pthread_mutex_lock(&q_lock);
+                }
+            } else {
+                pthread_cond_wait(&q_more, &q_lock);
+            }
+        }
         Req r = q[q_head % QN];
+        bool next_needs_submit = (q_head + 1 < q_tail) && (q[(q_head + 1) % QN].type != REQ_EXEC);
         pthread_mutex_unlock(&q_lock);
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
         vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
-        if (r.type == REQ_EXEC) { vk_execute_now(r.a); free(r.p); }  // (r.p: the list copy, vk_async_execute)
+        if (r.type == REQ_EXEC) { vk_execute_list_batch(r.a, next_needs_submit); free(r.p); }  // (r.p: the list copy, vk_async_execute)
         else if (r.type == REQ_PRESENT) vk_present_now((NvnTexture *)r.p, r.a);
+        else if (r.type == REQ_FLUSH) vk_flush_pending_work();
         if (r.type != REQ_FENCE) vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
-        else if (r.type == REQ_FENCE) nvn_sync_set_seq(r.a, renderer_fence_seq());
+        else if (r.type == REQ_FENCE) {
+            vk_flush_pending_work();
+            nvn_sync_set_seq(r.a, renderer_fence_seq());
+        }
         uint64_t elapsed = plat_now_ns() - t0;
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
         frame_work += elapsed;
@@ -102,7 +124,8 @@ static void *render_main(void *arg) {
             __atomic_store_n(&last_frame_work, frame_work, __ATOMIC_RELAXED);
             extern void plat_render_work(uint64_t work_ns, uint64_t target_ns);
             __atomic_store_n(&last_frame_cpu, frame_cpu, __ATOMIC_RELAXED);
-            plat_render_work(frame_cpu, 16666667ull);  // (ADPF: clocks for 60 fps on this thread too)
+            uint64_t report_ns = frame_work > frame_cpu ? frame_work : frame_cpu;
+            plat_render_work(report_ns, 16666667ull);  // (ADPF: clocks for 60 fps on this thread too)
             frame_work = frame_cpu = 0;
         }
         pthread_mutex_lock(&q_lock);
@@ -151,11 +174,20 @@ void vk_async_wait_id(uint64_t id) {
 
 // Until every request queued so far has run (the render thread is idle after it).
 void vk_async_drain(void) {
-    if (!g_vk_render_started || vk_async_is_render_thread()) return;
+    if (!g_vk_render_started || vk_async_is_render_thread()) {
+        if (vk_has_pending_commands()) vk_flush_pending_work();
+        return;
+    }
     pthread_mutex_lock(&q_lock);
     uint64_t id = q_tail;
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    if (vk_has_pending_commands()) {
+        pthread_mutex_lock(&p_lock);
+        uint64_t fid = push(REQ_FLUSH, 0, NULL);
+        pthread_mutex_unlock(&p_lock);
+        vk_async_wait_id(fid);
+    }
 }
 
 // The fences a command list signals (CMD_FENCE_SYNC, in it or in the lists it calls) get the list's request: a wait

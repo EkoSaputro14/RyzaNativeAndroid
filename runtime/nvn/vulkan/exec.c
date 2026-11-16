@@ -78,7 +78,7 @@ void vk_collect_dead(void);
 // ================================================================== submissions
 // A submission = optional upload command buffer + the main one, signalling the timeline with its number.
 #ifdef __ANDROID__
-#define SUBS 16  // (LARECOMP_VK_ASYNC submits a frame in chunks: more submissions in flight)
+#define SUBS 32  // (Increased from 16 to 32: prevents ring slot stalls on multi-pass KTGL frames)
 #else
 #define SUBS 8
 #endif
@@ -112,9 +112,13 @@ static struct { const void *rec; uint32_t aspects; } lclear[16];  // (clears the
 static int nlclear;
 static int naliases;
 
+static _Atomic uint64_t done_seq_cache;
+
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    uint64_t prev = atomic_load_explicit(&done_seq_cache, memory_order_relaxed);
+    if (v > prev) atomic_store_explicit(&done_seq_cache, v, memory_order_release);
     return v;
 }
 
@@ -148,22 +152,41 @@ static void ga_invalidate(const void *p, uint64_t len);
 
 void vk_wait_seq(uint64_t seq) {
     if (!seq) { wait_why = NULL; return; }
+    // Fast userspace check: if seq is already known completed, avoid kernel vkWaitSemaphores ioctl & lock contention
+    uint64_t cached = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+    if (seq <= cached) {
+        wait_why = NULL;
+        return;
+    }
+    uint64_t cur = vk_completed_seq();
+    if (seq <= cur) {
+        wait_why = NULL;
+        cq_resolve_done(cur);
+#ifdef __ANDROID__
+        gcopy_retire(cur);
+#endif
+        return;
+    }
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
-    stat_wait_ns += SDL_GetTicksNS() - t0;
-    cum_wait += SDL_GetTicksNS() - t0;
-    wait_account(SDL_GetTicksNS() - t0);
+    uint64_t dt = SDL_GetTicksNS() - t0;
+    stat_wait_ns += dt;
+    cum_wait += dt;
+    wait_account(dt);
 #ifdef __ANDROID__
-    if (vk_timing_trace_on()) vk_timing_trace_wait(VK_TIMING_TIMELINE, SDL_GetTicksNS() - t0);
+    if (vk_timing_trace_on()) vk_timing_trace_wait(VK_TIMING_TIMELINE, dt);
 #endif
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) {
+        uint64_t prev = atomic_load_explicit(&done_seq_cache, memory_order_relaxed);
+        if (seq > prev) atomic_store_explicit(&done_seq_cache, seq, memory_order_release);
+        cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
-    if (r == VK_SUCCESS) gcopy_retire(seq);
+        gcopy_retire(seq);
 #endif
-    else {
+    } else {
         extern void vk_devlost_dump(void);
         vk_devlost_dump();
         vk_device_fault_report();
@@ -324,7 +347,7 @@ void vk_pace_frame(void) {
     uint64_t p = now - last, wt = w - last_wait;
     bool first = !last;
     last = now, last_wait = w;
-    if (first || p > 100000000ull) return;  // (loading, a hitch: not a pace)
+    if (first || p > 1000000000ull) return;  // (Keep reporting ADPF for frames up to 1000 ms so <15 FPS never starves governor)
     double busy = (p > wt ? p - wt : 0) / 1e6;
 #ifdef __ANDROID__
     // LARECOMP_VK_ASYNC: the frame is two threads' work - the game's (busy) and the render thread's (its last frame)
@@ -347,27 +370,22 @@ void vk_pace_frame(void) {
         uint64_t total = gpu_busy_total, gpu = total - last_busy;
         last_busy = total;
         g_pace_gpu_ms = gpu / 1e6;
-        // (per presented frame, against 60 fps's budget in either mode: a 30 fps frame renders one image too - its GPU
-        // time is what a 60 fps frame would take, and halved it looked comfortable: the clock stayed low)
-        // The render hint defaults to the established wall-time signal; CPU-only timing is opt-in.
         extern uint64_t vk_async_frame_cpu_ns(void);
         double hint_busy = game_busy;
         double render_cpu = vk_async_on() ? vk_async_frame_cpu_ns() / 1e6 : 0;
         if (render_cpu > hint_busy) hint_busy = render_cpu;
-        // (Frame rate 30, fixed: no 60 fps trial to make room for - the budget is 30 fps's, so the governor stops
-        // running the threads at clocks that would finish them in 13 ms of their 33. LARECOMP_AB=<n>:adpf30: the 60
-        // fps budget on side B)
-        // Three quarters of the frame, not all of it: the governor lowers the clocks until the work just fits its
-        // target, and a phone whose frames weigh near 33 ms then went over it every few frames - each a vsync late, 50
-        // ms: 17-20 fps at any quality where 0.2.6 held 30 (Mali-G925, #89; 0.2.9 brought the 33 ms budget)
+        if (render_busy > hint_busy) hint_busy = render_busy;
+        if (hint_busy < 1.0 && p > 16000000ull) hint_busy = p / 1e6;
         bool fixed30 = g_settings.fps_mode == 1 && AB("adpf30") != 1;
         uint64_t budget = g_settings.fps_mode == 3 ? 37500000ull  // (Frame rate 20: 20 fps's, three quarters)
+                          : (hint_busy > 22.0) ? 16666667ull      // (Under heavy load >22ms, request 60fps target to boost CPU to max MHz)
                           : (follow && pace_slow) || fixed30 ? 25000000ull : 16666667ull;
         static double budget30 = -1;  // (LARECOMP_ADPF30_MS=<ms>, a test: the 30 fps budget instead of 25 ms)
         if (budget30 < 0) budget30 = getenv("LARECOMP_ADPF30_MS") ? atof(getenv("LARECOMP_ADPF30_MS")) : 0;
         if (budget30 > 0 && budget == 25000000ull) budget = (uint64_t)(budget30 * 1e6);
         plat_frame_work_gpu((uint64_t)(hint_busy * 1e6), no_gpu ? 0 : gpu, budget, (uint64_t)(game_busy * 1e6));
     }
+    if (p > 100000000ull) return;  // (after ADPF is reported: skip pace_slow hysteresis on >100 ms hitches)
 #endif
 #ifdef __ANDROID__
     // Per world step: the game picks its present interval frame by frame (1: one step, 60 fps; 2: two steps, 30 fps),
@@ -897,6 +915,31 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     vk_collect_dead();
 }
 
+static bool list_had_fence;
+static uint32_t batch_lists;
+static uint64_t batch_start_draws;
+
+bool vk_has_pending_commands(void) {
+    Sub *s = &subs[cur_sub];
+    return s->main_begun || s->upload_begun;
+}
+
+void vk_flush_pending_work(void) {
+    if (!vk_has_pending_commands()) return;
+#ifdef __ANDROID__
+    game_pending = true;
+#endif
+    static int sync_submit = -1;
+    if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
+    if (sync_submit) renderer_flush();
+    else renderer_submit();
+#ifdef __ANDROID__
+    game_pending = false;
+#endif
+    batch_lists = 0;
+    batch_start_draws = stat_draws;
+}
+
 void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
 void renderer_flush(void) {
@@ -973,7 +1016,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 // 64 MB host-visible chunks (device-local when the GPU exposes resizable BAR); a chunk is reused once every
 // submission that allocated from it has completed, and given back after 10 s unused (down to RING_KEEP of them).
 #define CHUNK_SIZE (64ull << 20)
-#define RING_KEEP 4
+#define RING_KEEP 6
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
@@ -1961,7 +2004,9 @@ uint64_t vk_scene_frame(void) { return g_scene_frame; }
 static VkRect2D scissor_rect(void);
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
-    pipeline_dirty = true;
+    uint32_t prev_ncolor = pass_ncolor, prev_samples = pass_samples;
+    VkFormat prev_color[8], prev_depth = pass_depth, prev_stencil = pass_stencil;
+    memcpy(prev_color, pass_color, sizeof prev_color);
     vk_end_pass();
     if (st.rt.depth && st.rt.ncolor >= 3 && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
         g_scene_frame = renderer_present_count();
@@ -2018,10 +2063,12 @@ static void begin_pass(void) {
     }
     {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
         // targets the scaling rule takes and ones it does not; the unscaled ones got only part of the pass)
+        extern void vk_promote_scene_rt(NvnTexture *t);
         NvnTexture *all[9];
         int n = 0;
         for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) all[n++] = st.rt.color[i];
         if (st.rt.depth) all[n++] = st.rt.depth;
+        for (int i = 0; i < n; i++) vk_promote_scene_rt(all[i]);
         for (int i = 0; i < n; i++) {
             if (!renderer_texture_scalable(all[i])) continue;
             for (int k = 0; k < n; k++)
@@ -2126,6 +2173,10 @@ static void begin_pass(void) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
+    if (pass_ncolor != prev_ncolor || pass_samples != prev_samples || pass_depth != prev_depth ||
+        pass_stencil != prev_stencil || memcmp(pass_color, prev_color, sizeof pass_color) != 0) {
+        pipeline_dirty = true;
+    }
     // A pass that begins with clears of whole attachments (BOTW's G-buffer, its light buffers): their load operations
     // clear instead. Loaded and then cleared by vkCmdClearAttachments, a tiler read each attachment from memory into
     // every bin first, for nothing. Only the clears right at the start, one after another (the same scissor), each over
@@ -2514,6 +2565,7 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
 #endif
 typedef struct {
     ShaderInfo *vi, *fi;
+    uint64_t prog_hash;         // deterministic content hash of VS+FS bytecode and ShaderKeys (ASLR-independent)
     uint64_t code[2], cmax[2];  // guest addresses retained for translation and diagnostics
     size_t const_bytes[2];
     ShaderKey vkey, fkey;
@@ -2818,6 +2870,20 @@ static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, Shad
     p->const_bytes[1] = fnp->stages[1].const_offset ? fnp->stages[1].const_size : 0;
     p->vkey = *vkey;
     p->fkey = *fkey;
+    {
+        uint64_t ph = 0xcbf29ce484222325ull;
+        if (vcode >= GUEST_LO && vcode + 0x250 <= GUEST_HI)
+            ph = hash_words(ph, (const void *)(uintptr_t)(vcode + 0x50), 512);
+        else
+            ph = hash_words(ph, &vcode, sizeof vcode);
+        if (fcode >= GUEST_LO && fcode + 0x250 <= GUEST_HI)
+            ph = hash_words(ph, (const void *)(uintptr_t)(fcode + 0x50), 512);
+        else
+            ph = hash_words(ph, &fcode, sizeof fcode);
+        ph = hash_words(ph, vkey, sizeof *vkey);
+        ph = hash_words(ph, fkey, sizeof *fkey);
+        p->prog_hash = ph ? ph : 1;
+    }
     run_translate(translate_program, p);
     return p;
 }
@@ -3309,6 +3375,7 @@ typedef struct {
 #define NUM_STREAMS        18
 typedef struct {
     Prog *prog;
+    uint64_t prog_hash;
     VkFormat color[8], depth, stencil;
     uint32_t ncolor, samples;
     uint32_t attr_fmt[32], attr_off[32], attr_bind[32];
@@ -4967,7 +5034,8 @@ static int ga_nres;
 static VkBuffer ga_buf;
 static VmaAllocation ga_mem;
 static uint8_t *ga_ptr;
-static uint64_t ga_res_top, ga_head = GA_RES, ga_seg_seq[GA_SIZE / GA_SEG];
+static uint64_t ga_res_top, ga_head = GA_RES, ga_seg_seq[GA_SIZE / GA_SEG], ga_seg_gen[GA_SIZE / GA_SEG];
+int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
 static int gres_state = -1;
 static uint64_t stat_gres_res, stat_gres_sync;  // (resident ranges used, CPU-changed bytes uploaded)
 
@@ -5052,9 +5120,14 @@ static uint64_t ga_ring(uint64_t size) {
     if (ga_head / GA_SEG != (ga_head + size - 1) / GA_SEG || ga_head + size > GA_SIZE - 4096) {  // (the last 4 KB: GMISS)
         ga_head = (ga_head / GA_SEG + 1) * GA_SEG;
         if (ga_head >= GA_SIZE) ga_head = GA_RES;
-        uint64_t q = ga_seg_seq[ga_head / GA_SEG];
+        uint64_t seg = ga_head / GA_SEG;
+        ga_seg_gen[seg]++;
+        uint64_t q = ga_seg_seq[seg];
         if (q >= vk_pending_seq()) return ~0ull;
-        if (q) vk_wait_seq(q);  // (the segment's last readers done)
+        if (q) {
+            wait_why = "ga ring";
+            vk_wait_seq(q);  // (the segment's last readers done)
+        }
     }
     uint64_t off = ga_head;
     ga_head += size;
@@ -5250,21 +5323,38 @@ static void gres_learn(uint32_t off) {
 // Load-only arena copies are immutable until their submission retires. Compare against that exact copy;
 // no assumption that guest memory remains unchanged between draws.
 static uint64_t ga_load_copy(uint64_t at, uint64_t size) {
-    static struct { uint64_t at, size, off, seq, gen; bool valid; } cache[64];
+    static struct { uint64_t at, size, off, seg_gen, gen; uint32_t pt_gen; bool valid; } cache[256];
     static int reuse = -1;
     if (reuse < 0) { const char *e = getenv("LARECOMP_GCOPY_REUSE"); reuse = !e || atoi(e) != 0; }
     uint64_t seq = vk_pending_seq();
-    unsigned slot = (unsigned)((at >> 8) ^ (size >> 8)) & 63;
+    unsigned slot = (unsigned)((at >> 8) ^ (size >> 8) ^ (at >> 16)) & 255;
     const uint8_t *src = (const uint8_t *)(uintptr_t)(HEAP_BASE + at);
-    if (reuse && cache[slot].valid && cache[slot].seq == seq && cache[slot].gen == gcopy_gen &&
-        cache[slot].at == at && cache[slot].size == size && !memcmp(ga_ptr + cache[slot].off, src, size))
-        return cache[slot].off;
+    if (reuse && cache[slot].valid && cache[slot].gen == gcopy_gen &&
+        cache[slot].at == at && cache[slot].size == size) {
+        uint64_t seg = cache[slot].off / GA_SEG;
+        uint64_t cur_seg = ga_head / GA_SEG;
+        uint64_t next_seg = cur_seg + 1 >= GA_SIZE / GA_SEG ? GA_RES / GA_SEG : cur_seg + 1;
+        // Reuse across submissions if the segment hasn't wrapped and isn't the immediate next segment to be recycled
+        if (cache[slot].seg_gen == ga_seg_gen[seg] && seg != next_seg) {
+            uint32_t now_pt = 0;
+            int chg = vk_pages_changed(HEAP_BASE + at, size, cache[slot].pt_gen, &now_pt);
+            if (chg == 0 || !memcmp(ga_ptr + cache[slot].off, src, size)) {
+                if (now_pt) cache[slot].pt_gen = now_pt;
+                if (ga_seg_seq[seg] < seq) ga_seg_seq[seg] = seq;
+                return cache[slot].off;
+            }
+        }
+    }
     uint64_t off = ga_ring(size);
     if (off == ~0ull) return off;
     memcpy(ga_ptr + off, src, size);
     ga_wrote(off, size);
+    uint64_t seg = off / GA_SEG;
+    uint32_t now_pt = 0;
+    (void)vk_pages_changed(HEAP_BASE + at, size, 0, &now_pt);
     cache[slot].at = at; cache[slot].size = size; cache[slot].off = off;
-    cache[slot].seq = seq; cache[slot].gen = gcopy_gen; cache[slot].valid = true;
+    cache[slot].seg_gen = ga_seg_gen[seg]; cache[slot].gen = gcopy_gen;
+    cache[slot].pt_gen = now_pt; cache[slot].valid = true;
     return off;
 }
 
@@ -5428,6 +5518,7 @@ static void gres_reset(void) {
     ga_ndirty = 0;
     gl_n = 0;
     memset(ga_seg_seq, 0, sizeof ga_seg_seq);
+    memset(ga_seg_gen, 0, sizeof ga_seg_gen);
 }
 
 // The storage buffers of the stages in stage_mask (bit = st.sbuf index) into the ring; store: copied back later.
@@ -5647,7 +5738,7 @@ static void vc_free_dead(bool all) {
 }
 
 static bool vc_drop(VcEnt *e) {  // (freed once the submissions that may read it are done)
-    if (vc_ndead == VC_DEAD) { vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
+    if (vc_ndead == VC_DEAD) { wait_why = "vcache drop"; vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
     if (vc_ndead == VC_DEAD) return false;  // (all read by the pending submission: keep it)
     vc_dead[vc_ndead].b = e->buf; vc_dead[vc_ndead].m = e->mem; vc_dead[vc_ndead++].seq = e->used_seq;
     vc_bytes -= e->hi - e->lo;
@@ -6940,10 +7031,12 @@ static void draw_(CmdRec *r, bool indexed) {
                last_pipeline->k.prog == pr && last_pipeline->k.topo_class == cls && last_pipeline->k.prim_restart == pre_key &&
                (g_vk.eds || !memcmp(&last_pipeline->k.fx, &fx, sizeof fx));
     Pipe *pp = hit ? last_pipeline : NULL;
+    if (hit) atomic_fetch_add(&g_precompute_stats.cache_hits, 1);
     if (!hit || verify) {
         PipeKey k;
         memset(&k, 0, sizeof k);
         k.prog = pr;
+        k.prog_hash = pr->prog_hash;
         k.prim_restart = pre_key;
         k.fx = fx;
         k.ncolor = pass_ncolor;
@@ -7053,12 +7146,17 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t ph;
         if (last_ph && !memcmp(&k, &last_k, sizeof k)) ph = last_ph;
         else {
-            ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+            // Hash starting at prog_hash (skipping host pointer Prog *prog) so ph is 100% deterministic across ASLR
+            ph = hash_words(0xcbf29ce484222325ull,
+                            (const uint8_t *)&k + offsetof(PipeKey, prog_hash),
+                            sizeof(k) - offsetof(PipeKey, prog_hash));
             if (!ph) ph = 1;
             last_k = k, last_ph = ph;
         }
 #else
-        uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        uint64_t ph = hash_words(0xcbf29ce484222325ull,
+                                 (const uint8_t *)&k + offsetof(PipeKey, prog_hash),
+                                 sizeof(k) - offsetof(PipeKey, prog_hash));
         if (!ph) ph = 1;
 #endif
         uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
@@ -7072,6 +7170,8 @@ static void draw_(CmdRec *r, bool indexed) {
             pipe_tab[pslot].key = ph;
             pipe_tab[pslot].pipe = pp;
             run_job(build_pipeline, pp);
+        } else if (!hit) {
+            atomic_fetch_add(&g_precompute_stats.cache_hits, 1);
         }
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
         if (hit && memcmp(&k, &last_pipeline->k, sizeof k)) {
@@ -9016,6 +9116,7 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_BARRIER: snapshots_flush_fb_dirty("barrier"); break;
         case CMD_FENCE_SYNC: {
+            list_had_fence = true;
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
@@ -9125,22 +9226,51 @@ static void exec_list(uint64_t handle, int depth) {
 }
 
 #ifdef __ANDROID__
-// LARECOMP_VK_ASYNC=1: queued for the render thread (vulkan/async.c), which runs vk_execute_now
+// LARECOMP_VK_ASYNC=1: queued for the render thread (vulkan/async.c), which runs vk_execute_list_batch
 bool vk_async_on(void);
 void vk_async_execute(uint64_t handle);
 void vk_execute_now(uint64_t handle);
+void vk_execute_list_batch(uint64_t handle, bool force_submit);
 void backend_execute(uint64_t handle) {
     if (vk_async_on()) vk_async_execute(handle);
     else vk_execute_now(handle);
 }
+void vk_execute_list_batch(uint64_t handle, bool force_submit) {
+    PROF_T0();
+    game_pending = true;  // (renderer_fence_seq)
+    if (batch_lists == 0) batch_start_draws = stat_draws;
+    list_had_fence = false;
+    static int log_lists = -1;
+    if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
+    uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
+    exec_list(handle, 0);
+    batch_lists++;
+    if (log_lists && renderer_present_count() % 120 == 0)
+        LOG("[lists] frame %llu: list %llx %llu draws %llu passes %.2f ms\n", (unsigned long long)renderer_present_count(),
+            (unsigned long long)handle, (unsigned long long)(stat_draws - ll_d), (unsigned long long)(stat_passes - ll_p),
+            (plat_now_ns() - ll_t) / 1e6);
+    PROF_ADD(prof_exec);
+    if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
+    static int no_batch = -1;
+    if (no_batch < 0) no_batch = getenv("LARECOMP_VK_NO_BATCH") != NULL;
+    static int sync_submit = -1;
+    if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
+    bool should_submit = no_batch || sync_submit || force_submit || list_had_fence ||
+                         (stat_draws - batch_start_draws >= 64) || (batch_lists >= 16);
+    if (should_submit) {
+        if (sync_submit) renderer_flush();
+        else renderer_submit();
+        batch_lists = 0;
+        batch_start_draws = stat_draws;
+    }
+    game_pending = false;
+}
 void vk_execute_now(uint64_t handle) {
+    vk_execute_list_batch(handle, true);
+}
 #else
 void backend_execute(uint64_t handle) {
-#endif
     PROF_T0();
-#ifdef __ANDROID__
-    game_pending = true;  // (renderer_fence_seq)
-#endif
     static int log_lists = -1;  // LARECOMP_LOG_LISTS=1: the command lists of one frame in 120 (draws, passes, time)
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
     uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
@@ -9155,7 +9285,5 @@ void backend_execute(uint64_t handle) {
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     if (sync_submit) renderer_flush();
     else renderer_submit();
-#ifdef __ANDROID__
-    game_pending = false;
-#endif
 }
+#endif

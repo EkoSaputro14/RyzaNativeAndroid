@@ -25,6 +25,7 @@ typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
+    float render_scale;  // Explicit internal 3D scene resolution scale factor (e.g. 0.65 .. 0.75 on Adreno 6xx; 0 = auto)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int out_lines;       // Output resolution: the final image (scene + HUD) at most this many lines, scaled up to the
                          // screen at the end (0: the screen's own; 1080 / 900 / 720; OUT_AUTO: 1080 on taller

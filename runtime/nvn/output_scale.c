@@ -23,7 +23,11 @@
 #define SCENE_LINES 900.0  // (BOTW's docked 3D scene: 1600x900)
 
 // Dynamic resolution: a factor on the Match display scale, 0.5 .. 1 in 0.05 steps.
+#ifdef __ANDROID__
+static double g_dyn = 0.68;
+#else
 static double g_dyn = 1.0;
+#endif
 static double g_dyn_gpu_sum, g_dyn_dt_sum, g_last_t;
 static int g_dyn_n, g_dyn_gpu_n, g_dyn_good;
 static double g_dyn_cool_until, g_dyn_probe_wait = 5.0, g_dyn_probe_at;
@@ -121,8 +125,14 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         if (mode != RES_MATCH) hs = fmin(base * share, hs);
     }
 #ifdef __ANDROID__
-    // Mobile GPU optimization: cap default 1x mode to 720p (720/900 = 0.8), but respect explicit 50%/75%/100%/forced settings
-    if (mode == 1 && forced <= 0 && hs > (720.0 / SCENE_LINES)) hs = 720.0 / SCENE_LINES;
+    // Mobile GPU optimization (Adreno 618 / 720p targets): scale default 1x mode by render_scale (default 0.68x -> ~870x490)
+    // to reduce fragment shader fillrate & ALU pressure by >50%, while respecting explicit 50%/75%/100%/forced settings.
+    if (mode == 1 && forced <= 0) {
+        double target_rs = (g_settings.render_scale >= 0.25f && g_settings.render_scale <= 2.0f)
+                               ? (double)g_settings.render_scale
+                               : 0.68;
+        if (hs > target_rs) hs = target_rs;
+    }
 #endif
     hs = fmax(hs, 0.1);
     o->scene_sx = hs * shape; o->scene_sy = hs;
