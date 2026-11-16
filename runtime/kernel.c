@@ -111,11 +111,18 @@ static bool kwait(int64_t timeout_ns, const struct timespec *ts) {
             if (t_cur && t_cur->wait_kind == WAIT_NONE) break;
             waited_sec += 3;
             if (t_cur) {
-                LOG("[kernel-wait] thread t%llu (entry %llx, lr %llx) waiting (%ds)...\n",
-                    (unsigned long long)t_cur->id,
-                    (unsigned long long)t_cur->entry,
-                    (unsigned long long)t_cur->cpu.x[30],
-                    waited_sec);
+                WaitKind wk = t_cur->wait_kind;
+                const char *kname = wk == WAIT_MUTEX ? "mutex" : wk == WAIT_CONDVAR ? "condvar"
+                                  : wk == WAIT_ARBITER ? "arbiter" : "sync";
+                bool idle_queue = (wk == WAIT_CONDVAR || wk == WAIT_ARBITER) && !t_cur->in_sync_wait;
+                bool log_all = getenv("LARECOMP_LOG_KWAIT_ALL") != NULL;
+                if (log_all || !idle_queue || waited_sec == 3 || waited_sec % 30 == 0) {
+                    LOG("[kernel-wait] thread t%llu (entry %llx, lr %llx, kind=%s addr=%llx) waiting (%ds)...\n",
+                        (unsigned long long)t_cur->id,
+                        (unsigned long long)t_cur->entry,
+                        (unsigned long long)t_cur->cpu.x[30],
+                        kname, (unsigned long long)t_cur->wait_addr, waited_sec);
+                }
             }
             if (t_cur && t_cur->cancel) { r = false; break; }
             if (g_rt_unwind) { r = false; break; }
@@ -488,6 +495,22 @@ void kernel_run_main(KThread *t, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t
 uint32_t kernel_current_thread_handle(void) { return t_cur ? t_cur->handle : 0; }
 Cpu *kernel_current_cpu(void) { return t_cur ? &t_cur->cpu : NULL; }
 KThread *kernel_current_thread(void) { return t_cur; }
+
+void kernel_collect_dispatch_stats(uint64_t *disp, uint64_t *hits, uint64_t *misses, uint64_t *recomp_calls) {
+    uint64_t d = 0, h = 0, m = 0, r = 0;
+    pthread_mutex_lock(&g_klock);
+    for (KThread *t = g_threads; t; t = t->anext) {
+        d += __atomic_load_n(&t->stat_dispatches, __ATOMIC_RELAXED);
+        h += __atomic_load_n(&t->stat_dcache_hits, __ATOMIC_RELAXED);
+        m += __atomic_load_n(&t->stat_dcache_misses, __ATOMIC_RELAXED);
+        r += __atomic_load_n(&t->stat_recomp_calls, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&g_klock);
+    if (disp) *disp = d;
+    if (hits) *hits = h;
+    if (misses) *misses = m;
+    if (recomp_calls) *recomp_calls = r;
+}
 
 // ------------------------------------------------------------------ mutex / condvar (Horizon semantics)
 // Mutex word: owner handle | WAITERS_BIT. Waiting threads sleep on the global cond and are handed ownership.

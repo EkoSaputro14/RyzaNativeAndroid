@@ -69,7 +69,17 @@ uint64_t prof_up_cum;  // (the same, never reset)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static _Atomic int stat_compiles_pending;
+static _Atomic uint64_t cum_compiles;
+static _Atomic uint64_t s_game_busy_ns_acc, s_game_busy_max_ns, s_game_busy_frames;
+static _Atomic uint64_t s_sync_wait_ns_acc, s_sync_wait_count;
+static uint64_t stat_wait_game_ns;
 static _Atomic bool s_pcache_dirty;
+
+void vk_record_nvn_sync_wait(uint64_t ns) {
+    atomic_fetch_add(&s_sync_wait_ns_acc, ns);
+    atomic_fetch_add(&s_sync_wait_count, 1);
+}
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -356,6 +366,17 @@ void vk_pace_frame(void) {
     extern uint64_t vk_async_frame_work_ns(void);
     double render_busy = vk_async_on() ? vk_async_frame_work_ns() / 1e6 : 0;
     double game_busy = busy;
+    uint64_t game_busy_ns = (uint64_t)(game_busy * 1e6);
+    atomic_fetch_add(&s_game_busy_ns_acc, game_busy_ns);
+    atomic_fetch_add(&s_game_busy_frames, 1);
+    uint64_t prev_max = atomic_load(&s_game_busy_max_ns);
+    while (game_busy_ns > prev_max && !atomic_compare_exchange_weak(&s_game_busy_max_ns, &prev_max, game_busy_ns)) {}
+    {
+        extern int g_exec_mode;
+        extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
+        __atomic_fetch_add(g_exec_mode == EXEC_NATIVE ? &g_bench_native_ns : &g_bench_recomp_ns,
+                           game_busy_ns, __ATOMIC_RELAXED);
+    }
     if (render_busy > busy) busy = render_busy;
 #endif
 #ifdef __ANDROID__
@@ -1287,10 +1308,24 @@ static void run_job(void (*fn)(void *), void *arg) {
 // empty: no ground on the plateau). Draws into arrays, cubemaps, 3D textures and mipmapped targets wait for their
 // shader and pipeline instead (LARECOMP_WAIT_PERSISTENT=0: skip them like the rest).
 static uint64_t stat_build_wait_ns;
+static pthread_mutex_t build_done_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t build_done_cond = PTHREAD_COND_INITIALIZER;
+
+static void build_mark_done(_Atomic int *state, int val) {
+    pthread_mutex_lock(&build_done_lock);
+    atomic_store(state, val);
+    int prev = atomic_fetch_sub(&stat_compiles_pending, 1);
+    if (prev <= 0) atomic_fetch_add(&stat_compiles_pending, 1);
+    pthread_cond_broadcast(&build_done_cond);
+    pthread_mutex_unlock(&build_done_lock);
+}
+
 static void wait_built(_Atomic int *state) {
     if (atomic_load(state)) return;
     uint64_t t0 = plat_now_ns();
-    while (!atomic_load(state)) usleep(200);
+    pthread_mutex_lock(&build_done_lock);
+    while (!atomic_load(state)) pthread_cond_wait(&build_done_cond, &build_done_lock);
+    pthread_mutex_unlock(&build_done_lock);
     stat_build_wait_ns += plat_now_ns() - t0;
 }
 static bool rt_is_persistent(NvnTexture *t) {
@@ -1384,8 +1419,15 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // (LARECOMP_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
-    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs;
+    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles;
     uint64_t now = SDL_GetTicksNS();
+#ifdef __ANDROID__
+    extern uint64_t vk_async_take_idle_ns(void);
+    uint64_t wait_game_ns = vk_async_take_idle_ns();
+    stat_wait_game_ns += wait_game_ns;
+#else
+    uint64_t wait_game_ns = 0;
+#endif
     s_iv_frames++;
     if (last_t) {
         uint64_t ex = cum_exec - l_exec;
@@ -1399,24 +1441,29 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
         precompute_tick();
         static uint64_t s_last_pcache_save_ns;
         if (atomic_load(&s_pcache_dirty) && (!s_last_pcache_save_ns || now - s_last_pcache_save_ns >= 15000000000ull)) {
-            extern void vk_pipeline_cache_save(void);
+            extern void vk_pipeline_cache_save_async(void);
             atomic_store(&s_pcache_dirty, false);
             s_last_pcache_save_ns = now;
-            vk_pipeline_cache_save();
+            vk_pipeline_cache_save_async();
         }
     }
+    uint64_t cur_compiles = atomic_load(&cum_compiles);
     if (!prof) {
-        last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
+        last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits; l_compiles = cur_compiles;
         return;
     }
     if (last_t && now - last_t > 50000000) {
         uint64_t dt = now - last_t, ex = cum_exec - l_exec, wt = cum_wait - l_wait;
-        LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + other %.1f; %llu draws, "
-            "%llu submits, compiles %d pending\n", (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
-            ((double)dt - ex - present_ns) / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
-            atomic_load(&stat_compiles));
+        double other_total = ((double)dt - ex - present_ns);
+        if (other_total < 0) other_total = 0;
+        double wg = (double)wait_game_ns < other_total ? (double)wait_game_ns : other_total;
+        double untracked = other_total - wg;
+        LOG("[hitch] frame %llu: %.0f ms = backend exec %.1f (of which GPU waits %.1f) + present %.1f + wait_game %.1f + other %.1f; %llu draws, "
+            "%llu submits, compiles +%llu done (%d pending)\n", (unsigned long long)frame, dt / 1e6, ex / 1e6, wt / 1e6, present_ns / 1e6,
+            wg / 1e6, untracked / 1e6, (unsigned long long)(cum_draws - l_draws), (unsigned long long)(cum_submits - l_subs),
+            (unsigned long long)(cur_compiles - l_compiles), atomic_load(&stat_compiles_pending));
     }
-    last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
+    last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits; l_compiles = cur_compiles;
 }
 
 static double s_last_cpu_exec_ms, s_last_gpu_ms;
@@ -1503,6 +1550,20 @@ const char *renderer_stats(void) {
         }
         memset(wait_tab, 0, sizeof wait_tab);
         pthread_mutex_unlock(&wait_tab_lock);
+        {
+            uint64_t gframes = atomic_exchange(&s_game_busy_frames, 0);
+            uint64_t gns = atomic_exchange(&s_game_busy_ns_acc, 0);
+            uint64_t gmax = atomic_exchange(&s_game_busy_max_ns, 0);
+            uint64_t sw_ns = atomic_exchange(&s_sync_wait_ns_acc, 0);
+            uint64_t sw_n = atomic_exchange(&s_sync_wait_count, 0);
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n,
+                     " | game avg %.1f max %.1f ms, nvnSync %.1f ms (%llu), wait_game %.0f ms, pending %d",
+                     gframes ? (gns / 1e6) / (double)gframes : 0.0, gmax / 1e6,
+                     sw_ns / 1e6, (unsigned long long)sw_n, stat_wait_game_ns / 1e6,
+                     atomic_load(&stat_compiles_pending));
+            stat_wait_game_ns = 0;
+        }
         prof_views_created = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
         uint64_t nf = s_iv_frames ? s_iv_frames : 1;
@@ -2648,7 +2709,7 @@ static void compile_program(void *arg) {
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
+    if (!sv || !sf) { free(sv); free(sf); build_mark_done(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -2659,7 +2720,7 @@ static void compile_program(void *arg) {
         if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
         if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
         p->vs = p->fs = VK_NULL_HANDLE;
-        atomic_store(&p->state, 2);
+        build_mark_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -2689,7 +2750,8 @@ static void compile_program(void *arg) {
             atomic_fetch_add(&g_precompute_stats.gameplay_shaders_compiled, 1);
     }
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+    atomic_fetch_add(&cum_compiles, 1);
+    build_mark_done(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
 #ifdef __ANDROID__
@@ -2756,12 +2818,12 @@ static void translate_program(void *arg) {
     pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
-        atomic_store(&p->state, 2);
+        build_mark_done(&p->state, 2);
         return;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
-        atomic_store(&p->state, 2);
+        build_mark_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -2887,6 +2949,7 @@ static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, Shad
         ph = hash_words(ph, fkey, sizeof *fkey);
         p->prog_hash = ph ? ph : 1;
     }
+    atomic_fetch_add(&stat_compiles_pending, 1);
     run_translate(translate_program, p);
     return p;
 }
@@ -3532,6 +3595,7 @@ static void build_pipeline(void *arg) {
     }
 #endif
     atomic_fetch_add(&stat_compiles, 1);
+    atomic_fetch_add(&cum_compiles, 1);
     if (r == VK_SUCCESS) {
         precompute_record_pipeline_hash(pp->hash);
         atomic_store(&s_pcache_dirty, true);
@@ -3540,7 +3604,7 @@ static void build_pipeline(void *arg) {
         if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
                           (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     }
-    atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+    build_mark_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -6280,7 +6344,7 @@ static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
-    if (!spv) { atomic_store(&cp->p.state, 2); return; }
+    if (!spv) { build_mark_done(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
@@ -6293,7 +6357,8 @@ static void build_compute(void *arg) {
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
     atomic_fetch_add(&stat_compiles, 1);
-    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
+    atomic_fetch_add(&cum_compiles, 1);
+    build_mark_done(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS || getenv("LARECOMP_LOG_CS_PIPELINES"))
         LOG("[compute] pipeline %llx: result %d, local %ux%ux%u, %zu SPIR-V words, %d bindings\n",
             (unsigned long long)cp->code_addr, r, cp->local[0], cp->local[1], cp->local[2], n, cp->p.nbinds);
@@ -6357,6 +6422,7 @@ static CsProg *compute_program(NvnProgram *np) {
         if (!cp->local[i]) cp->local[i] = 1;
     }
     save_glsl(cp->si->msl, ss->code_addr, "cs");
+    atomic_fetch_add(&stat_compiles_pending, 1);
     run_job(build_compute, cp);
     return cp;
 }
@@ -7172,6 +7238,7 @@ static void draw_(CmdRec *r, bool indexed) {
             (void)precompute_has_pipeline_cached(ph);
             pipe_tab[pslot].key = ph;
             pipe_tab[pslot].pipe = pp;
+            atomic_fetch_add(&stat_compiles_pending, 1);
             run_job(build_pipeline, pp);
         } else if (!hit) {
             atomic_fetch_add(&g_precompute_stats.cache_hits, 1);

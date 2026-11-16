@@ -52,6 +52,7 @@ struct KThread {
     bool core0_evicted;    // atomic request to reconcile core ownership at the next guest safe point
     KThread *core0_next;   // core-0 runnable queue (c0_m)
 #endif
+    uint64_t stat_dispatches, stat_dcache_hits, stat_dcache_misses, stat_recomp_calls;
 };
 
 typedef struct KSharedMem {

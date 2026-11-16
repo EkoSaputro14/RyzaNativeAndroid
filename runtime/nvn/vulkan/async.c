@@ -44,8 +44,10 @@ static int ahead = 1;
 
 // The render thread's work for its last frame (requests run between two presents, ns): the frame pacer's other half
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;
+static uint64_t frame_idle_ns;
 uint64_t vk_async_frame_work_ns(void) { return __atomic_load_n(&last_frame_work, __ATOMIC_RELAXED); }
 uint64_t vk_async_frame_cpu_ns(void) { return __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED); }
+uint64_t vk_async_take_idle_ns(void) { return __atomic_exchange_n(&frame_idle_ns, 0, __ATOMIC_RELAXED); }
 
 void kernel_blocking_begin(void);        // kernel.c: core 0 to the game's other threads while a guest thread waits here
 void kernel_blocking_end(void);
@@ -94,13 +96,18 @@ static void *render_main(void *arg) {
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_nsec += 1500000;  // 1.5 ms batch coalescing window before auto-flushing open command buffer
                 if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
-                if (pthread_cond_timedwait(&q_more, &q_lock, &ts) != 0 && q_head == q_tail) {
+                uint64_t w0 = plat_now_ns();
+                int wr = pthread_cond_timedwait(&q_more, &q_lock, &ts);
+                __atomic_fetch_add(&frame_idle_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
+                if (wr != 0 && q_head == q_tail) {
                     pthread_mutex_unlock(&q_lock);
                     vk_flush_pending_work();
                     pthread_mutex_lock(&q_lock);
                 }
             } else {
+                uint64_t w0 = plat_now_ns();
                 pthread_cond_wait(&q_more, &q_lock);
+                __atomic_fetch_add(&frame_idle_ns, plat_now_ns() - w0, __ATOMIC_RELAXED);
             }
         }
         Req r = q[q_head % QN];

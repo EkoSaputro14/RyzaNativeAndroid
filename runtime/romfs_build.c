@@ -654,7 +654,7 @@ struct RomfsVirtual {
     Tables t;
     uint8_t *head, *tail;  // [0, DATA_START) and the tables, [hv[1], size)
     uint64_t size;
-    struct { int file, fd; uint64_t used; } fds[VFD_SLOTS];  // (the files open lately)
+    struct { int file, fd, readers; uint64_t used; } fds[VFD_SLOTS];  // (the files open lately)
     uint64_t clock;
     pthread_mutex_t lock;  // (reads from several threads: the open files are shared)
 };
@@ -698,25 +698,56 @@ void romfs_virtual_close(RomfsVirtual *v) {
     free(v->head), free(v->tail), free(v);
 }
 
-static int virtual_fd(RomfsVirtual *v, int file) {
-    int lru = 0;
+static int virtual_acquire_fd(RomfsVirtual *v, int file, int *slot_out) {
+    pthread_mutex_lock(&v->lock);
+    int lru = -1;
     for (int i = 0; i < VFD_SLOTS; i++) {
-        if (v->fds[i].file == file) { v->fds[i].used = ++v->clock; return v->fds[i].fd; }
-        if (v->fds[i].used < v->fds[lru].used) lru = i;
+        if (v->fds[i].file == file && v->fds[i].fd >= 0) {
+            v->fds[i].used = ++v->clock;
+            v->fds[i].readers++;
+            *slot_out = i;
+            int fd = v->fds[i].fd;
+            pthread_mutex_unlock(&v->lock);
+            return fd;
+        }
+        if (v->fds[i].readers == 0 && (lru < 0 || v->fds[i].used < v->fds[lru].used)) lru = i;
     }
-    if (v->fds[lru].fd >= 0) close(v->fds[lru].fd);
-    v->fds[lru].file = file;
-    v->fds[lru].fd = open(v->t.l.files[file]->path, O_RDONLY);
-    v->fds[lru].used = ++v->clock;
-    return v->fds[lru].fd;
+    if (lru >= 0) {
+        if (v->fds[lru].fd >= 0) close(v->fds[lru].fd);
+        v->fds[lru].file = file;
+        v->fds[lru].fd = open(v->t.l.files[file]->path, O_RDONLY);
+        v->fds[lru].used = ++v->clock;
+        if (v->fds[lru].fd >= 0) {
+            v->fds[lru].readers = 1;
+            *slot_out = lru;
+            int fd = v->fds[lru].fd;
+            pthread_mutex_unlock(&v->lock);
+            return fd;
+        }
+        v->fds[lru].file = -1;
+        pthread_mutex_unlock(&v->lock);
+        *slot_out = -1;
+        return -1;
+    }
+    const char *path = v->t.l.files[file]->path;
+    pthread_mutex_unlock(&v->lock);
+    *slot_out = -1;
+    return open(path, O_RDONLY);
+}
+
+static void virtual_release_fd(RomfsVirtual *v, int slot, int fd) {
+    if (slot >= 0) {
+        pthread_mutex_lock(&v->lock);
+        if (v->fds[slot].readers > 0) v->fds[slot].readers--;
+        pthread_mutex_unlock(&v->lock);
+    } else if (fd >= 0) {
+        close(fd);
+    }
 }
 
 static int64_t virtual_read(RomfsVirtual *v, void *dst, uint64_t n, uint64_t off);
 int64_t romfs_virtual_read(RomfsVirtual *v, void *dst, uint64_t n, uint64_t off) {
-    pthread_mutex_lock(&v->lock);
-    int64_t r = virtual_read(v, dst, n, off);
-    pthread_mutex_unlock(&v->lock);
-    return r;
+    return virtual_read(v, dst, n, off);
 }
 
 static int64_t virtual_read(RomfsVirtual *v, void *dst, uint64_t n, uint64_t off) {
@@ -754,8 +785,10 @@ static int64_t virtual_read(RomfsVirtual *v, void *dst, uint64_t n, uint64_t off
             continue;
         }
         uint64_t in = rel - f->data_off, k = f->size - in < left ? f->size - in : left;
-        int fd = virtual_fd(v, at);
+        int slot = -1;
+        int fd = virtual_acquire_fd(v, at, &slot);
         ssize_t r = fd >= 0 ? pread(fd, d + done, k, (off_t)in) : -1;
+        virtual_release_fd(v, slot, fd);
         if (r <= 0) return -1;
         done += (uint64_t)r;
     }

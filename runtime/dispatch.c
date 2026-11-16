@@ -376,7 +376,9 @@ static void dispatch_fallback_nop(Cpu *c) {
 
 #ifdef __ANDROID__
 __attribute__((noinline)) static void dispatch_miss(Cpu *c) {
-    g_forensic_dcache_misses++;
+    KThread *t = c->thread;
+    if (t) t->stat_dcache_misses++;
+    else __atomic_fetch_add(&g_forensic_dcache_misses, 1, __ATOMIC_RELAXED);
     GuestFn f = dispatch_slow(c);
     __attribute__((musttail)) return f(c);
 }
@@ -394,8 +396,8 @@ __attribute__((visibility("default"))) void rt_dispatch(Cpu *c) {
     const DcEnt *dc;
     if (__builtin_expect(t && (dc = t->dcache) && dc[h].addr == c->pc, 1)) {
         if (__builtin_expect((h & 0x3F) == 0, 0)) {
-            g_forensic_dispatches += 64;
-            g_forensic_dcache_hits += 64;
+            t->stat_dispatches += 64;
+            t->stat_dcache_hits += 64;
         }
         GuestFn f = dc[h].fn;
         __attribute__((musttail)) return f(c);
@@ -430,7 +432,9 @@ void guest_call(Cpu *c, uint64_t addr) {
         c->pc = addr;
         rt_dispatch(c);
         c->x[30] = lr;
-        g_bench_recomp_calls++;
+        KThread *kt = c->thread;
+        if (kt) kt->stat_recomp_calls++;
+        else __atomic_fetch_add(&g_bench_recomp_calls, 1, __ATOMIC_RELAXED);
         return;
     }
 

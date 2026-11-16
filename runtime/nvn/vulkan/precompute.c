@@ -85,31 +85,81 @@ static void load_manifest(void) {
     fclose(f);
 }
 
-static void save_manifest(void) {
+static pthread_mutex_t s_manifest_io_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_manifest_io_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic bool s_manifest_writer_started = false;
+static bool s_manifest_io_pending = false;
+
+static void write_manifest_snapshot(uint32_t count, const uint64_t *hashes) {
+    if (count == 0 || !hashes) return;
     const char *cdir = get_cache_dir();
     mkdir_p(cdir);
 
     char tmp_path[512];
     snprintf(tmp_path, sizeof(tmp_path), "%s/pipe_manifest.bin.tmp", cdir);
 
-    pthread_mutex_lock(&s_manifest_lock);
-    if (s_manifest_count == 0) {
-        pthread_mutex_unlock(&s_manifest_lock);
-        return;
-    }
-
+    pthread_mutex_lock(&s_manifest_io_lock);
     FILE *f = fopen(tmp_path, "wb");
     if (f) {
-        uint32_t hdr[2] = {MANIFEST_MAGIC, s_manifest_count};
-        fwrite(hdr, sizeof(uint32_t), 2, f);
-        fwrite(s_manifest_hashes, sizeof(uint64_t), s_manifest_count, f);
-        fclose(f);
-        remove(get_manifest_path());
-        rename(tmp_path, get_manifest_path());
+        uint32_t hdr[2] = {MANIFEST_MAGIC, count};
+        bool ok = fwrite(hdr, sizeof(uint32_t), 2, f) == 2 &&
+                  fwrite(hashes, sizeof(uint64_t), count, f) == count;
+        if (fclose(f) != 0) ok = false;
+        if (ok) {
+            remove(get_manifest_path());
+            rename(tmp_path, get_manifest_path());
+        } else {
+            remove(tmp_path);
+        }
+    }
+    pthread_mutex_unlock(&s_manifest_io_lock);
+}
+
+static void save_manifest(void) {
+    uint32_t count = 0;
+    uint64_t *snap = NULL;
+    pthread_mutex_lock(&s_manifest_lock);
+    if (s_manifest_count > 0) {
+        count = s_manifest_count;
+        snap = malloc((size_t)count * sizeof(uint64_t));
+        if (snap) memcpy(snap, s_manifest_hashes, (size_t)count * sizeof(uint64_t));
         atomic_store(&s_manifest_dirty, false);
         atomic_store(&s_last_manifest_save_ns, get_time_ns());
     }
     pthread_mutex_unlock(&s_manifest_lock);
+    if (snap) {
+        write_manifest_snapshot(count, snap);
+        free(snap);
+    }
+}
+
+static void *manifest_writer_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&s_manifest_io_lock);
+        while (!s_manifest_io_pending) pthread_cond_wait(&s_manifest_io_cond, &s_manifest_io_lock);
+        s_manifest_io_pending = false;
+        pthread_mutex_unlock(&s_manifest_io_lock);
+        save_manifest();
+    }
+    return NULL;
+}
+
+static void save_manifest_async(void) {
+    if (!atomic_exchange(&s_manifest_writer_started, true)) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, manifest_writer_thread, NULL) == 0) pthread_detach(th);
+        else atomic_store(&s_manifest_writer_started, false);
+    }
+    if (atomic_load(&s_manifest_writer_started)) {
+        atomic_store(&s_last_manifest_save_ns, get_time_ns());
+        pthread_mutex_lock(&s_manifest_io_lock);
+        s_manifest_io_pending = true;
+        pthread_cond_signal(&s_manifest_io_cond);
+        pthread_mutex_unlock(&s_manifest_io_lock);
+    } else {
+        save_manifest();
+    }
 }
 
 void precompute_init(void) {
@@ -153,7 +203,7 @@ void precompute_tick(void) {
     uint64_t now = get_time_ns();
     uint64_t last = atomic_load(&s_last_manifest_save_ns);
     if (last && now - last < 3000000000ull) return;
-    save_manifest();
+    save_manifest_async();
 }
 
 void precompute_register_program(void *nvn_program) {

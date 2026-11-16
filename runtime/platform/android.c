@@ -48,17 +48,28 @@ static char g_early[64 << 10];
 static size_t g_early_n;
 
 static void log_file_line(const char *line) {
-    struct timespec ts;
+    struct timespec ts, mono;
     clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    uint64_t now_ns = (uint64_t)mono.tv_sec * 1000000000ull + (uint64_t)mono.tv_nsec;
     struct tm tm;
     localtime_r(&ts.tv_sec, &tm);
     char stamp[24];
     int sn = snprintf(stamp, sizeof stamp, "%02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
     size_t ln = strlen(line);
+    bool urgent = strstr(line, "FATAL") != NULL || strstr(line, "SIGSEGV") != NULL ||
+                  strstr(line, "[watchdog]") != NULL || strstr(line, "[android]") != NULL;
+    static uint64_t last_flush_ns;
+    static uint32_t unbuffered_lines;
     pthread_mutex_lock(&g_logf_lock);
     if (g_logf) {
         fprintf(g_logf, "%s%s\n", stamp, line);
-        fflush(g_logf);
+        unbuffered_lines++;
+        if (urgent || unbuffered_lines >= 32 || !last_flush_ns || now_ns - last_flush_ns >= 50000000ull) {
+            fflush(g_logf);
+            unbuffered_lines = 0;
+            last_flush_ns = now_ns;
+        }
     } else if (!g_folder_started && !g_root_started && g_early_n + (size_t)sn + ln + 1 <= sizeof g_early) {
         memcpy(g_early + g_early_n, stamp, (size_t)sn);
         memcpy(g_early + g_early_n + sn, line, ln);
@@ -1032,6 +1043,7 @@ static bool g_pinned;
 // SELinux, the cgroup's uclamp.max) goes to the log once.
 static void uclamp_min_thread(void) {
     static atomic_bool unsupported;
+    static atomic_int accepted_want;
     if (atomic_load(&unsupported)) return;
     static int want = -1;
     if (want < 0) {
@@ -1040,21 +1052,41 @@ static void uclamp_min_thread(void) {
         want = e ? (atoi(e) > 1024 ? 1024 : (atoi(e) < 0 ? 0 : atoi(e))) : 563;
     }
     if (!want) return;
-    struct {
-        uint32_t size, policy;
-        uint64_t flags;
-        int32_t nice;
-        uint32_t priority;
-        uint64_t runtime, deadline, period;
-        uint32_t util_min, util_max;
-    } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)want};  // (KEEP_POLICY | KEEP_PARAMS |
-                                                                                    //  UTIL_CLAMP_MIN; struct ver. 1)
-    long r = syscall(__NR_sched_setattr, 0, &attr, 0);
+    int cached = atomic_load(&accepted_want);
+    int tries[4] = {cached > 0 ? cached : want, 512, 384, 256};
+    int ntries = cached > 0 ? 1 : 4;
+    long r = -1;
+    int applied = want;
+    int last_err = 0;
+    for (int i = 0; i < ntries; i++) {
+        int val = tries[i];
+        if (i > 0 && val >= want) continue;
+        struct {
+            uint32_t size, policy;
+            uint64_t flags;
+            int32_t nice;
+            uint32_t priority;
+            uint64_t runtime, deadline, period;
+            uint32_t util_min, util_max;
+        } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)val};  // (KEEP_POLICY | KEEP_PARAMS |
+                                                                                        //  UTIL_CLAMP_MIN; struct ver. 1)
+        errno = 0;
+        r = syscall(__NR_sched_setattr, 0, &attr, 0);
+        last_err = errno;
+        if (r == 0) {
+            applied = val;
+            if (cached <= 0) atomic_store(&accepted_want, val);
+            break;
+        }
+        if (last_err != E2BIG) break;
+    }
+    errno = last_err;
     if (r != 0 && (errno == E2BIG || errno == ENOSYS || errno == EINVAL || errno == EPERM || errno == EACCES))
         atomic_store(&unsupported, true);
     static atomic_int logged;
     if (!atomic_exchange(&logged, 1))
-        LOG("[android] uclamp.min %d for the game's threads: %s\n", want, r ? strerror(errno) : "ok");
+        LOG("[android] uclamp.min %d (req %d) for the game's threads: %s\n",
+            r == 0 ? applied : want, want, r ? strerror(errno) : "ok");
 }
 
 void plat_thread_unpin(void) {

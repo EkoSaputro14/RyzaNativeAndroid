@@ -104,13 +104,22 @@ void fnprof_frame(uint64_t frame) {
         uint64_t draws = 0;
         vk_get_forensic_stats(&cpu_exec_ms, &gpu_ms, &draws);
 
+        extern void kernel_collect_dispatch_stats(uint64_t *disp, uint64_t *hits, uint64_t *misses, uint64_t *recomp_calls);
+        uint64_t t_disp = 0, t_hits = 0, t_misses = 0, t_recomp = 0;
+        kernel_collect_dispatch_stats(&t_disp, &t_hits, &t_misses, &t_recomp);
+        uint64_t recomp_calls = g_bench_recomp_calls + t_recomp;
+        uint64_t dispatches = g_forensic_dispatches + t_disp;
+        uint64_t dcache_hits = g_forensic_dcache_hits + t_hits;
+        uint64_t dcache_misses = g_forensic_dcache_misses + t_misses;
+        uint64_t recomp_ns = __atomic_load_n(&g_bench_recomp_ns, __ATOMIC_RELAXED);
+
         double nat_avg_us = g_bench_native_calls ? (double)g_bench_native_ns / (double)g_bench_native_calls / 1000.0 : 0.0;
-        double rec_avg_us = g_bench_recomp_calls ? (double)g_bench_recomp_ns / (double)g_bench_recomp_calls / 1000.0 : 0.0;
-        double rec_total_ms = (double)g_bench_recomp_ns / 1e6;
+        double rec_avg_us = recomp_calls ? (double)recomp_ns / (double)recomp_calls / 1000.0 : 0.0;
+        double rec_total_ms = (double)recomp_ns / 1e6;
         double nat_total_ms = (double)g_bench_native_ns / 1e6;
 
-        uint64_t total_dcache = g_forensic_dcache_hits + g_forensic_dcache_misses;
-        double hit_rate = total_dcache ? ((double)g_forensic_dcache_hits * 100.0 / (double)total_dcache) : 100.0;
+        uint64_t total_dcache = dcache_hits + dcache_misses;
+        double hit_rate = total_dcache ? ((double)dcache_hits * 100.0 / (double)total_dcache) : 100.0;
 
         LOG("\n=================== [FORENSIC AUDIT TELEMETRY] ===================\n");
         LOG("[FORENSIC] Frame: %llu | Active Execution Mode: %s (g_exec_mode=%d)\n",
@@ -121,17 +130,17 @@ void fnprof_frame(uint64_t frame) {
         LOG("[FORENSIC]   - Native EL0 calls          : %llu (Total: %.2f ms, avg %.2f us)\n",
             (unsigned long long)g_bench_native_calls, nat_total_ms, nat_avg_us);
         LOG("[FORENSIC]   - Recomp C guest calls      : %llu (Total: %.2f ms, avg %.2f us)\n",
-            (unsigned long long)g_bench_recomp_calls, rec_total_ms, rec_avg_us);
+            (unsigned long long)recomp_calls, rec_total_ms, rec_avg_us);
         LOG("[FORENSIC]   - Fallbacks Recomp->Native  : %llu\n", (unsigned long long)g_forensic_fallbacks);
         LOG("[FORENSIC]   - Recomp Indirect Dispatches: %llu (Cache Hits: %llu [%.1f%%], Misses: %llu)\n",
-            (unsigned long long)g_forensic_dispatches,
-            (unsigned long long)g_forensic_dcache_hits, hit_rate,
-            (unsigned long long)g_forensic_dcache_misses);
+            (unsigned long long)dispatches,
+            (unsigned long long)dcache_hits, hit_rate,
+            (unsigned long long)dcache_misses);
         LOG("[FORENSIC]   - HLE / Host calls          : %llu\n", (unsigned long long)g_forensic_hle_calls);
         LOG("[FORENSIC]   - Guest SVC (Syscall) calls : %llu\n", (unsigned long long)g_forensic_svc_calls);
         LOG("[FORENSIC] Performance Bottleneck Breakdown (Last Period):\n");
         LOG("[FORENSIC]   - Guest Game Logic (CPU)    : %.2f ms\n", g_exec_mode == 0 ? nat_total_ms : rec_total_ms);
-        LOG("[FORENSIC]   - Dispatch Cache Quality    : %.1f%% hits (%llu misses)\n", hit_rate, (unsigned long long)g_forensic_dcache_misses);
+        LOG("[FORENSIC]   - Dispatch Cache Quality    : %.1f%% hits (%llu misses)\n", hit_rate, (unsigned long long)dcache_misses);
         LOG("[FORENSIC]   - Vulkan Backend (CPU exec) : %.2f ms (Draws: %llu)\n", cpu_exec_ms, (unsigned long long)draws);
         LOG("[FORENSIC]   - GPU Hardware Time         : %.2f ms\n", gpu_ms);
         LOG("==================================================================\n\n");

@@ -503,19 +503,17 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
                               : romfs_read(st->fd, (uint8_t *)(uintptr_t)b->addr, size, off);
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         if (st->plain || R->dlc) break;
-        char cur_file_buf[512] = {0};
         {
             const char *path = romfs_file_at(off);
             static const char *last;
-            if (path && path != last) {
-                last = path;
+            const char *prev = __atomic_load_n(&last, __ATOMIC_RELAXED);
+            if (path && path != prev && __atomic_exchange_n(&last, path, __ATOMIC_RELAXED) != path)
                 LOG("[fs] read %s\n", path);
-            }
         }
         static uint64_t reads, bytes;
-        reads++;
-        bytes += size;
-        if ((reads & (reads - 1)) == 0) LOG("[fs] romfs reads: %llu (%llu KB)\n", reads, bytes >> 10);
+        uint64_t nr = __atomic_add_fetch(&reads, 1, __ATOMIC_RELAXED);
+        uint64_t nb = __atomic_add_fetch(&bytes, size, __ATOMIC_RELAXED);
+        if ((nr & (nr - 1)) == 0) LOG("[fs] romfs reads: %llu (%llu KB)\n", (unsigned long long)nr, (unsigned long long)(nb >> 10));
         break;
     }
     case 4: OUT(uint64_t, 0) = ov_n && !st->plain ? ov_end : st->size; resp_size(resp, 8); break;  // GetSize

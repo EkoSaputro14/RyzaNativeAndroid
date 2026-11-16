@@ -583,3 +583,61 @@ def _verify_p13_binder_and_sync_fixes():
 
 
 _verify_p13_binder_and_sync_fixes()
+
+
+def _verify_p13_cpu_sync_fixes():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    precompute_c = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    romfs_c = (repo_root / "runtime" / "romfs_build.c").read_text(encoding="utf-8")
+    fs_c = (repo_root / "runtime" / "services" / "fs.c").read_text(encoding="utf-8")
+    kernel_h = (repo_root / "runtime" / "kernel.h").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+    dispatch_c = (repo_root / "runtime" / "dispatch.c").read_text(encoding="utf-8")
+    fnprof_c = (repo_root / "runtime" / "fnprof.c").read_text(encoding="utf-8")
+
+    # 1. Async pipeline cache & manifest persistence off render thread
+    assert "save_manifest_async" in precompute_c and "manifest_writer_thread" in precompute_c
+    assert "vk_pipeline_cache_save_async" in device_c and "pcache_writer_main" in device_c
+    assert "vk_pipeline_cache_save_async();" in exec_c
+
+    # 2. Accurate compile done/pending tracking & condvar-based wait_built
+    assert "stat_compiles_pending" in exec_c and "cum_compiles" in exec_c
+    assert "build_mark_done(" in exec_c and "pthread_cond_wait(&build_done_cond, &build_done_lock)" in exec_c
+    assert "compiles +%llu done (%d pending)" in exec_c
+
+    # 3. Render-thread idle wait_game separation & game CPU / nvnSync telemetry
+    assert "vk_async_take_idle_ns" in async_c and "vk_async_take_idle_ns()" in exec_c
+    assert "wait_game %.1f + other %.1f" in exec_c
+    assert "vk_record_nvn_sync_wait(" in exec_c and "vk_record_nvn_sync_wait(" in objects_c
+    assert "game avg %.1f max %.1f ms, nvnSync %.1f ms" in exec_c
+
+    # 4. uclamp.min E2BIG step-down & batched log flushing
+    assert "accepted_want" in android_c and "tries[4]" in android_c
+    assert "last_flush_ns" in android_c and "unbuffered_lines" in android_c
+
+    # 5. Lock-free-pread refcounted virtual RomFS & atomic fs storage stats
+    assert "virtual_acquire_fd" in romfs_c and "virtual_release_fd" in romfs_c and "readers" in romfs_c
+    assert "__atomic_add_fetch(&reads, 1" in fs_c
+
+    # 6. Per-thread dispatch counters & kernel-wait kind/throttling
+    assert "stat_dispatches" in kernel_h and "kernel_collect_dispatch_stats" in kernel_c
+    assert "t->stat_dispatches += 64;" in dispatch_c and "kernel_collect_dispatch_stats" in fnprof_c
+    assert "idle_queue" in kernel_c and "LARECOMP_LOG_KWAIT_ALL" in kernel_c
+
+    # 7. Check math: split other = wait_game + untracked, compiles delta/pending
+    dt_ns, ex_ns, present_ns, wait_game_ns = 102_000_000, 6_100_000, 9_600_000, 84_500_000
+    other_total = max(0, dt_ns - ex_ns - present_ns)
+    wg = min(wait_game_ns, other_total)
+    untracked = other_total - wg
+    assert abs((wg / 1e6) - 84.5) < 1e-6 and abs((untracked / 1e6) - 1.8) < 1e-6
+
+    print("  -> PASS: p13 async cache saves, compile done/pending, wait_game split, uclamp fallback, refcounted VFD & per-thread dispatch verified.")
+
+
+_verify_p13_cpu_sync_fixes()

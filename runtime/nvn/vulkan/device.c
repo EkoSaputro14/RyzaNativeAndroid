@@ -935,6 +935,40 @@ void vk_pipeline_cache_save(void) {
     pthread_mutex_unlock(&pcache_save_lock);
 }
 
+static pthread_mutex_t pcache_async_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pcache_async_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic bool pcache_writer_started = false;
+static bool pcache_async_pending = false;
+
+static void *pcache_writer_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&pcache_async_lock);
+        while (!pcache_async_pending) pthread_cond_wait(&pcache_async_cond, &pcache_async_lock);
+        pcache_async_pending = false;
+        pthread_mutex_unlock(&pcache_async_lock);
+        vk_pipeline_cache_save();
+    }
+    return NULL;
+}
+
+void vk_pipeline_cache_save_async(void) {
+    if (getenv("LARECOMP_VK_NO_PIPELINE_CACHE") || !g_vk.dev || !g_vk.pcache) return;
+    if (!atomic_exchange(&pcache_writer_started, true)) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, pcache_writer_main, NULL) == 0) pthread_detach(th);
+        else atomic_store(&pcache_writer_started, false);
+    }
+    if (atomic_load(&pcache_writer_started)) {
+        pthread_mutex_lock(&pcache_async_lock);
+        pcache_async_pending = true;
+        pthread_cond_signal(&pcache_async_cond);
+        pthread_mutex_unlock(&pcache_async_lock);
+    } else {
+        vk_pipeline_cache_save();
+    }
+}
+
 // ================================================================== swapchain
 static bool swapchain_readback = true;  // (Android: false where the surface can't be a transfer source)
 static VkPresentModeKHR present_mode(void) {
