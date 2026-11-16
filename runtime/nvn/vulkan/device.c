@@ -14,6 +14,7 @@
 #endif
 
 #include "../../paths.h"
+#include "../../platform.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
@@ -942,6 +943,9 @@ static bool pcache_async_pending = false;
 
 static void *pcache_writer_main(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    plat_thread_pin_background();
+#endif
     for (;;) {
         pthread_mutex_lock(&pcache_async_lock);
         while (!pcache_async_pending) pthread_cond_wait(&pcache_async_cond, &pcache_async_lock);

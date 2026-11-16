@@ -1037,10 +1037,17 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 }
 
 // ================================================================== transient memory ring
-// 64 MB host-visible chunks (device-local when the GPU exposes resizable BAR); a chunk is reused once every
-// submission that allocated from it has completed, and given back after 10 s unused (down to RING_KEEP of them).
+// Host-visible chunks (device-local when the GPU exposes resizable BAR); a chunk is reused once every
+// submission that allocated from it has completed, and unused chunks above RING_KEEP are freed promptly.
+#ifdef __ANDROID__
+#define CHUNK_SIZE (32ull << 20)
+#define RING_KEEP 3
+#define RING_IDLE_FRAMES 120
+#else
 #define CHUNK_SIZE (64ull << 20)
 #define RING_KEEP 6
+#define RING_IDLE_FRAMES 300
+#endif
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
@@ -1069,7 +1076,22 @@ static int new_chunk(uint64_t size) {
     return nchunks++;
 }
 
-static void ring_retire(void) {}  // chunks are recycled lazily in vk_transient
+static void vk_transient_trim(bool aggressive) {
+    int keep = aggressive ? 1 : RING_KEEP;
+    if (nchunks <= keep) return;
+    uint64_t done = vk_completed_seq();
+    uint64_t now = renderer_present_count();
+    uint64_t idle_thresh = aggressive ? 15 : RING_IDLE_FRAMES;
+    for (int i = nchunks - 1; i >= 0 && nchunks > keep; i--) {
+        if (i == active || chunks[i].seq > done) continue;
+        if (!aggressive && now - chunks[i].frame < idle_thresh) continue;
+        vmaDestroyBuffer(g_vk.vma, chunks[i].buf, chunks[i].mem);
+        chunks[i] = chunks[--nchunks];
+        if (active == nchunks) active = i;
+    }
+}
+
+static void ring_retire(void) { vk_transient_trim(false); }
 
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
@@ -1088,16 +1110,9 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
 #ifdef __ANDROID__
     gcopy_retire(done);  // (copies back out of chunks about to be reused)
 #endif
-    // Chunks idle for 10 s go back to the driver: a burst of copies (hundreds of MB a frame after a load on a Mali, #89)
-    // grew the ring for good, and the app's memory with it - 256 MB steps up to the crash in #131. The first free one
-    // is always picked, so after a burst the extra chunks stay unpicked.
+    // Free completed extra chunks promptly after load/burst allocations to keep unified-memory PSS bounded.
     uint64_t now = renderer_present_count();
-    for (int i = nchunks - 1; i >= 0 && nchunks > RING_KEEP; i--) {
-        if (i == active || chunks[i].seq > done || now - chunks[i].frame < 300) continue;
-        vmaDestroyBuffer(g_vk.vma, chunks[i].buf, chunks[i].mem);
-        chunks[i] = chunks[--nchunks];
-        if (active == nchunks) active = i;
-    }
+    vk_transient_trim(false);
     int pick = -1;
     for (int i = 0; i < nchunks; i++)
         if (i != active && chunks[i].seq <= done && chunks[i].size >= size) { pick = i; break; }
@@ -1221,6 +1236,9 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    plat_thread_pin_fast();
+#endif
     crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
@@ -1249,6 +1267,9 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    plat_thread_pin_fast();
+#endif
     crash_handler_install();
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
@@ -1421,6 +1442,12 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles;
     uint64_t now = SDL_GetTicksNS();
+#ifdef __ANDROID__
+    {
+        extern void vk_memory_pressure_tick(uint64_t frame);
+        vk_memory_pressure_tick(frame);
+    }
+#endif
 #ifdef __ANDROID__
     extern uint64_t vk_async_take_idle_ns(void);
     uint64_t wait_game_ns = vk_async_take_idle_ns();
@@ -2609,6 +2636,9 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 
 // ================================================================== programs
 #define MAX_BIND 96
+static inline bool is_ubo(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+}
 #ifdef __ANDROID__
 // Reflection is immutable once a program is published. Partition its bindings once, rather than scanning both
 // stages twice per draw. Only metadata is reused: live buffers, texture views and UBO contents are still resolved.
@@ -2619,9 +2649,9 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
         if ((b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) ||
-            (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            (is_ubo(b->type) && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             plan->regular[plan->nregular++] = (uint8_t)i;
-        else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        else if (is_ubo(b->type) &&
                  (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
             plan->deferred[plan->ndeferred++] = (uint8_t)i;
     }
@@ -4135,6 +4165,14 @@ static uint64_t cbwin_row_(uint64_t addr, uint64_t size);
 #endif
 // (cbwin) the patch buffers of the draw being bound, vertex and fragment: shader.h maxwell_cb_window
 static struct { uint32_t m[4], rows[64][4]; } cbw_patch[2];
+static inline void cbw_patch_clear(void) {
+    for (int s = 0; s < 2; s++) {
+        if (cbw_patch[s].m[0]) {
+            uint32_t n = cbw_patch[s].m[2] <= 64 ? cbw_patch[s].m[2] : 64;
+            memset(&cbw_patch[s], 0, sizeof cbw_patch[s].m + (size_t)n * sizeof cbw_patch[s].rows[0]);
+        }
+    }
+}
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 // BOTW's half-size passes on a scaled scene (from SavageWindRecomp's up_fix, MIT): the draws that bring its half-size
@@ -5778,7 +5816,21 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
 #define VC_PAGE 4096ull
 #define VC_TAB 8192                   // entries (open addressing)
 #define VC_MAX_RANGE (64ull << 20)    // larger bound ranges: read in place
-#define VC_BUDGET (768ull << 20)      // device-local bytes kept; the least recently used go first
+static uint64_t vc_budget_bytes(void) {
+    static uint64_t budget = 0;
+    if (!budget) {
+        const char *e = getenv("LARECOMP_VK_VC_BUDGET_MB");
+#ifdef __ANDROID__
+        uint64_t mb = e ? (uint64_t)atoll(e) : 192ull;  // unified memory: 192 MB keeps PSS well below Android LMK
+#else
+        uint64_t mb = e ? (uint64_t)atoll(e) : 768ull;
+#endif
+        if (mb < 32) mb = 32;
+        if (mb > 1024) mb = 1024;
+        budget = mb << 20;
+    }
+    return budget;
+}
 typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
 static VcEnt vc_tab[VC_TAB];
 static uint32_t vc_pend[VC_TAB];  // entries the pending submission draws from (vc_flush brings them up to date)
@@ -5812,6 +5864,55 @@ static bool vc_drop(VcEnt *e) {  // (freed once the submissions that may read it
     memset(e, 0, sizeof *e);
     return true;
 }
+
+static void vc_trim_to(uint64_t target_bytes) {
+    uint64_t pend = vk_pending_seq();
+    while (vc_bytes > target_bytes) {
+        int lru = -1;
+        for (int i = 0; i < VC_TAB; i++)
+            if (vc_tab[i].buf && vc_tab[i].used_seq < pend &&
+                (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq))
+                lru = i;
+        if (lru < 0 || !vc_drop(&vc_tab[lru])) break;
+    }
+    if (vc_ndead) vc_free_dead(false);
+}
+
+#ifdef __ANDROID__
+static uint64_t read_proc_rss_mb(void) {
+    FILE *f = fopen("/proc/self/status", "re");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            kb = strtoull(line + 6, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb / 1024;
+}
+
+void vk_memory_pressure_tick(uint64_t frame) {
+    if (vc_ndead) vc_free_dead(false);
+    vk_collect_dead();
+    vk_transient_trim(false);
+    if ((frame % 60) != 0) return;
+    static uint64_t soft_limit_mb = 0;
+    if (!soft_limit_mb) {
+        const char *e = getenv("LARECOMP_MEM_SOFT_LIMIT_MB");
+        soft_limit_mb = e ? (uint64_t)atoll(e) : 2200ull;
+        if (soft_limit_mb < 1024) soft_limit_mb = 1024;
+    }
+    uint64_t rss_mb = read_proc_rss_mb();
+    if (rss_mb > soft_limit_mb) {
+        vc_trim_to(vc_budget_bytes() / 2);
+        vk_texture_snapshots_trim();
+        vk_transient_trim(true);
+    }
+}
+#endif
 
 // The page tables (vc_page_gen / vc_page_gpu) exist whenever the OS gives write tracking: the vertex cache and the
 // texture upload checks (vk_pages_changed) share them. Each write tracking query resets the OS bits, so every query
@@ -5915,7 +6016,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
             if (old_slot == ~0u || !vc_drop(&vc_tab[old_slot])) return false;
             free_slot = old_slot;
         }
-        while (vc_bytes + (hi - lo) > VC_BUDGET) {  // over budget: the least recently used entry goes
+        uint64_t budget = vc_budget_bytes();
+        while (vc_bytes + (hi - lo) > budget) {  // over budget: the least recently used entry goes
             int lru = -1;
             for (int i = 0; i < VC_TAB; i++)
                 if (vc_tab[i].buf && vc_tab[i].used_seq < pend && (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
@@ -6166,7 +6268,6 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // viewport decision), or NULL.
 static float g_mirror_w;  // mirror mode's composite: its render target width (rscale[65].x; 0 otherwise)
 
-static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
 
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
@@ -6186,12 +6287,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     static int planned = -1;
     if (planned < 0) {
         const char *e = getenv("LARECOMP_VK_DESCRIPTOR_PLAN");
-        planned = e && atoi(e) != 0;  // experimental: keep the measured stable path as the default
+        planned = !e || atoi(e) != 0;  // DescriptorPlan handles both static & dynamic UBOs; set =0 to disable
     }
     const DescriptorPlan *plan = &p->descriptor_plans[set];
 #endif
 #ifdef __ANDROID__
-    float rs[66][4];  // (filled when the shader has the table: binding 18 below)
+    static __thread float rs_buf[2][66][4];  // per-stage TLS zero-init avoids 1056-byte memset per draw
+    static __thread int rs_prev_ntex[2];
 #else
     float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
@@ -6272,13 +6374,21 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 #endif
         } else if (b->binding == 18) {
 #ifdef __ANDROID__
-            memset(rs, 0, sizeof rs);
-            rs[0][0] = rs[0][1] = 1;  // ([65]: mirror mode, renderer.m)
+            float (*rs)[4] = rs_buf[sg];
+            int ntex = si->ntex < 64 ? si->ntex : 64;
+            rs[0][0] = rs[0][1] = 1;
+            rs[0][2] = rs[0][3] = 0;  // ([65]: mirror mode, renderer.m)
             if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
             rs[65][0] = g_mirror_w;
-#endif
+            for (int t = 0; t < ntex; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
+            if (ntex < rs_prev_ntex[sg])
+                memset(&rs[1 + ntex], 0, (size_t)(rs_prev_ntex[sg] - ntex) * sizeof rs_buf[0][0]);
+            rs_prev_ntex[sg] = ntex;
+            bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs_buf[sg], sizeof rs_buf[sg], 256), sizeof rs_buf[sg]);
+#else
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+#endif
         } else {
             float zero[8] = {0};
             bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
@@ -6738,8 +6848,9 @@ static void draw_(CmdRec *r, bool indexed) {
             static uint64_t vskip[32], vskip_frame = ~0ull;
             static int nvskip, vskip_on = -1;
             if (vskip_on < 0) vskip_on = getenv("LARECOMP_SKIPVS") != NULL;
-            uint64_t now = renderer_present_count();
-            if (vskip_on && now / 15 != vskip_frame) {
+            if (vskip_on) {
+                uint64_t now = renderer_present_count();
+                if (now / 15 != vskip_frame) {
                 vskip_frame = now / 15;
                 char buf[512] = "";
                 FILE *f = fopen("build/skipvs.txt", "rb");
@@ -6752,6 +6863,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 }
                 if (n != nvskip) LOG("[vk] skipvs: %d vertex shaders skipped\n", n);
                 nvskip = n;
+                }
             }
             for (int i = 0; i < nvskip; i++)
                 if (vss->code_addr == vskip[i]) { stat_skipped++; return; }
@@ -7327,7 +7439,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
-    memset(cbw_patch, 0, sizeof cbw_patch);  // (cbwin_bind fills them while the sets are written)
+    cbw_patch_clear();  // (cbwin_bind fills them while the sets are written)
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
@@ -7356,7 +7468,7 @@ static void draw_(CmdRec *r, bool indexed) {
             up_fix.sx = (float)gb->width / (float)gt->width, up_fix.sy = (float)gb->height / (float)gt->height;
             up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
             ndv = 0;  // (the vertex set again, with its constants patched)
-            memset(cbw_patch, 0, sizeof cbw_patch);
+            cbw_patch_clear();
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
         }
     }
@@ -7627,7 +7739,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else {
         vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
-        if (indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFFFu)) {
+        if (g_ryza_forensic_enabled && indexed && pr && pr->vi && (pr->vi->attr_mask & 0xFFFFFFFFu)) {
             ryza_forensic_inspect_draw(pr, &pp->k, r, true, count, icount, (uint32_t)r->x[1], r->x[3], base_vertex);
         }
     }
@@ -7678,7 +7790,7 @@ static uint32_t ryza_read_index(const void *isrc, uint32_t isz, uint32_t idx) {
 
 static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, bool use_index, uint32_t count, uint32_t icount, uint32_t itype, uint64_t iaddr, int32_t base_vertex) {
     (void)r;
-    if (!use_index || count == 0 || icount < 30 || !pr || !pr->vi) return;
+    if (!g_ryza_forensic_enabled || !use_index || count == 0 || icount < 30 || !pr || !pr->vi) return;
     if (g_ryza_capture_freeze) return;
     g_ryza_3d_draw_count++;
 

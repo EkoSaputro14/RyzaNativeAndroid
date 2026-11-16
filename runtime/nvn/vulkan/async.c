@@ -81,8 +81,9 @@ static uint64_t render_cpu_ns(void) {
 
 static void *render_main(void *arg) {
     (void)arg;
-    extern void plat_thread_unpin(void);
-    plat_thread_unpin();
+#ifdef __ANDROID__
+    plat_thread_pin_fast();
+#endif
     crash_handler_install();
     // Keep the established ADPF signal by default. CPU-only timing is an explicit experiment:
     // excluding descheduling/waits can understate the work seen by Android's frequency governor.

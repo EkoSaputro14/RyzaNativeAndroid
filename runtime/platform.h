@@ -105,8 +105,14 @@ typedef struct {
 } PlatAdpfStats;
 void plat_adpf_stats(PlatAdpfStats *out);
 #ifdef __ANDROID__
-// A new thread back on every core: threads inherit the creating thread's affinity, and the presenting thread is
-// pinned to the fastest cores (platform/android.c)
+// Thread core affinity & uclamp helpers (platform/android.c):
+// - plat_thread_pin_fast: pins hot threads (main/t80, render, shader workers) to Big/Prime cores and applies uclamp.min
+// - plat_thread_pin_background: isolates audio, vsync, and disk/debug threads to Little cores
+// - plat_uclamp_min_tid: applies per-TID sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN) or nice fallback (0 = calling thread)
+// - plat_thread_unpin: keeps legacy non-hot thread callers isolated to Little cores
+void plat_thread_pin_fast(void);
+void plat_thread_pin_background(void);
+void plat_uclamp_min_tid(int32_t tid);
 void plat_thread_unpin(void);
 void plat_flush_logs(void);
 void plat_crash_write_raw(const char *s);

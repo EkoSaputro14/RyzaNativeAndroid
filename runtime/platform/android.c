@@ -1025,36 +1025,146 @@ void plat_device_stats(PlatDeviceStats *out) {
 typedef struct APerformanceHintManager APerformanceHintManager;
 typedef struct APerformanceHintSession APerformanceHintSession;
 
-// LARECOMP_PIN=1 (experiment, off by default): the presenting thread (the game's main thread, which also records the
-// frame) on the cores with the highest clock. Left to the scheduler it stays on the middle cluster (cores 0-5 at
-// ~2.4 GHz on a Snapdragon 8 Elite) while the two prime cores idle at 1 GHz. But pinned, it crashed the game within a
-// minute or two every time (2026-10-16, four runs): a job worker called into a job the main thread had already moved
-// on from - a race in the game's job system that a main thread much faster than its workers wins (on the Switch every
-// core runs at the same clock).
-static cpu_set_t g_all_cores;
-static bool g_pinned;
+#ifndef SYS_sched_setattr
+#define SYS_sched_setattr __NR_sched_setattr
+#endif
+#ifndef SYS_gettid
+#define SYS_gettid __NR_gettid
+#endif
+#ifndef SCHED_ATTR_SIZE_VER1
+#define SCHED_ATTR_SIZE_VER1 56
+#endif
+#ifndef SCHED_FLAG_KEEP_POLICY
+#define SCHED_FLAG_KEEP_POLICY 0x08
+#endif
+#ifndef SCHED_FLAG_KEEP_PARAMS
+#define SCHED_FLAG_KEEP_PARAMS 0x10
+#endif
+#ifndef SCHED_FLAG_UTIL_CLAMP_MIN
+#define SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+#endif
 
-// LARECOMP_UCLAMP_MIN=<1-1024> (a test, issue #41): a utilization floor for every thread that starts here (the game's,
-// the render thread, audio), so the governor runs their cores at least at that share of their top clock, however
-// briefly each thread works. On a Snapdragon 8 Gen 3 (MagicOS) the game's busiest core stayed at ~600 MHz in the open
-// world - ~12 fps - with the ADPF session on, the app in the game list and performance mode. Per thread, so the
-// threads' relative speeds stay as they were (LARECOMP_PIN's fast main thread crashed the game's job system).
-// sched_setattr with SCHED_FLAG_UTIL_CLAMP_MIN keeps the policy and priority; whether Android allows it (seccomp,
-// SELinux, the cgroup's uclamp.max) goes to the log once.
-static void uclamp_min_thread(void) {
+// 3-cluster / big.LITTLE CPU topology state:
+// Hot game threads (t80 main + guest workers), presenting thread, render thread, and shader workers are pinned
+// together onto Big/Prime cores (> min_mhz, e.g. CPU 4..7 on SD855 4L+3B+1P) so they share uniform high clocks
+// without creating a main-vs-worker speed race, while audio/vsync/disk/watch threads stay on Little cores (0..3).
+// LARECOMP_PIN=0 disables cluster pinning.
+static cpu_set_t g_all_cores;
+static cpu_set_t g_fast_cores;
+static cpu_set_t g_little_cores;
+static pthread_once_t g_topo_once = PTHREAD_ONCE_INIT;
+static bool g_has_clusters;
+static bool g_pin_enabled;
+
+static void init_cpu_topology(void) {
+    const char *pin_env = getenv("LARECOMP_PIN");
+    g_pin_enabled = !pin_env || atoi(pin_env) != 0;
+
+    if (sched_getaffinity(0, sizeof g_all_cores, &g_all_cores) != 0) {
+        CPU_ZERO(&g_all_cores);
+        for (int c = 0; c < 8; c++) CPU_SET(c, &g_all_cores);
+    }
+
+    long min_mhz = 0, max_mhz = 0, mhz[64] = {0};
+    int n = 0;
+    for (int c = 0; c < CPU_SETSIZE && c < 64; c++) {
+        if (!CPU_ISSET(c, &g_all_cores)) continue;
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
+        fclose(f);
+        if (mhz[c] > 0) {
+            if (!min_mhz || mhz[c] < min_mhz) min_mhz = mhz[c];
+            if (mhz[c] > max_mhz) max_mhz = mhz[c];
+        }
+        n = c + 1;
+    }
+
+    CPU_ZERO(&g_fast_cores);
+    CPU_ZERO(&g_little_cores);
+    int fast_cnt = 0, little_cnt = 0;
+    uint64_t fast_mask = 0, little_mask = 0;
+    if (min_mhz > 0 && max_mhz > min_mhz) {
+        for (int c = 0; c < n; c++) {
+            if (mhz[c] <= 0) continue;
+            if (mhz[c] > min_mhz) {
+                CPU_SET(c, &g_fast_cores);
+                fast_cnt++;
+                fast_mask |= (1ull << c);
+            } else {
+                CPU_SET(c, &g_little_cores);
+                little_cnt++;
+                little_mask |= (1ull << c);
+            }
+        }
+    }
+
+    g_has_clusters = (fast_cnt > 0 && little_cnt > 0);
+    LOG("[android] CPU topology (%d cores): fast=0x%llx (%d cores, >%ld MHz), little=0x%llx (%d cores, %ld MHz), pin=%s\n",
+        n, (unsigned long long)fast_mask, fast_cnt, min_mhz / 1000,
+        (unsigned long long)little_mask, little_cnt, min_mhz / 1000,
+        (g_pin_enabled && g_has_clusters) ? "on" : "off");
+}
+
+static int read_sys_uclamp_min_max(void) {
+    static atomic_int cached_sys_max = -1;
+    int v = atomic_load(&cached_sys_max);
+    if (v >= 0) return v;
+    int res = 1024;
+    FILE *f = fopen("/proc/sys/kernel/sched_util_clamp_min", "re");
+    if (f) {
+        int val = 0;
+        if (fscanf(f, "%d", &val) == 1 && val > 0 && val <= 1024) res = val;
+        fclose(f);
+    }
+    atomic_store(&cached_sys_max, res);
+    return res;
+}
+
+static int apply_nice_fallback(pid_t target_tid) {
+    static const int prios[] = {-8, -4, -2};
+    for (size_t i = 0; i < sizeof(prios) / sizeof(prios[0]); i++) {
+        errno = 0;
+        if (setpriority(PRIO_PROCESS, (id_t)target_tid, prios[i]) == 0) return prios[i];
+    }
+    errno = 0;
+    int cur = getpriority(PRIO_PROCESS, (id_t)target_tid);
+    return errno == 0 ? cur : 0;
+}
+
+// Per-TID sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN) with kernel cap read from /proc/sys/kernel/sched_util_clamp_min.
+// Default 768 (75% of 1024) forces CPU clusters onto higher OPPs even when ADPF is unavailable (e.g. Android < 12).
+// On older 4.14 kernels where sched_attr lacks uclamp (E2BIG) or seccomp blocks sched_setattr, falls back cleanly to
+// per-TID setpriority() nice boost without spamming "Argument list too long".
+void plat_uclamp_min_tid(int32_t tid) {
     static atomic_bool unsupported;
     static atomic_int accepted_want;
-    if (atomic_load(&unsupported)) return;
-    static int want = -1;
+    static atomic_int want_cached = -1;
+
+    int want = atomic_load(&want_cached);
     if (want < 0) {
         const char *e = getenv("LARECOMP_UCLAMP_MIN");
-        // Default 563 (~55% of 1024) prevents Snapdragon 732G / Adreno 618 big cluster from dropping to 1017 MHz during render
-        want = e ? (atoi(e) > 1024 ? 1024 : (atoi(e) < 0 ? 0 : atoi(e))) : 563;
+        int raw = e ? atoi(e) : 768;
+        if (raw < 0) raw = 0;
+        if (raw > 1024) raw = 1024;
+        int sys_max = read_sys_uclamp_min_max();
+        if (sys_max > 0 && raw > sys_max) raw = sys_max;
+        want = raw;
+        atomic_store(&want_cached, want);
     }
     if (!want) return;
+
+    pid_t target_tid = tid > 0 ? (pid_t)tid : (pid_t)syscall(SYS_gettid);
+    if (atomic_load(&unsupported)) {
+        apply_nice_fallback(target_tid);
+        return;
+    }
+
     int cached = atomic_load(&accepted_want);
-    int tries[4] = {cached > 0 ? cached : want, 512, 384, 256};
-    int ntries = cached > 0 ? 1 : 4;
+    int tries[5] = {cached > 0 ? cached : want, 563, 512, 384, 256};
+    int ntries = cached > 0 ? 1 : 5;
     long r = -1;
     int applied = want;
     int last_err = 0;
@@ -1062,17 +1172,47 @@ static void uclamp_min_thread(void) {
         int val = tries[i];
         if (i > 0 && val >= want) continue;
         struct {
-            uint32_t size, policy;
-            uint64_t flags;
-            int32_t nice;
-            uint32_t priority;
-            uint64_t runtime, deadline, period;
-            uint32_t util_min, util_max;
-        } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)val};  // (KEEP_POLICY | KEEP_PARAMS |
-                                                                                        //  UTIL_CLAMP_MIN; struct ver. 1)
+            uint32_t size;
+            uint32_t sched_policy;
+            uint64_t sched_flags;
+            int32_t sched_nice;
+            uint32_t sched_priority;
+            uint64_t sched_runtime;
+            uint64_t sched_deadline;
+            uint64_t sched_period;
+            uint32_t sched_util_min;
+            uint32_t sched_util_max;
+        } attr;
+        memset(&attr, 0, sizeof attr);
+        attr.size = SCHED_ATTR_SIZE_VER1;
+        attr.sched_flags = SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN;
+        attr.sched_util_min = (uint32_t)val;
+
         errno = 0;
-        r = syscall(__NR_sched_setattr, 0, &attr, 0);
+        r = syscall(SYS_sched_setattr, target_tid, &attr, 0);
         last_err = errno;
+        if (r != 0 && last_err == EINVAL) {
+            // Some backported kernels support SCHED_FLAG_UTIL_CLAMP_MIN without KEEP_POLICY | KEEP_PARAMS
+            int pol = sched_getscheduler(target_tid);
+            if (pol < 0) pol = SCHED_OTHER;
+            errno = 0;
+            int cur_nice = getpriority(PRIO_PROCESS, (id_t)target_tid);
+            if (errno != 0) cur_nice = 0;
+            struct sched_param sp;
+            memset(&sp, 0, sizeof sp);
+            if (pol != SCHED_OTHER && pol != SCHED_BATCH && pol != SCHED_IDLE)
+                sched_getparam(target_tid, &sp);
+            memset(&attr, 0, sizeof attr);
+            attr.size = SCHED_ATTR_SIZE_VER1;
+            attr.sched_policy = (uint32_t)pol;
+            attr.sched_flags = SCHED_FLAG_UTIL_CLAMP_MIN;
+            attr.sched_nice = cur_nice;
+            attr.sched_priority = (uint32_t)sp.sched_priority;
+            attr.sched_util_min = (uint32_t)val;
+            errno = 0;
+            r = syscall(SYS_sched_setattr, target_tid, &attr, 0);
+            last_err = errno;
+        }
         if (r == 0) {
             applied = val;
             if (cached <= 0) atomic_store(&accepted_want, val);
@@ -1080,47 +1220,42 @@ static void uclamp_min_thread(void) {
         }
         if (last_err != E2BIG) break;
     }
-    errno = last_err;
-    if (r != 0 && (errno == E2BIG || errno == ENOSYS || errno == EINVAL || errno == EPERM || errno == EACCES))
-        atomic_store(&unsupported, true);
+
+    int nice_applied = 0;
+    if (r != 0) {
+        if (last_err == E2BIG || last_err == ENOSYS || last_err == EINVAL || last_err == EPERM || last_err == EACCES)
+            atomic_store(&unsupported, true);
+        nice_applied = apply_nice_fallback(target_tid);
+    }
+
     static atomic_int logged;
-    if (!atomic_exchange(&logged, 1))
-        LOG("[android] uclamp.min %d (req %d) for the game's threads: %s\n",
-            r == 0 ? applied : want, want, r ? strerror(errno) : "ok");
+    if (!atomic_exchange(&logged, 1)) {
+        if (r == 0) {
+            LOG("[android] uclamp.min %d (req %d, sys_max %d) via sched_setattr: ok\n",
+                applied, want, read_sys_uclamp_min_max());
+        } else if (last_err == E2BIG || last_err == ENOSYS) {
+            LOG("[android] uclamp.min unavailable in kernel sched_setattr (errno=%d); using per-TID nice boost (%d)\n",
+                last_err, nice_applied);
+        } else {
+            LOG("[android] uclamp.min %d rejected (errno=%d: %s); nice boost=%d\n",
+                want, last_err, strerror(last_err), nice_applied);
+        }
+    }
+}
+
+void plat_thread_pin_fast(void) {
+    pthread_once(&g_topo_once, init_cpu_topology);
+    if (g_pin_enabled && g_has_clusters) sched_setaffinity(0, sizeof g_fast_cores, &g_fast_cores);
+    plat_uclamp_min_tid(0);
+}
+
+void plat_thread_pin_background(void) {
+    pthread_once(&g_topo_once, init_cpu_topology);
+    if (g_pin_enabled && g_has_clusters) sched_setaffinity(0, sizeof g_little_cores, &g_little_cores);
 }
 
 void plat_thread_unpin(void) {
-    if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
-    uclamp_min_thread();
-}
-
-static void pin_to_fastest_cores(void) {
-    if (!getenv("LARECOMP_PIN")) return;
-    long best = 0, mhz[CPU_SETSIZE] = {0};
-    int n = 0;
-    for (int c = 0; c < CPU_SETSIZE && c < 64; c++) {
-        char path[96];
-        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
-        FILE *f = fopen(path, "re");
-        if (!f) continue;
-        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
-        fclose(f);
-        if (mhz[c] > best) best = mhz[c];
-        n = c + 1;
-    }
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    int k = 0;
-    for (int c = 0; c < n; c++)
-        if (mhz[c] == best) {
-            CPU_SET(c, &set);
-            k++;
-        }
-    if (!best || k == 0 || k == n) return;  // (one cluster: nothing to pick)
-    if (sched_getaffinity(0, sizeof g_all_cores, &g_all_cores)) return;
-    g_pinned = true;  // (before: a thread started from here from now on goes back to g_all_cores)
-    int r = sched_setaffinity(0, sizeof set, &set);
-    LOG("[android] presenting thread on the %d fastest cores (%ld MHz): %s\n", k, best / 1000, r ? strerror(errno) : "ok");
+    plat_thread_pin_background();
 }
 
 // One session for both threads by default (the presenting thread and the render thread; LARECOMP_ADPF_SPLIT=1 for
@@ -1153,6 +1288,33 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         (*wd_gpu)(AWorkDuration *, int64_t);
     static int (*report2)(APerformanceHintSession *, AWorkDuration *);
     static AWorkDuration *wd;
+    // Always apply fast-core pinning, per-TID uclamp/nice boost, and CPU telemetry even if ADPF is unavailable.
+    static uint64_t s_last_render_ns;
+    static bool s_uclamp_applied[2];
+    if (!s_uclamp_applied[slot & 1]) {
+        s_uclamp_applied[slot & 1] = true;
+        plat_thread_pin_fast();
+    }
+    if (slot == 0) {  // Presenting thread (game's main loop)
+        s_presenting_tid = (int32_t)gettid();
+        s_game_cpu = sched_getcpu();
+        if (s_last_render_ns > work_ns) work_ns = s_last_render_ns;
+        float gms = (float)(game_ns ? game_ns : work_ns) / 1e6f;
+        s_game_ms = s_game_ms > 0 ? s_game_ms * 0.9f + gms * 0.1f : gms;
+        float wms = (float)work_ns / 1e6f;
+        if (s_render_ms > wms) wms = s_render_ms;
+        s_work_ms = wms;
+        s_target_ms = (float)target_ns / 1e6f;
+    } else {          // Render thread (Vulkan command translation)
+        s_render_tid = (int32_t)gettid();
+        s_render_cpu = sched_getcpu();
+        s_last_render_ns = work_ns;
+        float rms = (float)work_ns / 1e6f;
+        s_render_ms = s_render_ms > 0 ? s_render_ms * 0.9f + rms * 0.1f : rms;
+        if (rms > s_work_ms) s_work_ms = rms;
+        if (s_target_ms <= 0.0f) s_target_ms = (float)target_ns / 1e6f;
+    }
+
     if (loaded < 0 || state[slot] < 0) return;
     if (!loaded) {
         if (getenv("LARECOMP_NO_ADPF")) { loaded = -2; return; }
@@ -1191,31 +1353,7 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
     if (target_override_us > 0) target_ns = (uint64_t)target_override_us * 1000ull;
     else if (margin_pct > 0 && margin_pct < 100) target_ns = target_ns * (100 - margin_pct) / 100;
 
-    static uint64_t s_last_render_ns;
-    static bool s_uclamp_applied[2];
-    if (!s_uclamp_applied[slot & 1]) {
-        s_uclamp_applied[slot & 1] = true;
-        uclamp_min_thread();
-    }
-    if (slot == 0) {  // Presenting thread (game's main loop)
-        s_presenting_tid = (int32_t)gettid();
-        s_game_cpu = sched_getcpu();
-        if (s_last_render_ns > work_ns) work_ns = s_last_render_ns;
-        float gms = (float)(game_ns ? game_ns : work_ns) / 1e6f;
-        s_game_ms = s_game_ms > 0 ? s_game_ms * 0.9f + gms * 0.1f : gms;
-        float wms = (float)work_ns / 1e6f;
-        if (s_render_ms > wms) wms = s_render_ms;
-        s_work_ms = wms;
-        s_target_ms = (float)target_ns / 1e6f;
-    } else {          // Render thread (Vulkan command translation)
-        s_render_tid = (int32_t)gettid();
-        s_render_cpu = sched_getcpu();
-        s_last_render_ns = work_ns;
-        float rms = (float)work_ns / 1e6f;
-        s_render_ms = s_render_ms > 0 ? s_render_ms * 0.9f + rms * 0.1f : rms;
-        if (rms > s_work_ms) s_work_ms = rms;
-        if (s_target_ms <= 0.0f) s_target_ms = (float)target_ns / 1e6f;
-    }
+    if (slot == 0) s_target_ms = (float)target_ns / 1e6f;
 
     APerformanceHintManager *m = get_manager();
     if (!m) return;
@@ -1226,7 +1364,6 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         static bool s_tried_add_render;
         if (state[0] < 0) return;
         if (!session[0]) {
-            if (slot == 0) pin_to_fastest_cores();
             int32_t tids[2];
             int ntids = 0;
             if (s_presenting_tid > 0) tids[ntids++] = s_presenting_tid;
@@ -1313,7 +1450,6 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         // --- Split session mode (one session per thread) ---
         if (!state[slot]) {
             state[slot] = -1;
-            if (slot == 0) pin_to_fastest_cores();
             int32_t tid = (int32_t)gettid();
             session[slot] = create(m, &tid, 1, (int64_t)target_ns);
             LOG("[android] performance hint session (%s thread): %s\n", slot ? "render" : "presenting",

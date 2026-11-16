@@ -240,6 +240,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         g_ryza_capture_freeze = !g_ryza_capture_freeze;
     }
     ImGui::SameLine();
+    if (ImGui::Button(g_ryza_forensic_enabled ? "Capture: ON" : "Capture: OFF")) {
+        ryza_forensics_set_enabled(!g_ryza_forensic_enabled);
+    }
+    ImGui::SameLine();
     if (ImGui::Button("Re-arm")) {
         ryza_rearm_capture();
     }

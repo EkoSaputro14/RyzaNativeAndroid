@@ -828,10 +828,25 @@ static TextureSnapshot texture_snapshots[8];
 static void texture_snapshot_forget(TexBackend *b) {
     for (int i = 0; i < 8; i++) if (texture_snapshots[i].owner == b) texture_snapshots[i].owner = NULL;
 }
+void vk_texture_snapshots_trim(void) {
+    for (int i = 0; i < 8; i++) {
+        free(texture_snapshots[i].bytes);
+        texture_snapshots[i].bytes = NULL;
+        texture_snapshots[i].owner = NULL;
+        texture_snapshots[i].hash = 0;
+        texture_snapshots[i].size = 0;
+    }
+}
+
 static bool texture_unchanged(TexBackend *b, const uint8_t *mem, uint64_t size) {
     static int enabled = -1;
     if (enabled < 0) { const char *e = getenv("LARECOMP_TEX_SNAPSHOTS"); enabled = !e || atoi(e) != 0; }
-    if (!enabled || !size || size > (8u << 20)) return false;
+#ifdef __ANDROID__
+    const uint64_t max_snap_bytes = 2u << 20;
+#else
+    const uint64_t max_snap_bytes = 8u << 20;
+#endif
+    if (!enabled || !size || size > max_snap_bytes) return false;
     TextureSnapshot *e = &texture_snapshots[((uintptr_t)b >> 6) & 7];
     if (e->owner == b && e->hash == b->data_hash && e->size == size && !memcmp(e->bytes, mem, size)) return true;
     if (e->size != size) {

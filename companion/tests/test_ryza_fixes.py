@@ -540,7 +540,7 @@ def _verify_p13_perf_optimizations():
 
     # 4. ADPF critical-path work reporting & uclamp.min floor
     assert "s_last_render_ns" in android_c
-    assert "want = e ? (atoi(e) > 1024 ? 1024 : (atoi(e) < 0 ? 0 : atoi(e))) : 563;" in android_c
+    assert "int raw = e ? atoi(e) : 768;" in android_c and "read_sys_uclamp_min_max()" in android_c
     assert "if (render_busy > hint_busy) hint_busy = render_busy;" in exec_c
 
     print("  -> PASS: p13 ASLR-free PipeKey hash, command list batching, ga_load_copy reuse, 0.68x resolution scaling & ADPF governor boost verified.")
@@ -565,7 +565,7 @@ def _verify_p13_binder_and_sync_fixes():
 
     # 2. uclamp.min unsupported kernel short-circuit
     assert "static atomic_bool unsupported;" in android_c
-    assert "errno == E2BIG || errno == ENOSYS || errno == EINVAL" in android_c
+    assert "last_err == E2BIG || last_err == ENOSYS || last_err == EINVAL" in android_c
 
     # 3. vk_promote_scene_rt protects GPU-owned / presented render targets
     assert "if (b->rs_group || b->uploaded || b->gpu_owned || b->presented) return;" in textures_c
@@ -618,7 +618,7 @@ def _verify_p13_cpu_sync_fixes():
     assert "game avg %.1f max %.1f ms, nvnSync %.1f ms" in exec_c
 
     # 4. uclamp.min E2BIG step-down & batched log flushing
-    assert "accepted_want" in android_c and "tries[4]" in android_c
+    assert "accepted_want" in android_c and "tries[5]" in android_c
     assert "last_flush_ns" in android_c and "unbuffered_lines" in android_c
 
     # 5. Lock-free-pread refcounted virtual RomFS & atomic fs storage stats
@@ -661,3 +661,67 @@ def _verify_p13_adrenotools_symbol_isolation():
 
 
 _verify_p13_adrenotools_symbol_isolation()
+
+
+def _verify_p13_sd855_sched_and_mem_opts():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    platform_h = (repo_root / "runtime" / "platform.h").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    audio_c = (repo_root / "runtime" / "services" / "audio.c").read_text(encoding="utf-8")
+    vi_c = (repo_root / "runtime" / "hle" / "vi.c").read_text(encoding="utf-8")
+    dispatch_c = (repo_root / "runtime" / "dispatch.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    precompute_c = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c").read_text(encoding="utf-8")
+    forensics_h = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.h").read_text(encoding="utf-8")
+    forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+
+    # 1. Direct per-TID sched_setattr(SYS_sched_setattr), sysctl cap, EINVAL retry, and nice fallback without E2BIG log spam
+    assert "void plat_uclamp_min_tid(int32_t tid);" in platform_h
+    assert "syscall(SYS_sched_setattr, target_tid, &attr, 0)" in android_c
+    assert "/proc/sys/kernel/sched_util_clamp_min" in android_c
+    assert "apply_nice_fallback(target_tid)" in android_c
+    assert "plat_thread_pin_fast();" in android_c
+    assert android_c.index("plat_thread_pin_fast();") < android_c.index("APerformanceHintManager *m = get_manager();")
+
+    # 2. 3-cluster topology pinning: hot threads on fast cores (> min_mhz), audio/background on little cores
+    assert "void plat_thread_pin_fast(void);" in platform_h
+    assert "void plat_thread_pin_background(void);" in platform_h
+    assert "init_cpu_topology" in android_c and "g_fast_cores" in android_c and "g_little_cores" in android_c
+    assert "plat_thread_pin_fast();" in kernel_c
+    assert "plat_thread_pin_fast();" in async_c
+    assert "plat_thread_pin_fast();" in exec_c
+    assert "plat_thread_pin_background();" in audio_c
+    assert "plat_thread_pin_background();" in vi_c
+    assert "plat_thread_pin_background();" in dispatch_c
+    assert "plat_thread_pin_background();" in device_c
+    assert "plat_thread_pin_background();" in precompute_c
+
+    # 3. Forensic draw capture disabled by default, opt-in via env/UI toggle
+    assert "extern bool g_ryza_forensic_enabled;" in forensics_h
+    assert "bool g_ryza_forensic_enabled = false;" in forensics_c
+    assert "LARECOMP_FORENSIC_CAPTURE" in forensics_c
+    assert "ryza_forensics_set_enabled" in overlay_mm
+    assert "g_ryza_forensic_enabled && indexed" in exec_c
+
+    # 4. DescriptorPlan dynamic UBO bug fix & default-on + stage_set TLS rscale buffer & cbw_patch_clear
+    assert "(is_ubo(b->type) && b->binding < 17)" in exec_c
+    assert "planned = !e || atoi(e) != 0;" in exec_c
+    assert "static __thread float rs_buf[2][66][4];" in exec_c
+    assert "cbw_patch_clear();" in exec_c
+
+    # 5. Unified-memory PSS footprint caps & periodic memory-pressure trimming
+    assert "#define CHUNK_SIZE (32ull << 20)" in exec_c and "#define RING_KEEP 3" in exec_c
+    assert "192ull" in exec_c and "vc_budget_bytes()" in exec_c
+    assert "vk_memory_pressure_tick(" in exec_c and "vk_texture_snapshots_trim()" in exec_c
+    assert "void vk_texture_snapshots_trim(void)" in textures_c and "2u << 20" in textures_c
+
+    print("  -> PASS: SD855 direct sched_setattr uclamp/nice fallback, 3-cluster pinning, forensic toggle, DescriptorPlan dynamic UBO fix & PSS caps verified.")
+
+
+_verify_p13_sd855_sched_and_mem_opts()

@@ -2,6 +2,9 @@
 // Implementation of startup precomputation, state caching, and dynamic invalidation.
 
 #include "precompute.h"
+#ifdef __ANDROID__
+#include "../../platform.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -135,6 +138,9 @@ static void save_manifest(void) {
 
 static void *manifest_writer_thread(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    plat_thread_pin_background();
+#endif
     for (;;) {
         pthread_mutex_lock(&s_manifest_io_lock);
         while (!s_manifest_io_pending) pthread_cond_wait(&s_manifest_io_cond, &s_manifest_io_lock);

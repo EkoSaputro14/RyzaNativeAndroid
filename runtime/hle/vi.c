@@ -13,7 +13,7 @@ uint64_t g_native_window;
 
 static void *vsync_thread(void *arg) {
 #ifdef __ANDROID__
-    plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
+    plat_thread_pin_background();  // (not the presenting thread's fast cores: platform.h)
     crash_handler_install();
 #endif
     (void)arg;

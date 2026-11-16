@@ -265,6 +265,9 @@ static int c0_nevicted;  // (c0_m)
 static uint64_t c0_slice_ns;  // affinity handles BOTW's cross-core waits; slicing is diagnostic only
 static void *core0_slicer(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    plat_thread_pin_background();
+#endif
     for (;;) {
         struct timespec ts = {0, 2000000};
         nanosleep(&ts, NULL);
@@ -395,7 +398,7 @@ static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
 #ifdef __ANDROID__
-    plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
+    plat_thread_pin_fast();  // pin main (t80) & guest worker threads together onto Big/Prime cores
 #endif
     crash_handler_install();
     rt_set_fpcr(0);
@@ -842,6 +845,9 @@ static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 // LARECOMP_WATCHDOG=<seconds>: every that many seconds, the game's threads stuck in one svc for longer, with its
 // arguments and caller, and where each of the others is (its guest lr) - for hangs.
 static void *watchdog_main(void *arg) {
+#ifdef __ANDROID__
+    plat_thread_pin_background();
+#endif
     uint64_t every = (uint64_t)(uintptr_t)arg;
     for (;;) {
         sleep((unsigned)every);

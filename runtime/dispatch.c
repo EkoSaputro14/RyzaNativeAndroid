@@ -623,7 +623,7 @@ uint64_t g_watch_lo, g_watch_hi;
 static uint64_t watch_page;
 static void *watch_thread(void *a) {
 #ifdef __ANDROID__
-    plat_thread_unpin();  // (not the presenting thread's fast cores: platform.h)
+    plat_thread_pin_background();  // (not the presenting thread's fast cores: platform.h)
 #endif
     (void)a;
     int r = plat_protect(watch_page, PLAT_PAGE, PLAT_PROT_NONE);
@@ -674,7 +674,7 @@ static int rw_n;
 static volatile int rw_armed;
 static void *range_watch_thread(void *a) {
 #ifdef __ANDROID__
-    plat_thread_unpin();
+    plat_thread_pin_background();
 #endif
     (void)a;  // (armed late: the loader fills it through the kernel too, which would just fail - LARECOMP_WATCH_READ_DELAY s)
     const char *d = getenv("LARECOMP_WATCH_READ_DELAY");

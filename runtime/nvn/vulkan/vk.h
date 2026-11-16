@@ -163,6 +163,8 @@ void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags as
 void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
+void vk_collect_dead(void);
+void vk_texture_snapshots_trim(void);
 uint64_t vk_frame_counter(void);
 
 // ---- shaders / pipelines (shaders.c)

@@ -25,6 +25,7 @@ uint32_t g_ryza_captured_draw_count = 0;
 uint64_t g_ryza_3d_draw_count = 0;
 uint64_t g_ryza_character_draw_count = 0;
 bool g_ryza_capture_freeze = false;
+bool g_ryza_forensic_enabled = false;
 char g_ryza_session_id[32] = {0};
 static pthread_mutex_t g_ryza_capture_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_ryza_auto_dump_pending = 0;
@@ -89,7 +90,15 @@ const char *ryza_get_build_fingerprint(void) {
     return buf;
 }
 
+void ryza_forensics_set_enabled(bool enabled) {
+    ryza_capture_lock();
+    g_ryza_forensic_enabled = enabled;
+    ryza_capture_unlock();
+}
+
 void ryza_forensics_init(void) {
+    const char *e = getenv("LARECOMP_FORENSIC_CAPTURE");
+    g_ryza_forensic_enabled = (e && atoi(e) != 0);
     g_ryza_captured_draw_count = 0;
     g_ryza_3d_draw_count = 0;
     g_ryza_character_draw_count = 0;
@@ -103,6 +112,7 @@ void ryza_forensics_init(void) {
 
 void ryza_rearm_capture(void) {
     ryza_capture_lock();
+    g_ryza_forensic_enabled = true;
     g_ryza_capture_freeze = false;
     g_ryza_captured_draw_count = 0;
     memset(g_ryza_captured_draws, 0, sizeof(g_ryza_captured_draws));
@@ -111,7 +121,7 @@ void ryza_rearm_capture(void) {
 }
 
 RyzaDrawForensic *ryza_allocate_capture_slot(uint32_t icount, uint32_t attr_mask, bool has_bones, bool is_character, bool is_deformed) {
-    if (g_ryza_capture_freeze) return NULL;
+    if (!g_ryza_forensic_enabled || g_ryza_capture_freeze) return NULL;
 
     static uint32_t s_idx_char = 0; // 0..15: Character Skinned Meshes
     static uint32_t s_idx_def = 16;  // 16..23: Deformed Meshes
