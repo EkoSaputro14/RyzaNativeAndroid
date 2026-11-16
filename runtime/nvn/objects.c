@@ -1591,6 +1591,7 @@ NVN(nvnQueuePresentTexture) {
     if (!w) return;
     int i = (int)A(2);
     static uint64_t s_frame_cnt = 0;
+    static uint64_t s_last_frame_cnt = 0;
     static uint64_t s_last_log_ns = 0;
     {
         static uint64_t last_id = ~0ull;
@@ -1601,8 +1602,9 @@ NVN(nvnQueuePresentTexture) {
         if (s_last_log_ns == 0) s_last_log_ns = now_ns;
         if (now_ns - s_last_log_ns >= 3000000000ull) {
             double elapsed_s = (double)(now_ns - s_last_log_ns) / 1e9;
-            double fps = (double)s_frame_cnt / elapsed_s;
+            double fps = (double)(s_frame_cnt - s_last_frame_cnt) / elapsed_s;
             LOG("[render-heartbeat] total frames: %llu (%.1f fps)\n", (unsigned long long)s_frame_cnt, fps);
+            s_last_frame_cnt = s_frame_cnt;
             s_last_log_ns = now_ns;
         }
     }

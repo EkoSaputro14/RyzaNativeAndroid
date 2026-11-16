@@ -1153,7 +1153,7 @@ void vk_promote_scene_rt(NvnTexture *t) {
     if (on < 0) on = getenv("LARECOMP_NO_SCALE") == NULL;
     if (!on) return;
     TexBackend *b = tex_backend(t);
-    if (b->rs_group || b->uploaded) return;
+    if (b->rs_group || b->uploaded || b->gpu_owned || b->presented) return;
     b->rs_group = RS_SCENE;
     destroy_image(b);
     create_image(t, b);

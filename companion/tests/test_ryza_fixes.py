@@ -547,3 +547,39 @@ def _verify_p13_perf_optimizations():
 
 
 _verify_p13_perf_optimizations()
+
+
+def _verify_p13_binder_and_sync_fixes():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+
+    # 1. ADPF Binder proxy leak guard, 125 Hz rate limit, and single add-render-thread attempt
+    assert "state[0] = -1;" in android_c
+    assert "if (state[0] < 0) return;" in android_c
+    assert "s_tried_add_render" in android_c
+    assert "last_report_ns" in android_c and "8000000ull" in android_c
+
+    # 2. uclamp.min unsupported kernel short-circuit
+    assert "static atomic_bool unsupported;" in android_c
+    assert "errno == E2BIG || errno == ENOSYS || errno == EINVAL" in android_c
+
+    # 3. vk_promote_scene_rt protects GPU-owned / presented render targets
+    assert "if (b->rs_group || b->uploaded || b->gpu_owned || b->presented) return;" in textures_c
+
+    # 4. Thread-safe g_batch_pending replaces stale subs[cur_sub].main_begun check
+    assert "static _Atomic bool g_batch_pending;" in exec_c
+    assert "__atomic_load_n(&g_batch_pending, __ATOMIC_ACQUIRE)" in exec_c
+    assert "__atomic_store_n(&g_batch_pending, false, __ATOMIC_RELEASE);" in exec_c
+
+    # 5. Render heartbeat FPS uses interval delta frames
+    assert "s_last_frame_cnt" in objects_c
+    assert "(double)(s_frame_cnt - s_last_frame_cnt) / elapsed_s" in objects_c
+
+    print("  -> PASS: ADPF Binder leak guard, 125 Hz throttle, uclamp.min cache, gpu_owned RT guard, g_batch_pending & heartbeat FPS verified.")
+
+
+_verify_p13_binder_and_sync_fixes()

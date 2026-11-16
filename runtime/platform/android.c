@@ -1031,6 +1031,8 @@ static bool g_pinned;
 // sched_setattr with SCHED_FLAG_UTIL_CLAMP_MIN keeps the policy and priority; whether Android allows it (seccomp,
 // SELinux, the cgroup's uclamp.max) goes to the log once.
 static void uclamp_min_thread(void) {
+    static atomic_bool unsupported;
+    if (atomic_load(&unsupported)) return;
     static int want = -1;
     if (want < 0) {
         const char *e = getenv("LARECOMP_UCLAMP_MIN");
@@ -1048,6 +1050,8 @@ static void uclamp_min_thread(void) {
     } attr = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = (uint32_t)want};  // (KEEP_POLICY | KEEP_PARAMS |
                                                                                     //  UTIL_CLAMP_MIN; struct ver. 1)
     long r = syscall(__NR_sched_setattr, 0, &attr, 0);
+    if (r != 0 && (errno == E2BIG || errno == ENOSYS || errno == EINVAL || errno == EPERM || errno == EACCES))
+        atomic_store(&unsupported, true);
     static atomic_int logged;
     if (!atomic_exchange(&logged, 1))
         LOG("[android] uclamp.min %d for the game's threads: %s\n", want, r ? strerror(errno) : "ok");
@@ -1184,8 +1188,11 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
     APerformanceHintManager *m = get_manager();
     if (!m) return;
 
+    static uint64_t last_report_ns[2];
     if (!s_split) {
         // --- Single session mode (both threads in session[0]) ---
+        static bool s_tried_add_render;
+        if (state[0] < 0) return;
         if (!session[0]) {
             if (slot == 0) pin_to_fastest_cores();
             int32_t tids[2];
@@ -1193,6 +1200,8 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
             if (s_presenting_tid > 0) tids[ntids++] = s_presenting_tid;
             if (s_render_tid > 0) tids[ntids++] = s_render_tid;
             if (ntids > 0) {
+                // Mark failed before create() so unsupported devices never retry create() and leak Binder proxies
+                state[0] = -1;
                 session[0] = create(m, tids, (size_t)ntids, (int64_t)target_ns);
                 if (session[0]) {
                     s_session_threads = ntids;
@@ -1200,12 +1209,15 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
                     state[0] = 1;
                     LOG("[android] performance hint single session (%d thread%s): on\n", ntids, ntids > 1 ? "s" : "");
                 } else {
+                    state[1] = -1;
                     s_errors++;
                     s_last_error = errno;
+                    LOG("[android] performance hint single session: not available (%s)\n", strerror(errno));
                 }
             }
-        } else if (s_session_threads < 2 && s_presenting_tid > 0 && s_render_tid > 0) {
-            // Add the second thread to the active session
+        } else if (!s_tried_add_render && s_session_threads < 2 && s_presenting_tid > 0 && s_render_tid > 0) {
+            // Try adding the second thread to the active session once
+            s_tried_add_render = true;
             int32_t tids[2] = {s_presenting_tid, s_render_tid};
             int ok = 0;
             if (set_threads) {
@@ -1221,6 +1233,7 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
                     s_recreated++;
                     LOG("[android] performance hint session recreated with 2 threads: on\n");
                 } else {
+                    state[0] = state[1] = -1;
                     s_errors++;
                     s_last_error = errno;
                 }
@@ -1229,6 +1242,10 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         if (!session[0]) return;
         // Allow render thread (slot 1) to report directly when its work exceeds target_ns so cpu 6 stays boosted
         if (slot != 0 && work_ns <= target_ns) return;
+        // Rate limit ADPF Binder IPC to <= 125 Hz (>= 8 ms between reports)
+        uint64_t now_ns = plat_now_ns();
+        if (last_report_ns[0] && now_ns - last_report_ns[0] < 8000000ull) return;
+        last_report_ns[0] = now_ns;
 
         if (target_ns != target[0]) {
             int r = retarget(session[0], (int64_t)target_ns);
@@ -1275,6 +1292,9 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
             s_session_threads = (session[0] ? 1 : 0) + (session[1] ? 1 : 0);
         }
         if (!session[slot]) return;
+        uint64_t now_ns = plat_now_ns();
+        if (last_report_ns[slot] && now_ns - last_report_ns[slot] < 8000000ull) return;
+        last_report_ns[slot] = now_ns;
         if (target_ns != target[slot]) {
             int r = retarget(session[slot], (int64_t)target_ns);
             if (r != 0) { s_errors++; s_last_error = r; }
