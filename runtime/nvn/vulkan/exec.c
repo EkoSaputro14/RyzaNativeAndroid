@@ -919,6 +919,14 @@ static bool list_had_fence;
 static uint32_t batch_lists;
 static uint64_t batch_start_draws;
 
+void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
+
+void renderer_flush(void) {
+    renderer_submit();
+    if (!wait_why) wait_why = "flush";
+    vk_wait_seq(submit_seq);
+}
+
 bool vk_has_pending_commands(void) {
     Sub *s = &subs[cur_sub];
     return s->main_begun || s->upload_begun;
@@ -938,14 +946,6 @@ void vk_flush_pending_work(void) {
 #endif
     batch_lists = 0;
     batch_start_draws = stat_draws;
-}
-
-void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
-
-void renderer_flush(void) {
-    renderer_submit();
-    if (!wait_why) wait_why = "flush";
-    vk_wait_seq(submit_seq);
 }
 
 void renderer_sync(void) {
@@ -7613,7 +7613,7 @@ static void ryza_forensic_inspect_draw(Prog *pr, const PipeKey *pk, CmdRec *r, b
     g_ryza_3d_draw_count++;
 
     bool has_bone_idx = false;
-    bool has_bone_wgt = false;
+    bool has_bone_wgt = false; (void)has_bone_wgt;
     bool is_character = false;
     int pos_attr_hint = -1;
     int norm_attr_hint = -1;
