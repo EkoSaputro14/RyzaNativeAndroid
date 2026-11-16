@@ -18,6 +18,16 @@ include(${R}/android/gamelib_id.cmake)  # (GAMELIB_ID: the same as botwgame.so's
 message(STATUS "GAMELIB_ID ${GAMELIB_ID}")
 
 add_subdirectory(${R}/third_party/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+# Keep adrenotools/linkernsbypass symbols hidden inside libmain.so and libhook_impl.so so
+# -Wl,-z,global -Wl,-export-dynamic never exports linkernsbypass .bss pointers (e.g.
+# android_get_exported_namespace) into the process global symbol group and hijacks system PLTs.
+set_target_properties(adrenotools linkernsbypass PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+if(TARGET hook_impl)
+    target_link_options(hook_impl PRIVATE -Wl,--exclude-libs,liblinkernsbypass.a)
+endif()
 
 add_library(SDL3 SHARED IMPORTED)
 set_target_properties(SDL3 PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libSDL3.so)
@@ -50,6 +60,7 @@ set_source_files_properties(${UI_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-
 set_source_files_properties(${R}/runtime/gamelib.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 set_source_files_properties(${R}/runtime/gamebuild.c PROPERTIES COMPILE_DEFINITIONS "GAMELIB_ID=\"${GAMELIB_ID}\"")
 set_source_files_properties(${R}/runtime/android_libm_compat.c PROPERTIES COMPILE_OPTIONS "-fno-builtin")
+set_source_files_properties(${DEPS}/volk/volk.c ${IMGUI_SRC} PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
 
 execute_process(
     COMMAND git rev-parse --short HEAD
@@ -93,4 +104,4 @@ target_link_libraries(main PRIVATE SDL3 shaderc_shared adrenotools android log d
 # (runtime/hle.h, ipc.h, main.c: tables in named sections found through __start_ / __stop_ symbols)
 # -rdynamic / -Wl,-export-dynamic agar simbol-simbol runtime seperti g_fnprof, fnprof_hit, dll
 # dapat di-resolve saat dlopen() botwgame.so
-target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc -Wl,-z,global -Wl,-export-dynamic)
+target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc -Wl,-z,global -Wl,-export-dynamic -Wl,--exclude-libs,libadrenotools.a -Wl,--exclude-libs,liblinkernsbypass.a)

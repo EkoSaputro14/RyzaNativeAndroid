@@ -641,3 +641,23 @@ def _verify_p13_cpu_sync_fixes():
 
 
 _verify_p13_cpu_sync_fixes()
+
+
+def _verify_p13_adrenotools_symbol_isolation():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    main_cmake = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+    probe_cmake = (repo_root / "android" / "probe" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    for label, txt in (("main CMakeLists.txt", main_cmake), ("probe CMakeLists.txt", probe_cmake)):
+        assert "set_target_properties(adrenotools linkernsbypass PROPERTIES" in txt, label
+        assert "C_VISIBILITY_PRESET hidden" in txt and "CXX_VISIBILITY_PRESET hidden" in txt, label
+        assert "target_link_options(hook_impl PRIVATE -Wl,--exclude-libs,liblinkernsbypass.a)" in txt, label
+        assert "-Wl,--exclude-libs,libadrenotools.a" in txt and "-Wl,--exclude-libs,liblinkernsbypass.a" in txt, label
+
+    assert 'set_source_files_properties(${DEPS}/volk/volk.c ${IMGUI_SRC} PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")' in main_cmake
+    assert "-Wl,-z,nostart-stop-gc -Wl,-z,global -Wl,-export-dynamic" in main_cmake
+    print("  -> PASS: adrenotools/linkernsbypass/volk symbol isolation verified (prevents DF_1_GLOBAL android_get_exported_namespace collision).")
+
+
+_verify_p13_adrenotools_symbol_isolation()
