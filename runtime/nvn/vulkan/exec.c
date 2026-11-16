@@ -20,6 +20,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "stall_trace.h"
+uint64_t renderer_present_count(void);
 #include "timing_trace.h"
 #include "../renderer.h"
 #include "../../settings.h"
