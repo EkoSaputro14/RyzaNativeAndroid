@@ -572,8 +572,8 @@ def _verify_p13_binder_and_sync_fixes():
 
     # 4. Thread-safe g_batch_pending replaces stale subs[cur_sub].main_begun check
     assert "static _Atomic bool g_batch_pending;" in exec_c
-    assert "__atomic_load_n(&g_batch_pending, __ATOMIC_ACQUIRE)" in exec_c
-    assert "__atomic_store_n(&g_batch_pending, false, __ATOMIC_RELEASE);" in exec_c
+    assert "atomic_load_explicit(&g_batch_pending, memory_order_acquire)" in exec_c
+    assert "atomic_store_explicit(&g_batch_pending, false, memory_order_release);" in exec_c
 
     # 5. Render heartbeat FPS uses interval delta frames
     assert "s_last_frame_cnt" in objects_c

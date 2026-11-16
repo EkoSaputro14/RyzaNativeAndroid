@@ -698,7 +698,7 @@ static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
     *begun = true;
-    __atomic_store_n(&g_batch_pending, true, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_batch_pending, true, memory_order_release);
 }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
@@ -905,7 +905,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (game_pending) work_seq = submit_seq;  // (cleared when backend_execute is done: flushes inside it come first)
 #endif
     s->main_begun = s->upload_begun = false;
-    __atomic_store_n(&g_batch_pending, false, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_batch_pending, false, memory_order_release);
     pthread_mutex_unlock(&seq_lock);
     {
         static int log = -1;  // (LARECOMP_LOG_SYNCSEQ, renderer_wait_seq)
@@ -932,7 +932,7 @@ void renderer_flush(void) {
 }
 
 bool vk_has_pending_commands(void) {
-    return __atomic_load_n(&g_batch_pending, __ATOMIC_ACQUIRE);
+    return atomic_load_explicit(&g_batch_pending, memory_order_acquire);
 }
 
 void vk_flush_pending_work(void) {
@@ -961,7 +961,7 @@ void renderer_sync(void) {
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
-    uint64_t q = submit_seq + (__atomic_load_n(&g_batch_pending, __ATOMIC_ACQUIRE) ? 1 : 0);
+    uint64_t q = submit_seq + (atomic_load_explicit(&g_batch_pending, memory_order_acquire) ? 1 : 0);
 #ifdef __ANDROID__
     static int fence_present = -1;
     if (fence_present < 0) fence_present = getenv("LARECOMP_FENCE_PRESENT") != NULL;
