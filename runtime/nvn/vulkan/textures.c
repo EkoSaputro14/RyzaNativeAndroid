@@ -684,6 +684,8 @@ static void live_remove(TexBackend *b) {
     b->reg = 0;
 }
 
+static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = __atomic_load_n(&t->backend, __ATOMIC_ACQUIRE);
     if (b) {
@@ -775,7 +777,6 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
-static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Guest texels for a scaled image (the CPU filled a render target: the title screen's save pictures): they go into a
 // guest-size image of their own, then a filtered blit brings them to the allocation's size (SavageWindRecomp's).
