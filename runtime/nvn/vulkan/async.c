@@ -452,6 +452,8 @@ static void mark_fences(uint64_t p, uint64_t id, int depth) {
             if (!s) { s = calloc(1, sizeof *s); SET_HOST(r->x[1], s); }
             s->signaled = 1;
             s->lseq = id;
+            extern void nvn_note_newest_fence_lseq(uint64_t lseq);
+            nvn_note_newest_fence_lseq(id);
         }
         if (!r->size) return;
         p += r->size;

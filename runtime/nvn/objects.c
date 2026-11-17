@@ -353,11 +353,19 @@ uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
 #ifdef __ANDROID__
 static uint64_t g_newest_fence_lseq;  // (sync lag, nvnSyncWait: the render thread's request of the newest fence placed)
+void nvn_note_newest_fence_lseq(uint64_t lseq) {
+    if (lseq > __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED))
+        __atomic_store_n(&g_newest_fence_lseq, lseq, __ATOMIC_RELAXED);
+}
 NVN(nvnQueueFenceSync) {
     NvnSync *s = sync_of(A(1));
     if (!s) return;
     s->signaled = 1;
-    if (vk_async_on()) s->lseq = g_newest_fence_lseq = vk_async_fence(A(1));  // (its submission: once the render thread gets there)
+    if (vk_async_on()) {
+        uint64_t lseq = vk_async_fence(A(1));
+        s->lseq = lseq;
+        nvn_note_newest_fence_lseq(lseq);
+    }  // (its submission: once the render thread gets there)
     else s->seq = renderer_fence_seq();
     extern uint64_t renderer_present_count(void);
     s->frame = renderer_present_count();
@@ -421,7 +429,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // lag on from the start, some ponds stayed white for the whole session, and turned on later in play they were right
     // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
     // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
-    if (lag > 0 && env_lag < 0) {
+    if (lag > 0 && env_lag < 0 && g_game_version >= 182) {
         enum { LAG_SETTLE = 300 };
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
         static uint64_t world_since;
@@ -435,7 +443,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     int ab = vk_ab("synclag");
     bool lag_now = vk_async_on() && !flush && !whole && (ab >= 0 ? ab == 1 : lag > 0);
     static uint64_t prev_newest_seq;  // (kept with the lag off too: turned on, it waits one frame back, not more)
-    bool newest = vk_async_on() && sync_of(A(0))->lseq == g_newest_fence_lseq;
+    bool newest = vk_async_on() && sync_of(A(0))->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED);
     uint64_t newest_prev = prev_newest_seq;
     if (newest) prev_newest_seq = sync_of(A(0))->seq;
     if (lag_now && newest) {

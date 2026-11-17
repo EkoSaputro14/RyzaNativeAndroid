@@ -958,3 +958,31 @@ def _verify_p13_sprint4_heap_split_spin():
 
 
 _verify_p13_sprint4_heap_split_spin()
+
+def _verify_p13_sprint5_synclag_and_present_latency():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+
+    # 1. Remove forced sync_lag=0 override; default sync_lag=1 while respecting botwrecompandroid.ini
+    assert ".sync_lag = true," in settings_c
+    assert "g_settings.sync_lag = false;" not in settings_c
+    assert "forced sync_lag=" not in settings_c
+    assert "void nvn_note_newest_fence_lseq(uint64_t lseq)" in objects_c
+    assert "nvn_note_newest_fence_lseq(id);" in async_c
+    assert "if (lag > 0 && env_lag < 0 && g_game_version >= 182)" in objects_c
+
+    # 2. Swapchain triple-buffering + pre-acquire 3D submission + skip 120Hz display-timing IPC
+    assert "if (count > 3 && caps.minImageCount <= 3) count = 3;" in device_c
+    assert "#define FRAMES 4" in device_c
+    assert "if (p && p < 12000000ull) return;" in device_c
+    assert "if (vk_has_pending_commands()) renderer_submit();" in device_c
+    assert device_c.index("if (vk_has_pending_commands()) renderer_submit();") < device_c.index("bool have = vk_frame_begin(black);")
+
+    print("  -> PASS: p13 Sprint #5 (sync_lag=1 default + CMD_FENCE_SYNC tracking + triple-buffer/pre-submit present latency) verified.")
+
+
+_verify_p13_sprint5_synclag_and_present_latency()

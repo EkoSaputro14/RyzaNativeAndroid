@@ -64,7 +64,7 @@ Settings g_settings = {
 #ifdef __ANDROID__
     .upscaler = UPSCALE_BILINEAR,  // (one pass: ~1 ms on the Adreno 830 to 2560x1440, FSR 1's two ~2.7 ms; 40 fps against 38)
     .native_code = true,       // (an experiment: runtime/native.c)
-    .sync_lag = false,         // (false on Android: avoids CPU race on bone/vertex buffers that causes stretched polygons)
+    .sync_lag = true,          // (true on Android: 1-frame CPU/GPU pipelining; override via sync_lag=0 in botwrecompandroid.ini)
     .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 640 from 1440p down by 4.8x for 45-60 FPS)
     .heap_mb = 3328,           // (3328 MB / HEAP_MAX default on Android: Ryza requires ~3220 MB Switch heap at boot)
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
@@ -370,13 +370,12 @@ void settings_load(void) {
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
 #ifdef __ANDROID__
-    g_settings.sync_lag = false;
     g_settings.upscaler = UPSCALE_BILINEAR;
     if (g_settings.out_lines <= 0 || g_settings.out_lines == OUT_AUTO) g_settings.out_lines = 720;
     if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.68f;
 #endif
     extern int g_exec_mode;
-    LOG("[settings] loaded %s (forced sync_lag=%d, upscaler=%d, exec_mode=%d)\n",
+    LOG("[settings] loaded %s (sync_lag=%d, forced upscaler=%d, exec_mode=%d)\n",
         SETTINGS_FILE, g_settings.sync_lag, g_settings.upscaler, g_exec_mode);
 }
 

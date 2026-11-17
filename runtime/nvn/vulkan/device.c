@@ -1065,8 +1065,8 @@ static void create_swapchain(void) {
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
     uint32_t count = caps.minImageCount + 1;
+    if (count > 3 && caps.minImageCount <= 3) count = 3;  // triple buffering: cuts BufferQueue/swapchain stall vs 5+ images
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
-    if (count > 8) count = 8;  // (asked for: the driver may make more, up to VK_MAX_SWAP_IMAGES)
     if (count < caps.minImageCount) count = caps.minImageCount;
     const char *sc_env = getenv("LARECOMP_SWAP_IMAGES");  // (a test switch: as many as a driver that makes more)
     if (sc_env && atoi(sc_env) > 0) count = (uint32_t)atoi(sc_env);
@@ -1107,6 +1107,8 @@ static void create_swapchain(void) {
     if (g_vk.sc_count > VK_MAX_SWAP_IMAGES)
         FATAL("Driver created %u swapchain images; renderer supports at most %d.\n", g_vk.sc_count, VK_MAX_SWAP_IMAGES);
     VK_CHECK(vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images));
+    LOG("[vk] swapchain ready: %ux%u, %u images (requested %u, min %u max %u)\n",
+        g_vk.sc_extent.width, g_vk.sc_extent.height, g_vk.sc_count, count, caps.minImageCount, caps.maxImageCount);
 #else
     g_vk.sc_count = VK_MAX_SWAP_IMAGES;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
@@ -1205,7 +1207,7 @@ static bool android_surface_ready(void) {  // false: no window to draw into now
 
 // ================================================================== frames (start screen and game)
 // Acquire semaphores rotate per frame in flight; a slot is reused once the submission that waited on it is done.
-#define FRAMES 3
+#define FRAMES 4
 static VkSemaphore acquire_sem[FRAMES], done_sem[VK_MAX_SWAP_IMAGES];
 static uint64_t slot_seq[FRAMES];
 static int slot;
@@ -1366,6 +1368,7 @@ static void vsync_update(uint64_t queued) {
         if (!p != !was || (p > was ? p - was : was - p) > was / 100) LOG("[pace] display vsync %.3f ms\n", p / 1e6);
         __atomic_store_n(&vs_period, p, __ATOMIC_RELAXED);
     }
+    if (p && p < 12000000ull) return;  // 120 Hz+ does not use backend_vsync_offset; skip per-frame SurfaceFlinger IPC
     VkPastPresentationTimingGOOGLE past[8];
     uint32_t n = 8;
     if (vkGetPastPresentationTimingGOOGLE(g_vk.dev, g_vk.swapchain, &n, past) < 0) n = 0;  // (INCOMPLETE: the newest 8)
@@ -1422,16 +1425,19 @@ void vk_frame_end(const char *shot_path) {
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
 #ifdef __ANDROID__
     uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
+    static uint32_t pres_frames;
+    uint64_t p_cur = __atomic_load_n(&vs_period, __ATOMIC_RELAXED);
+    bool want_timing = display_timing && (!p_cur || p_cur >= 12000000ull || ((++pres_frames) & 127u) == 0);
     // (Android times only the presents that carry an id; desiredPresentTime 0: shown as soon as it can be, as before)
-    VkPresentTimeGOOGLE when = {.presentID = ++present_id};
+    VkPresentTimeGOOGLE when = {.presentID = want_timing ? ++present_id : present_id};
     VkPresentTimesInfoGOOGLE times = {.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1,
                                       .pTimes = &when};
-    if (display_timing) pi.pNext = &times;
+    if (want_timing) pi.pNext = &times;
     uint64_t queued = plat_now_ns();
 #endif
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
 #ifdef __ANDROID__
-    if (display_timing && r >= 0) vsync_update(queued);
+    if (want_timing && r >= 0) vsync_update(queued);
     if (trace_start) vk_timing_trace_wait(VK_TIMING_PRESENT, SDL_GetTicksNS() - trace_start);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) recreate_swapchain();  // (SUBOPTIMAL: every frame of an unrotated swapchain)
     else if (r == VK_ERROR_SURFACE_LOST_KHR) surface_lost = true;
@@ -1546,6 +1552,10 @@ void backend_present(NvnTexture *t) {
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded, as before anything outside a pass)
 #endif
+    // Kick the 3D scene GPU submission before acquiring a swapchain image so Adreno renders the scene
+    // concurrently while vkAcquireNextImageKHR waits and present_ms measures only acquire/blit/present.
+    extern bool vk_has_pending_commands(void);
+    if (vk_has_pending_commands()) renderer_submit();
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = plat_now_ns();
     stall_note_active_work("vk_acquire");
