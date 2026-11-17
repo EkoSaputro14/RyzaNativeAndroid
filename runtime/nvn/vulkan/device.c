@@ -756,8 +756,10 @@ static void create_device(void) {
         f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess;
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
         g_vk.fp16_supported = true;
-        LOG("[vk-cap] fp16_shaders=%d (device shaderFloat16=%s, SPIR-V RelaxedPrecision active)\n",
-            g_settings.fp16_shaders, h12.shaderFloat16 ? "on" : "mediump");
+        settings_load();
+        LOG("[vk-cap] fp16_shaders=%d (device shaderFloat16=%s, SPIR-V RelaxedPrecision %s)\n",
+            g_settings.fp16_shaders, h12.shaderFloat16 ? "on" : "mediump",
+            g_settings.fp16_shaders ? "active" : "off");
         // nor 16-bit storage: no translated or built-in shader declares it, and the Adreno 610 under Turnip lacks it
         // (LAS Recomp's issue #4). LARECOMP_VK_NO_STORAGE16=1 (test): as if it lacked it.
         if (env_on("LARECOMP_VK_NO_STORAGE16"))

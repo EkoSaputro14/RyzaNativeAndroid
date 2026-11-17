@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 46" in gradle_kts and "0.3.2-forensic-p14" in gradle_kts
+    assert "versionCode = 47" in gradle_kts and "0.3.2-forensic-p15" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 46" in gradle_kts and "0.3.2-forensic-p14" in gradle_kts
+    assert "versionCode = 47" in gradle_kts and "0.3.2-forensic-p15" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1055,3 +1055,41 @@ def _verify_p14_zero_hardcoding_and_gpu_optimizations():
 
 
 _verify_p14_zero_hardcoding_and_gpu_optimizations()
+
+
+def _verify_p15_zero_copy_global_memory_and_fp16_banner() -> None:
+    from pathlib import Path
+    print("[TEST] Verifying p15 Zero-Copy/Persistent Arena Global Memory Coalescing, Frame-Indexed SyncLag, and fp16_shaders Banner...")
+    repo_root = Path(__file__).resolve().parents[2]
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    heaps_c = (repo_root / "runtime" / "hle" / "heaps.c").read_text(encoding="utf-8")
+
+    # 1. Persistent device-local host-visible coherent arena + no misleading CPU copy log banner
+    assert 'LOG("[vk] no heap import: shader global memory through CPU copies\n")' not in exec_c
+    assert "persistent device-local host-visible coherent arena + dirty-range coalescing" in exec_c
+    assert ".requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT" in exec_c
+    assert ".preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT" in exec_c
+
+    # 2. Per-submission coalescing of UBOs (guest_copy) and global memory (s_gprep_cache, ga_load_copy, gres_sync)
+    assert "s_gprep_cache" in exec_c
+    assert "gcopy[slot].sub_seq == sub_seq" in exec_c
+    assert "size > HEAP_MAX" in exec_c
+    assert "plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX)" in exec_c
+
+    # 3. Frame-indexed sync_lag in nvnSyncWait + REQ_FENCE scan-through in async.c + memset 0xef skip in heaps.c
+    assert "lag_cur_frame" in objects_c and "lag_frame_max_seq" in objects_c
+    assert "nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE" in async_c
+    assert 'HLE_FUNC("memset", hle_guest_memset)' in heaps_c
+
+    # 4. fp16_shaders capability log banner and strict guard
+    assert 'g_settings.fp16_shaders ? "active" : "off"' in device_c
+    assert "if (!g_settings.fp16_shaders) return spv;" in shaders_c
+
+    print("  -> PASS: p15 (Persistent BAR arena + per-submit UBO/global memory coalescing + frame-indexed sync_lag + fp16_shaders banner) verified.")
+
+
+_verify_p15_zero_copy_global_memory_and_fp16_banner()

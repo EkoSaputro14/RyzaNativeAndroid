@@ -443,11 +443,25 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     int ab = vk_ab("synclag");
     bool lag_now = vk_async_on() && !flush && !whole && (ab >= 0 ? ab == 1 : lag > 0);
     static uint64_t prev_newest_seq;  // (kept with the lag off too: turned on, it waits one frame back, not more)
-    bool newest = vk_async_on() && sync_of(A(0))->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED);
-    uint64_t newest_prev = prev_newest_seq;
-    if (newest) prev_newest_seq = sync_of(A(0))->seq;
-    if (lag_now && newest) {
-        uint64_t seq = sync_of(A(0))->seq, target = newest_prev < seq ? newest_prev : seq;
+    static uint64_t prev2_newest_seq;
+    static uint64_t lag_cur_frame = ~0ull, lag_frame_max_seq;
+    extern uint64_t renderer_present_count(void);
+    uint64_t cur_pf = renderer_present_count();
+    uint64_t cur_fseq = sync_of(A(0))->seq;
+    if (cur_pf != lag_cur_frame) {
+        if (lag_cur_frame != ~0ull && lag_frame_max_seq > prev_newest_seq) {
+            prev2_newest_seq = prev_newest_seq;
+            prev_newest_seq = lag_frame_max_seq;
+        }
+        lag_cur_frame = cur_pf;
+        lag_frame_max_seq = cur_fseq;
+    } else if (cur_fseq > lag_frame_max_seq) {
+        lag_frame_max_seq = cur_fseq;
+    }
+    uint64_t newest_prev = (lag >= 2 && prev2_newest_seq) ? prev2_newest_seq : prev_newest_seq;
+    bool can_lag = vk_async_on() && (cur_fseq >= newest_prev || sync_of(A(0))->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED));
+    if (lag_now && can_lag) {
+        uint64_t seq = cur_fseq, target = newest_prev < seq ? newest_prev : seq;
         // (3: the newest frame's write-backs waited for - they land once their submission is done, vulkan/exec.c wb_apply)
         extern uint64_t vk_last_writeback_seq(void);
         static uint64_t n, wb_n, wb_pos, st_n, st_pos;  // (LARECOMP_LOG_SYNC_LAG: how often, how far into the frame)

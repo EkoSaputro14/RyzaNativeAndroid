@@ -237,7 +237,7 @@ static void *render_main(void *arg) {
         if (r.type == REQ_EXEC) {
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
                 int nt = q[scan % QN].type;
-                if (nt == REQ_TEX_REG || nt == REQ_SMP_REG) continue;
+                if (nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE) continue;
                 next_needs_submit = (nt == REQ_PRESENT || nt == REQ_FLUSH);
                 break;
             }
@@ -312,13 +312,14 @@ static uint64_t push(int type, uint64_t a, void *p) {
         g_vk_render_started = true;
         pthread_create(&g_vk_render_thread, NULL, render_main, NULL);
     }
-    if (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) {
-        bool pres_wait = (type == REQ_PRESENT && q_presents >= ahead);
+    int max_ahead = (g_settings.sync_lag >= 2 && ahead < 2) ? 2 : ahead;
+    if (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= max_ahead)) {
+        bool pres_wait = (type == REQ_PRESENT && q_presents >= max_ahead);
         pthread_mutex_unlock(&q_lock);
         uint64_t w0 = plat_now_ns();
         kernel_blocking_begin();
         pthread_mutex_lock(&q_lock);
-        while (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) pthread_cond_wait(&q_less, &q_lock);
+        while (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= max_ahead)) pthread_cond_wait(&q_less, &q_lock);
         pthread_mutex_unlock(&q_lock);
         kernel_blocking_end();
         uint64_t w1 = plat_now_ns();

@@ -1294,36 +1294,64 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     return s;
 }
 
-// Guest memory copied once per submission: draws binding the same range share the copy.
+// Guest memory copied and coalesced per submission: draws across batched lists binding an unchanged range share the copy.
+static uint64_t hmix(uint64_t h, const void *p, size_t n);
+int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
 #define GCOPY_TAB 4096
-static struct { uint64_t addr, size, seq; VkSpan span; } gcopy[GCOPY_TAB];
+static struct { uint64_t addr, size, seq, sub_seq, gen, hash; uint32_t pt_gen; VkSpan span; } gcopy[GCOPY_TAB];
 static uint16_t gcopy_active[GCOPY_TAB];
 static int gcopy_nactive;
 static uint64_t gcopy_active_seq;
-static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
-static void guest_copy_flush(void) { gcopy_gen++; gcopy_nactive = 0; }
+static uint64_t gcopy_gen;  // bumped between batched command lists
+static void guest_copy_flush(void) { gcopy_gen++; }
 static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
-    uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40);
-    if (gcopy_active_seq != seq) return;
+    uint64_t sub_seq = vk_pending_seq() + (desc_epoch << 40);
+    if (gcopy_active_seq != sub_seq) return;
     for (int i = 0; i < gcopy_nactive; i++) {
         uint16_t s = gcopy_active[i];
-        if (gcopy[s].seq == seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) gcopy[s].seq = 0;
+        if (gcopy[s].sub_seq == sub_seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) {
+            gcopy[s].seq = 0;
+            gcopy[s].sub_seq = 0;
+        }
     }
 }
 static uint64_t stat_gcopy_calls, stat_gcopy_hits;
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     stat_gcopy_calls++;
-    uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
-    if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
+    uint64_t sub_seq = vk_pending_seq() + (desc_epoch << 40);
+    uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40);
+    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    if (gcopy_active_seq != sub_seq) { gcopy_active_seq = sub_seq; gcopy_nactive = 0; }
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
-        stat_gcopy_hits++;
-        return gcopy[slot].span;
+    if (gcopy[slot].sub_seq == sub_seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
+        if (gcopy[slot].gen == gcopy_gen) {
+            stat_gcopy_hits++;
+            return gcopy[slot].span;
+        }
+        uint64_t cur_h = size <= 4096 ? hmix(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size) : 0;
+        uint32_t now_pt = 0;
+        int chg = size > 4096 ? vk_pages_changed(addr, size, gcopy[slot].pt_gen, &now_pt) : -1;
+        if ((size <= 4096 && cur_h == gcopy[slot].hash) || (size > 4096 && chg == 0)) {
+            gcopy[slot].gen = gcopy_gen;
+            gcopy[slot].seq = seq;
+            if (now_pt) gcopy[slot].pt_gen = now_pt;
+            stat_gcopy_hits++;
+            return gcopy[slot].span;
+        }
     }
-    if (gcopy[slot].seq != seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
+    if (gcopy[slot].sub_seq != sub_seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     stat_cb_copied += size;
-    gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s;
+    uint32_t now_pt = 0;
+    if (size > 4096) (void)vk_pages_changed(addr, size, 0, &now_pt);
+    gcopy[slot].addr = addr;
+    gcopy[slot].size = size;
+    gcopy[slot].seq = seq;
+    gcopy[slot].sub_seq = sub_seq;
+    gcopy[slot].gen = gcopy_gen;
+    gcopy[slot].hash = size <= 4096 ? hmix(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size) : 0;
+    gcopy[slot].pt_gen = now_pt;
+    gcopy[slot].span = s;
     return s;
 }
 
@@ -1824,9 +1852,14 @@ void vk_get_frame_split_stats(double *guest_exec_ms, double *sync_wait_ms, doubl
 
 // Baked state changes and pass restarts invalidate the last pipeline; dynamic state does not.
 static bool pipeline_dirty = true;
+static uint64_t sbuf_gen = 1;
+#ifdef __ANDROID__
+static bool gres_init(void);
+#endif
 
 static void st_defaults(void) {
     pipeline_dirty = true;
+    sbuf_gen++;
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
@@ -1847,11 +1880,15 @@ void vk_exec_init(void) {
     extern void vk_memfd_probe(void);
     vk_memfd_probe();  // (LARECOMP_MEMFD_PROBE=1: memfd_probe.c)
     gcopy_mode = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");
-    if (gcopy_mode) LOG("[vk] no heap import: shader global memory through CPU copies\n");
-    // (for good, without placed memory: the vertex cache and the texture checks fed by write tracking - vc_flush)
-    // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
+    if (gcopy_mode) {
+        bool have_arena = gres_init();
+        LOG("[vk] shader global memory: %s (placed=%s, dmabuf=%s, fd=%s)\n",
+            have_arena ? "persistent device-local host-visible coherent arena + dirty-range coalescing"
+                       : "transient ring fallback",
+            g_vk.map_placed ? "yes" : "no", g_vk.mem_dmabuf ? "yes" : "no", g_vk.mem_fd ? "yes" : "no");
+    }
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + rt_heap_max_bytes());
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -4835,7 +4872,7 @@ static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uni
 
 static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static int on = -1;
-    if (on < 0) on = getenv("LARECOMP_UBO_DIRECT") && atoi(getenv("LARECOMP_UBO_DIRECT"));
+    if (on < 0) { const char *e = getenv("LARECOMP_UBO_DIRECT"); on = e ? atoi(e) != 0 : 1; }
     extern int vk_ab(const char *what);
     if (!(on || AB("ubo") == 1) || !gmem_placed || addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size) return false;
     uint64_t off = addr - HEAP_BASE;
@@ -4985,32 +5022,20 @@ bool vk_heap_place(uint64_t size) {
     // OS's write tracking - vk_exec_init turns it on only without placed memory at all, so a Turnip that has it but
     // isn't an Adreno 8xx (Automatic) had neither: every vertex and index buffer copied each frame, ~150 MB, 7-9 fps
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
-#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + rt_heap_max_bytes()) : (void)0, false)
-    // Without placed maps, the same through an exported file (VK_KHR_external_memory_fd, a dma-buf) mapped at the heap's
-    // address by mmap (after legendszaonandroid's VULKAN_BACKEND.md, MIT; memfd_probe.c tests it): Mali and Xclipse
-    // have neither the placed map nor the import, and their CPU copies with write tracking were slow and ran the
-    // process out of memory mappings (#196). Off unless the start screen's Driver compatibility turns it on
-    // (g_settings.heap_file) - untried on a Mali yet (the import there lost the menus' text and ran out of memory, #44
-    // #118); on the POCO's Turnip, forced in place of the placed map, the world played as with it (2026-11-03).
-    // LARECOMP_VK_MEMFD=1 / 0: on / off whatever the setting.
+#define NOT_PLACED() (gcopy_mode ? (gres_init(), plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX)) : (void)0, false)
     extern bool vk_heap_file_asked(void);
-    bool memfd = vk_heap_file_asked();
-    if (g_settings.heap_file && !g_vk.mem_fd)  // (the setting on where it can't be: said, not silent - #249)
+    bool memfd = vk_heap_file_asked() || (!g_vk.map_placed && g_vk.mem_fd && g_settings.gpu_heap > 0);
+    if (g_settings.heap_file && !g_vk.mem_fd)
         LOG("[vk] game memory through a shared file: on in the settings, but this driver can't export its memory (no "
-            "VK_KHR_external_memory_fd) - shader global memory through CPU copies\n");
+            "VK_KHR_external_memory_fd) - using persistent device-local host-visible coherent arena\n");
     if ((!g_vk.map_placed && !memfd) || getenv("LARECOMP_VK_NO_PLACED")) return NOT_PLACED();
     extern bool vk_turnip_heap_on(int setting);
     if (memfd ? g_settings.gpu_heap == 0 : !vk_turnip_heap_on(g_settings.gpu_heap)) {
-        // (the start screen's Driver compatibility: Automatic is on wherever Turnip places it - vulkan/device.c)
-        LOG("[vk] guest heap as GPU memory: off (%s) - shader global memory through CPU copies\n",
+        LOG("[vk] guest heap as GPU memory: off (%s) - using persistent device-local host-visible coherent arena\n",
             g_settings.gpu_heap < 0 ? "automatic: not Turnip" : "settings");
         return NOT_PLACED();
     }
-    {   // The placed heap is committed at once (~3.1 GB for BOTW), where CPU copies commit only the pages the game
-        // touches: on a 6 GB phone with it turned on by hand, Android killed the app as the world loaded (issue #83,
-        // Adreno 640, 3.6 GB in use). Below ~7 GB of RAM (6 GB phones report ~5.5, 8 GB ones ~7.4) or when MemAvailable
-        // cannot spare the upfront allocation plus ~1.5 GB headroom for the runtime/driver/recomp SO: CPU copies.
-        // LARECOMP_HEAP_ANY_RAM=1: placed anyway.
+    {
         long total_kb = 0, avail_kb = 0;
         FILE *f = fopen("/proc/meminfo", "r");
         if (f) {
@@ -5023,18 +5048,19 @@ bool vk_heap_place(uint64_t size) {
             }
             fclose(f);
         }
-        long need_kb = (long)(size >> 10) + 1536L * 1024L;
-        if (((total_kb && total_kb < 7L * 1024 * 1024) || (avail_kb && avail_kb < need_kb)) &&
+        long budget_kb = (long)(rt_heap_max_bytes() >> 10);
+        long need_kb = budget_kb + 512L * 1024L;
+        if (((total_kb && total_kb < 6800L * 1024L && g_settings.gpu_heap <= 0) || (avail_kb && avail_kb < need_kb)) &&
             !getenv("LARECOMP_HEAP_ANY_RAM")) {
-            LOG("[vk] guest heap as GPU memory: off (MemTotal %ld MB, MemAvail %ld MB: placing %llu MB needs >= %ld MB free) - "
-                "shader global memory through CPU copies\n",
-                total_kb >> 10, avail_kb >> 10, (unsigned long long)(size >> 20), need_kb >> 10);
+            LOG("[vk] full guest heap placement deferred (MemTotal %ld MB, MemAvail %ld MB, budget %ld MB): "
+                "using 128 MB persistent device-local host-visible coherent arena + dirty-range coalescing\n",
+                total_kb >> 10, avail_kb >> 10, need_kb >> 10);
             return NOT_PLACED();
         }
     }
     uint64_t align = g_vk.placed_align > 65536 ? g_vk.placed_align : 65536;
     size = (size + align - 1) & ~(align - 1);
-    if ((HEAP_BASE & (align - 1)) || size > rt_heap_max_bytes()) {
+    if ((HEAP_BASE & (align - 1)) || size > HEAP_MAX) {
         LOG("[vk] heap placement: %llx / %llu MB doesn't fit (alignment %llu)\n", (unsigned long long)HEAP_BASE,
             (unsigned long long)(size >> 20), (unsigned long long)align);
         return NOT_PLACED();
@@ -5102,8 +5128,8 @@ bool vk_heap_place(uint64_t size) {
     if (r != VK_SUCCESS || p != (void *)(uintptr_t)HEAP_BASE) {
         // (memory types the buffer takes: with an exported file on an Xclipse 530 none of them was host-visible and
         // coherent, -8, #234)
-        LOG("[vk] heap placement failed (%d, mapped at %p, type %d, the buffer's memory types 0x%x%s): shader global memory "
-            "through CPU copies\n", r, p, type, mr.memoryTypeBits, memfd ? ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf" : ", an exported file" : "");
+        LOG("[vk] heap placement failed (%d, mapped at %p, type %d, the buffer's memory types 0x%x%s): using persistent "
+            "device-local host-visible coherent arena\n", r, p, type, mr.memoryTypeBits, memfd ? ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf" : ", an exported file" : "");
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // (freeing a placed map unmaps it: the window gets its pages back)
         if (p == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
         vkDestroyBuffer(g_vk.dev, buf, NULL);
@@ -5367,6 +5393,7 @@ typedef struct {
     bool learned, stored;  // (made by gres_learn; a shader has stored into it: never let go)
     bool spare;            // (a learned window out of gl_learned: let go when the space runs out - ga_res_alloc)
     uint64_t dead_seq;     // (let go: its space reusable once that submission is done - ga_free)
+    uint32_t pt_gen;       // page write-tracking generation to skip full memcmp scans when CPU pages are clean
 } GaRes;
 static GaRes ga_res[GA_NRES];
 static int ga_nres;
@@ -5426,6 +5453,8 @@ static bool gres_init(void) {
     // (cached: the CPU reads the GPU's stores back. Adreno's Turnip has a cached coherent type; Mali's cached one
     // isn't coherent - flushed and invalidated by hand, ga_noncoherent)
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                  .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   .flags = (getenv("LARECOMP_GA_UNCACHED") ? VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
                                                                            : VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT) |
                                            VMA_ALLOCATION_CREATE_MAPPED_BIT};  // (LARECOMP_GA_UNCACHED=1, a test)
@@ -5484,6 +5513,10 @@ static void gres_sync(GaRes *e) {
     e->checked = frame;
     const uint8_t *g = (const uint8_t *)(uintptr_t)(HEAP_BASE + e->lo);
     uint64_t len = e->hi - e->lo;
+    uint32_t now_pt = 0;
+    int chg = vk_pages_changed(HEAP_BASE + e->lo, len, e->pt_gen, &now_pt);
+    if (now_pt) e->pt_gen = now_pt;
+    if (chg == 0) return;
     VkCommandBuffer barrier_cb = VK_NULL_HANDLE;
     for (uint64_t b = 0; b < len;) {
         if (!memcmp(g + b, e->shadow + b, 256)) { b += 256; continue; }
@@ -5596,7 +5629,9 @@ static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
     uint64_t *bseq = calloc((len + 255) / 256, sizeof *bseq);
     if (!shadow || !bseq) { free(shadow); free(bseq); if (slot == ga_nres - 1) ga_nres--; return NULL; }
     const uint8_t *g = (const uint8_t *)(uintptr_t)(HEAP_BASE + ulo);
-    *n = (GaRes){ulo, uhi, at, renderer_present_count() + 1, shadow, true, bseq};  // (synced: this frame)
+    uint32_t init_pt = 0;
+    (void)vk_pages_changed(HEAP_BASE + ulo, len, 0, &init_pt);
+    *n = (GaRes){ulo, uhi, at, renderer_present_count() + 1, shadow, true, bseq, false, false, false, 0, init_pt};  // (synced: this frame)
     memcpy(shadow, g, len);
     memcpy(ga_ptr + n->off, g, len);  // (a new slot: nothing on the GPU uses it yet)
     ga_wrote(n->off, len);
@@ -5655,30 +5690,40 @@ static void gres_learn(uint32_t off) {
         memmove(gl_learned, gl_learned + 1, sizeof gl_learned[0] * --gl_n);
     }
     gl_learned[gl_n++] = (GcRange){in->lo, in->hi};
+    sbuf_gen++;
     LOG("[vk] global memory: shaders reach heap %x outside their tables - %llx+%llx goes in every table\n", off,
         (unsigned long long)in->lo, (unsigned long long)(in->hi - in->lo));
 }
 
-// Load-only arena copies are immutable until their submission retires. Compare against that exact copy;
-// no assumption that guest memory remains unchanged between draws.
+// Load-only arena copies are immutable until their submission retires. Coalesce across batched lists and submissions
+// using page write-tracking and guest-RAM hashing so unchanged global memory ranges are not re-copied per draw.
 static uint64_t ga_load_copy(uint64_t at, uint64_t size) {
-    static struct { uint64_t at, size, off, seg_gen, gen; uint32_t pt_gen; bool valid; } cache[256];
+    static struct { uint64_t at, size, off, seg_gen, gen, hash; uint32_t pt_gen; bool valid; } cache[256];
     static int reuse = -1;
     if (reuse < 0) { const char *e = getenv("LARECOMP_GCOPY_REUSE"); reuse = !e || atoi(e) != 0; }
     uint64_t seq = vk_pending_seq();
     unsigned slot = (unsigned)((at >> 8) ^ (size >> 8) ^ (at >> 16)) & 255;
     const uint8_t *src = (const uint8_t *)(uintptr_t)(HEAP_BASE + at);
-    if (reuse && cache[slot].valid && cache[slot].gen == gcopy_gen &&
-        cache[slot].at == at && cache[slot].size == size) {
+    if (reuse && cache[slot].valid && cache[slot].at == at && cache[slot].size == size) {
         uint64_t seg = cache[slot].off / GA_SEG;
         uint64_t cur_seg = ga_head / GA_SEG;
         uint64_t next_seg = cur_seg + 1 >= GA_SIZE / GA_SEG ? GA_RES / GA_SEG : cur_seg + 1;
-        // Reuse across submissions if the segment hasn't wrapped and isn't the immediate next segment to be recycled
         if (cache[slot].seg_gen == ga_seg_gen[seg] && seg != next_seg) {
+            if (cache[slot].gen == gcopy_gen && ga_seg_seq[seg] == seq) {
+                return cache[slot].off;
+            }
             uint32_t now_pt = 0;
             int chg = vk_pages_changed(HEAP_BASE + at, size, cache[slot].pt_gen, &now_pt);
-            if (chg == 0 || !memcmp(ga_ptr + cache[slot].off, src, size)) {
+            bool same = (chg == 0);
+            if (!same && size <= 65536) {
+                uint64_t cur_h = hmix(1469598103934665603ull, src, (size_t)size);
+                same = (cur_h == cache[slot].hash);
+            } else if (!same) {
+                same = !memcmp(ga_ptr + cache[slot].off, src, size);
+            }
+            if (same) {
                 if (now_pt) cache[slot].pt_gen = now_pt;
+                cache[slot].gen = gcopy_gen;
                 if (ga_seg_seq[seg] < seq) ga_seg_seq[seg] = seq;
                 return cache[slot].off;
             }
@@ -5695,6 +5740,7 @@ static uint64_t ga_load_copy(uint64_t at, uint64_t size) {
     (void)vk_pages_changed(HEAP_BASE + at, size, 0, &now_pt);
     cache[slot].at = at; cache[slot].size = size; cache[slot].off = off;
     cache[slot].seg_gen = ga_seg_gen[seg]; cache[slot].gen = gcopy_gen;
+    cache[slot].hash = size <= 65536 ? hmix(1469598103934665603ull, src, (size_t)size) : 0;
     cache[slot].pt_gen = now_pt; cache[slot].valid = true;
     return off;
 }
@@ -5958,7 +6004,37 @@ static bool gsnap_prepare(void) {
     return true;
 }
 
+static struct {
+    uint64_t seq, sbuf_gen, gc_size;
+    unsigned stage_mask;
+    int m;
+    GcRange r[GMAP_MAX];
+    uint32_t pt_gen[GMAP_MAX];
+    uint32_t tab[(GMAP_MAX + 1) * 4];
+    VkSpan span;
+} s_gprep_cache;
+
 static void gcopy_prepare(unsigned stage_mask, bool store) {
+    if (!store && s_gprep_cache.seq == vk_pending_seq() && s_gprep_cache.sbuf_gen == sbuf_gen &&
+        s_gprep_cache.stage_mask == stage_mask && s_gprep_cache.gc_size > 0) {
+        bool clean = true;
+        for (int i = 0; i < s_gprep_cache.m; i++) {
+            uint32_t now_pt = 0;
+            if (vk_pages_changed(HEAP_BASE + s_gprep_cache.r[i].lo,
+                                 s_gprep_cache.r[i].hi - s_gprep_cache.r[i].lo,
+                                 s_gprep_cache.pt_gen[i], &now_pt) != 0) {
+                clean = false;
+                break;
+            }
+        }
+        if (clean) {
+            memcpy(gmap_tab, s_gprep_cache.tab, sizeof gmap_tab);
+            gc_span = s_gprep_cache.span;
+            gc_size = s_gprep_cache.gc_size;
+            gfast_n = 0;
+            return;
+        }
+    }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
     gc_size = 0;
@@ -6019,7 +6095,24 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
                 stage_mask, store ? "STORE" : "load", m, total / 1024.0, b, total > RING_SLICE_SIZE ? " (TOO MUCH: skipped)" : "");
         }
     }
-    if (m && gres_prepare(r, m, store)) return;  // (the arena: what shaders store stays on the GPU)
+    if (m && gres_prepare(r, m, store)) {
+        if (!store && m <= GMAP_MAX) {
+            s_gprep_cache.seq = vk_pending_seq();
+            s_gprep_cache.sbuf_gen = sbuf_gen;
+            s_gprep_cache.stage_mask = stage_mask;
+            s_gprep_cache.gc_size = gc_size;
+            s_gprep_cache.m = m;
+            for (int i = 0; i < m; i++) {
+                s_gprep_cache.r[i] = r[i];
+                uint32_t now_pt = 0;
+                (void)vk_pages_changed(HEAP_BASE + r[i].lo, r[i].hi - r[i].lo, 0, &now_pt);
+                s_gprep_cache.pt_gen[i] = now_pt;
+            }
+            memcpy(s_gprep_cache.tab, gmap_tab, sizeof gmap_tab);
+            s_gprep_cache.span = gc_span;
+        }
+        return;  // (the arena: what shaders store stays on the GPU)
+    }
     memset(gmap_tab, 0, sizeof gmap_tab);
     gc_size = 0;
     if (!m || total > RING_SLICE_SIZE) return;  // (too much: those loads read zero, as without this)
@@ -9429,6 +9522,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
                 memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+            sbuf_gen++;
             break;
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
@@ -9689,8 +9783,15 @@ static void exec_list(uint64_t handle, int depth) {
                         (unsigned long long)r->x[2], h0 == h1 ? "unchanged" : "CHANGED");
                 }
             }
+#ifdef __ANDROID__
+            if (gmem_placed || gc_nback > 0) renderer_flush();
+            if (r->x[2] >= 4096) plat_write_prepare(r->x[1], r->x[2]);
+#else
             renderer_flush();
+#endif
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
+            guest_copy_invalidate(r->x[1], r->x[1] + r->x[2]);
+            sbuf_gen++;
             break;
         default: break;
         }

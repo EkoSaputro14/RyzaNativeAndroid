@@ -130,11 +130,34 @@ HLE_FUNC("_ZN2nn4lmem20AllocateFromUnitHeapEPNS0_6detail8HeapHeadE", heap_alloc_
 }
 
 #ifdef __ANDROID__
+extern bool vk_gmem_placed(void);
+extern void plat_write_prepare(uint64_t addr, uint64_t size);
+
+// Intercept guest SDK memset when Atelier Ryza debug-fills >=16 MB heap arenas with 0xef poison
+// so we never fault in 1.58 GB of physical pages on anonymous or placed/dma-buf GPU heap mappings.
+HLE_FUNC("memset", hle_guest_memset) {
+    uint64_t dst = c->x[0], val = c->x[1] & 0xffu, len = c->x[2];
+    if (val == 0xef && len >= (16ull << 20) && dst >= HEAP_BASE && dst < HEAP_BASE + HEAP_MAX) {
+        size_t head = len > 0x10000 ? 0x10000 : (size_t)len;
+        plat_write_prepare(dst, head);
+        memset((void *)(uintptr_t)dst, (int)val, head);
+        LOG("[heaps] skipped %llu MB 0xef debug-poison memset at %#llx (saved physical RAM commit)\n",
+            (unsigned long long)(len >> 20), (unsigned long long)dst);
+        return;
+    }
+    if (dst >= GUEST_LO && dst < GUEST_HI && len <= GUEST_HI - dst) {
+        if (len >= 4096) plat_write_prepare(dst, len);
+        memset((void *)(uintptr_t)dst, (int)val, (size_t)len);
+        return;
+    }
+    CALL("memset");
+}
+
 // Atelier Ryza debug-fills newly carved sub-heaps (including the 1579 MB 0x62b00000 StandardAllocator)
 // with 0xef via memset right before calling Initialize, faulting in >1.5 GB of unused physical RAM.
 // Reclaim those 0xef-poisoned physical pages back to demand-zero before Initialize writes its header.
 static void reclaim_poisoned_arena(uint64_t addr, uint64_t size) {
-    if (size < (16ull << 20)) return;
+    if (size < (16ull << 20) || vk_gmem_placed()) return;
     if (addr < HEAP_BASE || addr >= HEAP_BASE + HEAP_MAX || size > HEAP_BASE + HEAP_MAX - addr) return;
     uint64_t lo = (addr + 0x10000ull) & ~0xfffull;
     uint64_t hi = (addr + size) & ~0xfffull;

@@ -135,6 +135,9 @@ static bool frag_fp16_inst(const uint32_t *w, uint32_t wc, uint32_t op, const ui
 }
 
 static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
+#ifdef __ANDROID__
+    if (!g_settings.fp16_shaders) return spv;
+#endif
     enum { OP_DECORATE = 71, DEC_RELAXED_PRECISION = 0, DEC_BUILT_IN = 11 };
     size_t n = *nwords, insert = 0, count = 0;
     uint32_t bound = spv[3];
