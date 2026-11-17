@@ -82,6 +82,7 @@ void vk_execute_now(uint64_t handle);    // exec.c: translate and submit a comma
 void vk_execute_list_batch(uint64_t handle, bool force_submit);
 void vk_flush_pending_work(void);
 bool vk_has_pending_commands(void);
+uint64_t vk_submitted_seq(void);
 void vk_present_now(NvnTexture *t, uint64_t asked);  // device.c: the window's half of backend_present
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
 uint64_t renderer_fence_seq(void);
