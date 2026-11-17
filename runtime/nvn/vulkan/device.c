@@ -1621,10 +1621,10 @@ void backend_present(NvnTexture *t) {
     } else {
         renderer_submit();
     }
+    uint64_t present_t1 = plat_now_ns();
     extern void vk_ring_begin_frame(uint64_t frame_index);
     vk_ring_begin_frame(total_frames + 1);
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
-    uint64_t present_t1 = plat_now_ns();
     vk_prof_frame(total_frames, present_t1 >= t0 ? present_t1 - t0 : 0);
     frames++;
     total_frames++;

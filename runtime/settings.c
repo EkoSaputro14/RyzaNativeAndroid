@@ -66,6 +66,8 @@ Settings g_settings = {
     .native_code = true,       // (an experiment: runtime/native.c)
     .sync_lag = false,         // (false on Android: avoids CPU race on bone/vertex buffers that causes stretched polygons)
     .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 640 from 1440p down by 4.8x for 45-60 FPS)
+    .heap_mb = 2560,           // (2560 MB default on Android: leaves >= 1100 MB free on 6 GB devices)
+    .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -276,6 +278,14 @@ void settings_load(void) {
         else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
         else if (!strcmp(key, "driver_env")) snprintf(g_settings.driver_env, sizeof g_settings.driver_env, "%s", val);
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
+        else if (!strcmp(key, "heap_mb")) {
+            int hm = atoi(val);
+            g_settings.heap_mb = hm == 0 ? 2560 : (hm < 1024 ? 1024 : (hm > 3328 ? 3328 : hm));
+        }
+        else if (!strcmp(key, "async_spin_us")) {
+            int sp = atoi(val);
+            g_settings.async_spin_us = sp < 0 ? 0 : (sp > 2000 ? 2000 : sp);
+        }
         else if (!strcmp(key, "touch_scale")) g_settings.touch_scale = (float)atof(val);
         else if (!strcmp(key, "touch_opacity")) g_settings.touch_opacity = (float)atof(val);
         else if (!strcmp(key, "touch_drag_camera")) g_settings.touch_drag_camera = atoi(val) != 0;
@@ -399,6 +409,7 @@ void settings_save(void) {
     fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\ngpu_model = %s\n", TRI(g_settings.gpu_heap),
             TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), g_settings.log_file, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
+    fprintf(f, "heap_mb = %d\nasync_spin_us = %d\n", g_settings.heap_mb, g_settings.async_spin_us);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,

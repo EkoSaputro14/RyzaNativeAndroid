@@ -422,6 +422,7 @@ void stall_on_frame_end(const StallFrameMetrics *m) {
     LOG("[stall] severity=%s frame=%llu total_ms=%.1f start_ns=%llu end_ns=%llu "
         "guest_exec_ms=%.1f wait_game_ms=%.1f (queue=%.1f coalesce=%.1f) "
         "backend_exec_ms=%.1f vk_cpu_prep_ms=%.1f vk_submit_ms=%.1f gpu_ms=%.1f gpu_wait_ms=%.1f (acq=%.1f) present_ms=%.1f "
+        "sync_wait_ms=%.1f gcopy_ms=%.2f page_fault_ms=%.2f (faults=%llu) "
         "tex_uploads=%llu tex_bytes=%.2fMB tex_deswizzle_ms=%.1f lock_wait_ms=%.2f bg_lock_wait_ms=%.2f "
         "draws=%llu submits=%llu compiles=+%llu(%d pending) "
         "tid=%d thread=%s reason=%s waited_on=%d(%s)\n",
@@ -431,6 +432,7 @@ void stall_on_frame_end(const StallFrameMetrics *m) {
         m->wait_game_queue_ns / 1e6, m->wait_game_coalesce_ns / 1e6,
         m->backend_exec_ns / 1e6, m->vk_cpu_prep_ns / 1e6, m->vk_submit_ns / 1e6,
         m->gpu_ns / 1e6, m->gpu_wait_ns / 1e6, m->acquire_ns / 1e6, m->present_ns / 1e6,
+        m->sync_wait_ns / 1e6, m->gcopy_ns / 1e6, m->page_fault_ns / 1e6, (unsigned long long)m->page_fault_count,
         (unsigned long long)m->tex_uploads, m->tex_upload_bytes / 1048576.0, m->tex_deswizzle_ns / 1e6,
         m->lock_wait_ns / 1e6, m->bg_lock_wait_ns / 1e6,
         (unsigned long long)m->draws, (unsigned long long)m->submits,

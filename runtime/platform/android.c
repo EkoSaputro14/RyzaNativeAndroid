@@ -375,6 +375,7 @@ static uint8_t *wt_state;  // per 4 KB page: 0 not tracked (counts as written), 
                            // (all three: tentative definitions, declared above plat_reset_guest)
 static atomic_flag wt_spin = ATOMIC_FLAG_INIT;  // (taken in the signal handler too: no mutex)
 static bool wt_broken;  // (an mprotect failed - out of memory mappings: no new pages tracked)
+static _Atomic uint64_t wt_fault_ns_acc, wt_fault_count_acc, wt_query_ns_acc;
 static void wt_lock(void) {
     while (atomic_flag_test_and_set_explicit(&wt_spin, memory_order_acquire)) {
 #if defined(__aarch64__) || defined(__arm__)
@@ -423,6 +424,7 @@ static bool wt_reopen_all(void) {
 
 static bool wt_fault(uint64_t a) {
     if (!wt_state || a < wt_lo || a >= wt_hi) return false;
+    uint64_t wt_t0 = plat_now_ns();
     uint64_t p = (a - wt_lo) >> 12, np = (wt_hi - wt_lo) >> 12;
     bool ours = false;
     wt_lock();
@@ -453,6 +455,10 @@ static bool wt_fault(uint64_t a) {
         ours = true;
     }
     wt_unlock();
+    if (ours) {
+        atomic_fetch_add_explicit(&wt_fault_ns_acc, plat_now_ns() - wt_t0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&wt_fault_count_acc, 1, memory_order_relaxed);
+    }
     return ours;
 }
 
@@ -465,6 +471,7 @@ static int plat_write_tracking_state(uint64_t a, uint64_t *odd) {
 
 void plat_write_prepare(uint64_t addr, uint64_t size) {
     if (!wt_state || !size || addr + size <= wt_lo || addr >= wt_hi) return;
+    uint64_t qt0 = plat_now_ns();
     uint64_t a = addr < wt_lo ? wt_lo : addr, e = addr + size > wt_hi ? wt_hi : addr + size;
     uint64_t p0 = (a - wt_lo) >> 12, p1 = (e - wt_lo + 0xFFF) >> 12;
     wt_lock();
@@ -476,6 +483,7 @@ void plat_write_prepare(uint64_t addr, uint64_t size) {
         p = q;
     }
     wt_unlock();
+    atomic_fetch_add_explicit(&wt_query_ns_acc, plat_now_ns() - qt0, memory_order_relaxed);
 }
 
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
@@ -530,6 +538,7 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
                     in_window, gpu, n - in_window - gpu, most);
         }
     }
+    uint64_t qt0 = plat_now_ns();
     uint64_t p0 = (addr - wt_lo) >> 12, p1 = (addr + size - wt_lo + 0xFFF) >> 12;
     int n = 0;
     wt_lock();
@@ -560,6 +569,7 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
                 if (errno == ENOMEM && wt_reopen_all()) {
                     // Range stays writable with state 3/2 intact; return dirty count collected so far without -1 storm
                     wt_unlock();
+                    atomic_fetch_add_explicit(&wt_query_ns_acc, plat_now_ns() - qt0, memory_order_relaxed);
                     return n > max ? max : n;
                 }
                 for (uint64_t k = p; k < q; k++) wt_state[k] = 0;
@@ -571,7 +581,18 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         p = q;
     }
     wt_unlock();
+    atomic_fetch_add_explicit(&wt_query_ns_acc, plat_now_ns() - qt0, memory_order_relaxed);
     return n > max ? max : n;
+}
+
+uint64_t plat_take_write_tracking_ns(uint64_t *faults_out, uint64_t *fault_ns_out, uint64_t *query_ns_out) {
+    uint64_t f = atomic_exchange_explicit(&wt_fault_count_acc, 0, memory_order_relaxed);
+    uint64_t fns = atomic_exchange_explicit(&wt_fault_ns_acc, 0, memory_order_relaxed);
+    uint64_t qns = atomic_exchange_explicit(&wt_query_ns_acc, 0, memory_order_relaxed);
+    if (faults_out) *faults_out = f;
+    if (fault_ns_out) *fault_ns_out = fns;
+    if (query_ns_out) *query_ns_out = qns;
+    return fns + qns;
 }
 
 

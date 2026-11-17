@@ -74,12 +74,22 @@ static _Atomic int stat_compiles;
 static _Atomic int stat_compiles_pending;
 static _Atomic uint64_t cum_compiles;
 static _Atomic uint64_t s_game_busy_ns_acc, s_game_busy_max_ns, s_game_busy_frames;
-static _Atomic uint64_t s_sync_wait_ns_acc, s_sync_wait_count;
+static _Atomic uint64_t s_sync_wait_ns_acc, s_sync_wait_count, s_frame_sync_wait_ns;
+static _Atomic uint64_t s_gcopy_ns_acc;
+static _Atomic uint64_t s_split_guest_ns, s_split_sync_ns, s_split_present_ns, s_split_copy_ns;
+static _Atomic uint64_t s_iv_guest_ns, s_iv_sync_ns, s_iv_present_ns, s_iv_gcopy_ns;
+static _Atomic uint64_t s_iv_wt_ns, s_iv_wt_fault_ns, s_iv_wt_query_ns, s_iv_wt_faults, s_iv_split_frames;
+static __thread int s_sync_wait_depth;
 static uint64_t stat_wait_game_ns;
 static _Atomic bool s_pcache_dirty;
 
+void vk_sync_wait_enter(void) { s_sync_wait_depth++; }
+void vk_sync_wait_leave(void) { if (s_sync_wait_depth > 0) s_sync_wait_depth--; }
+bool vk_in_sync_wait(void) { return s_sync_wait_depth > 0; }
+
 void vk_record_nvn_sync_wait(uint64_t ns) {
     atomic_fetch_add(&s_sync_wait_ns_acc, ns);
+    atomic_fetch_add(&s_frame_sync_wait_ns, ns);
     atomic_fetch_add(&s_sync_wait_count, 1);
 }
 static uint64_t op_counts[CMD_COUNT];
@@ -1061,7 +1071,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 // overflow buffers for burst frames > RING_SLICE_SIZE). Eliminates mid-frame vmaCreateBuffer/vmaDestroyBuffer
 // churn while preserving full multi-frame GPU lifetime safety via vk_ring_begin_frame().
 #ifdef __ANDROID__
-#define RING_SLICE_SIZE (48ull << 20)
+#define RING_SLICE_SIZE (16ull << 20)
 #else
 #define RING_SLICE_SIZE (64ull << 20)
 #endif
@@ -1241,8 +1251,12 @@ void vk_readback_ready(uint64_t size) {
 }
 
 VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
+    uint64_t ct0 = size ? plat_now_ns() : 0;
     VkSpan s = vk_transient(size ? size : 16, align);
-    if (size) memcpy(s.ptr, data, size);
+    if (size) {
+        memcpy(s.ptr, data, size);
+        atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
+    }
     return s;
 }
 
@@ -1552,6 +1566,41 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     uint64_t coalesce_ns = 0;
     uint64_t cur_gpu = prof_gpu;
 #endif
+    uint64_t guest_ns = stall_take_guest_exec_ns();
+    uint64_t sync_ns = atomic_exchange(&s_frame_sync_wait_ns, 0);
+    uint64_t gcopy_ns = atomic_exchange(&s_gcopy_ns_acc, 0);
+    uint64_t wt_faults = 0, wt_fault_ns = 0, wt_query_ns = 0, wt_total_ns = 0;
+#ifdef __ANDROID__
+    wt_total_ns = plat_take_write_tracking_ns(&wt_faults, &wt_fault_ns, &wt_query_ns);
+#endif
+    uint64_t copy_fault_ns = gcopy_ns + wt_total_ns;
+    {
+        static uint64_t ema_g, ema_s, ema_p, ema_c;
+        static bool ema_init;
+        if (!ema_init) {
+            ema_g = guest_ns; ema_s = sync_ns; ema_p = present_ns; ema_c = copy_fault_ns;
+            ema_init = true;
+        } else {
+            ema_g = (ema_g * 3 + guest_ns) / 4;
+            ema_s = (ema_s * 3 + sync_ns) / 4;
+            ema_p = (ema_p * 3 + present_ns) / 4;
+            ema_c = (ema_c * 3 + copy_fault_ns) / 4;
+        }
+        atomic_store_explicit(&s_split_guest_ns, ema_g, memory_order_relaxed);
+        atomic_store_explicit(&s_split_sync_ns, ema_s, memory_order_relaxed);
+        atomic_store_explicit(&s_split_present_ns, ema_p, memory_order_relaxed);
+        atomic_store_explicit(&s_split_copy_ns, ema_c, memory_order_relaxed);
+    }
+    atomic_fetch_add(&s_iv_guest_ns, guest_ns);
+    atomic_fetch_add(&s_iv_sync_ns, sync_ns);
+    atomic_fetch_add(&s_iv_present_ns, present_ns);
+    atomic_fetch_add(&s_iv_gcopy_ns, gcopy_ns);
+    atomic_fetch_add(&s_iv_wt_ns, wt_total_ns);
+    atomic_fetch_add(&s_iv_wt_fault_ns, wt_fault_ns);
+    atomic_fetch_add(&s_iv_wt_query_ns, wt_query_ns);
+    atomic_fetch_add(&s_iv_wt_faults, wt_faults);
+    atomic_fetch_add(&s_iv_split_frames, 1);
+
     s_iv_frames++;
     uint64_t cur_compiles = atomic_load(&cum_compiles);
     int pending_compiles = atomic_load(&stat_compiles_pending);
@@ -1570,7 +1619,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             .frame_start_ns = last_t,
             .frame_end_ns = now,
             .total_ns = dt,
-            .guest_exec_ns = stall_take_guest_exec_ns(),
+            .guest_exec_ns = guest_ns,
             .wait_game_queue_ns = wait_game_ns,
             .wait_game_coalesce_ns = coalesce_ns,
             .backend_exec_ns = ex,
@@ -1580,6 +1629,10 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             .gpu_wait_ns = wt,
             .acquire_ns = stall_take_acquire_ns(),
             .present_ns = present_ns,
+            .sync_wait_ns = sync_ns,
+            .gcopy_ns = gcopy_ns,
+            .page_fault_ns = wt_total_ns,
+            .page_fault_count = wt_faults,
             .tex_uploads = tex_up,
             .tex_upload_bytes = tex_bytes,
             .tex_deswizzle_ns = tex_desw_ns,
@@ -1722,6 +1775,22 @@ const char *renderer_stats(void) {
                      sw_ns / 1e6, (unsigned long long)sw_n, stat_wait_game_ns / 1e6,
                      atomic_load(&stat_compiles_pending));
             stat_wait_game_ns = 0;
+            uint64_t sf = atomic_exchange(&s_iv_split_frames, 0);
+            uint64_t ig = atomic_exchange(&s_iv_guest_ns, 0);
+            uint64_t is = atomic_exchange(&s_iv_sync_ns, 0);
+            uint64_t ip = atomic_exchange(&s_iv_present_ns, 0);
+            uint64_t ic = atomic_exchange(&s_iv_gcopy_ns, 0);
+            uint64_t iw = atomic_exchange(&s_iv_wt_ns, 0);
+            uint64_t iwf = atomic_exchange(&s_iv_wt_fault_ns, 0);
+            uint64_t iwq = atomic_exchange(&s_iv_wt_query_ns, 0);
+            uint64_t iwcnt = atomic_exchange(&s_iv_wt_faults, 0);
+            double div = sf ? (double)sf : 1.0;
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n,
+                     " | split game %.1f sync %.1f pres %.1f copy %.1f ms (gcopy %.1f wt %.1f[flt %.1f qry %.1f]/%llu)",
+                     (ig / 1e6) / div, (is / 1e6) / div, (ip / 1e6) / div,
+                     ((ic + iw) / 1e6) / div, (ic / 1e6) / div, (iw / 1e6) / div,
+                     (iwf / 1e6) / div, (iwq / 1e6) / div, (unsigned long long)iwcnt);
             n = strlen(stats_text);
             stall_format_summary(stats_text + n, sizeof stats_text - n);
         }
@@ -1744,6 +1813,13 @@ void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws)
     if (cpu_exec_ms) *cpu_exec_ms = s_has_iv_stats ? s_last_cpu_exec_ms : ((prof_exec / 1e6) / (double)nf);
     if (gpu_ms) *gpu_ms = s_has_iv_stats ? s_last_gpu_ms : ((prof_gpu / 1e6) / (double)nf);
     if (draws) *draws = s_has_iv_stats ? s_last_draws : (stat_draws / nf);
+}
+
+void vk_get_frame_split_stats(double *guest_exec_ms, double *sync_wait_ms, double *present_ms, double *copy_fault_ms) {
+    if (guest_exec_ms) *guest_exec_ms = atomic_load_explicit(&s_split_guest_ns, memory_order_relaxed) / 1e6;
+    if (sync_wait_ms) *sync_wait_ms = atomic_load_explicit(&s_split_sync_ns, memory_order_relaxed) / 1e6;
+    if (present_ms) *present_ms = atomic_load_explicit(&s_split_present_ns, memory_order_relaxed) / 1e6;
+    if (copy_fault_ms) *copy_fault_ms = atomic_load_explicit(&s_split_copy_ns, memory_order_relaxed) / 1e6;
 }
 
 // Baked state changes and pass restarts invalidate the last pipeline; dynamic state does not.
@@ -1775,7 +1851,7 @@ void vk_exec_init(void) {
     // (for good, without placed memory: the vertex cache and the texture checks fed by write tracking - vc_flush)
     // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + rt_heap_max_bytes());
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -4906,7 +4982,7 @@ bool vk_heap_place(uint64_t size) {
     // OS's write tracking - vk_exec_init turns it on only without placed memory at all, so a Turnip that has it but
     // isn't an Adreno 8xx (Automatic) had neither: every vertex and index buffer copied each frame, ~150 MB, 7-9 fps
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
-#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
+#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + rt_heap_max_bytes()) : (void)0, false)
     // Without placed maps, the same through an exported file (VK_KHR_external_memory_fd, a dma-buf) mapped at the heap's
     // address by mmap (after legendszaonandroid's VULKAN_BACKEND.md, MIT; memfd_probe.c tests it): Mali and Xclipse
     // have neither the placed map nor the import, and their CPU copies with write tracking were slow and ran the
@@ -4955,7 +5031,7 @@ bool vk_heap_place(uint64_t size) {
     }
     uint64_t align = g_vk.placed_align > 65536 ? g_vk.placed_align : 65536;
     size = (size + align - 1) & ~(align - 1);
-    if ((HEAP_BASE & (align - 1)) || size > HEAP_MAX) {
+    if ((HEAP_BASE & (align - 1)) || size > rt_heap_max_bytes()) {
         LOG("[vk] heap placement: %llx / %llu MB doesn't fit (alignment %llu)\n", (unsigned long long)HEAP_BASE,
             (unsigned long long)(size >> 20), (unsigned long long)align);
         return NOT_PLACED();
@@ -5231,6 +5307,7 @@ static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void gcopy_retire(uint64_t done) {
     pthread_mutex_lock(&gc_lock);
+    uint64_t ct0 = gc_nback ? plat_now_ns() : 0;
     int k = 0;
     for (int i = 0; i < gc_nback; i++) {
         if (gc_back[i].seq <= done) {
@@ -5258,6 +5335,7 @@ static void gcopy_retire(uint64_t done) {
     }
     gc_nback = k;
     pthread_mutex_unlock(&gc_lock);
+    if (ct0) atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
 }
 
 
@@ -5603,10 +5681,12 @@ static uint64_t ga_load_copy(uint64_t at, uint64_t size) {
             }
         }
     }
+    uint64_t ct0 = plat_now_ns();
     uint64_t off = ga_ring(size);
     if (off == ~0ull) return off;
     memcpy(ga_ptr + off, src, size);
     ga_wrote(off, size);
+    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
     uint64_t seg = off / GA_SEG;
     uint32_t now_pt = 0;
     (void)vk_pages_changed(HEAP_BASE + at, size, 0, &now_pt);
@@ -5858,6 +5938,7 @@ static bool gsnap_prepare(void) {
     }
     for (int i = 0; i < m; i++) total += r[i].hi - r[i].lo;
     if (!m || m > GMAP_MAX || total > (64u << 10)) return false;
+    uint64_t ct0 = plat_now_ns();
     gc_span = vk_transient(total, 256);
     uint64_t off = 0;
     for (int i = 0; i < m; i++) {
@@ -5870,6 +5951,7 @@ static bool gsnap_prepare(void) {
     }
     gc_size = total;
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
     return true;
 }
 
@@ -5938,6 +6020,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
     memset(gmap_tab, 0, sizeof gmap_tab);
     gc_size = 0;
     if (!m || total > RING_SLICE_SIZE) return;  // (too much: those loads read zero, as without this)
+    uint64_t ct0 = plat_now_ns();
     gc_span = vk_transient(total, 256);
     gc_size = total;
     uint64_t off = 0, seq = vk_pending_seq();
@@ -5954,6 +6037,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
     }
     pthread_mutex_unlock(&gc_lock);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
+    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
 }
 #endif
 
@@ -6228,6 +6312,7 @@ void vc_flush(void) {
         i = j;
     }
     prof_vc_scan_ns += SDL_GetTicksNS() - t0;
+    uint64_t vc_cp_t0 = plat_now_ns();
     VkCommandBuffer cb = vk_upload_cmd();
     for (int i = 0; i < vc_npend; i++) {
         VcEnt *e = &vc_tab[vc_pend[i]];
@@ -6256,6 +6341,7 @@ void vc_flush(void) {
         e->gen = g;
     }
     vc_npend = 0;
+    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - vc_cp_t0, memory_order_relaxed);
 }
 
 // Vertex / index data from the imported guest heap (renderer.m bind_guest reads g_guest_buffer the same way): the
@@ -7841,6 +7927,7 @@ static void draw_(CmdRec *r, bool indexed) {
             for (int i = 0; i < 32; i++) if ((pp->k.attr_mask & (1u << i)) && pp->k.attr_bind[i] == (uint32_t)s) nat_s++;
             uint64_t total_bytes = conv_stride ? nverts * conv_stride : (uint64_t)nat_s * 16u;
             if (!total_bytes) total_bytes = 16;
+            uint64_t vct0 = plat_now_ns();
             sp = vk_transient(total_bytes, 16);
             memset(sp.ptr, 0, (size_t)total_bytes);
             for (int i = 0; i < 32; i++) {
@@ -7862,6 +7949,7 @@ static void draw_(CmdRec *r, bool indexed) {
                     }
                 }
             }
+            atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - vct0, memory_order_relaxed);
         } else {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
@@ -7874,9 +7962,11 @@ static void draw_(CmdRec *r, bool indexed) {
                 reach = pp->k.divisor[s] ? ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * pp->k.stride[s]
                                      : ((uint64_t)first + count) * pp->k.stride[s];
             if (v.addr && v.size && reach > v.size && reach <= (1u << 20) && ryza_guest_readable(v.addr, v.size)) {
+                uint64_t vpt0 = plat_now_ns();
                 sp = vk_transient(reach, 16);
                 memcpy(sp.ptr, (const void *)(uintptr_t)v.addr, v.size);
                 memset((uint8_t *)sp.ptr + v.size, 0, reach - v.size);
+                atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - vpt0, memory_order_relaxed);
                 VkDeviceSize zoff = sp.off;
                 if (!(ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == zoff)) {
                     ss.vb[s] = sp.buf; ss.vo[s] = zoff; ss.vb_known |= 1u << s;

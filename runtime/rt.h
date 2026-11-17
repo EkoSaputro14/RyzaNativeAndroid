@@ -88,6 +88,8 @@ extern uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache
 extern uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
 extern uint64_t g_forensic_dispatch_overhead_ns;
 void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws);
+void vk_get_frame_split_stats(double *guest_exec_ms, double *sync_wait_ms, double *present_ms, double *copy_fault_ms);
+uint64_t rt_heap_max_bytes(void);
 GuestFn dispatch_lookup(uint64_t addr);
 uint64_t hle_register(const char *name, HostFn fn);  // returns fake guest address
 HostFn hle_lookup_impl(const char *name);

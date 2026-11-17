@@ -32,6 +32,9 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
 // No-ops elsewhere (Windows tracks writes itself).
 void plat_write_tracking_enable(uint64_t lo, uint64_t hi);
 void plat_write_prepare(uint64_t addr, uint64_t size);
+#ifdef __ANDROID__
+uint64_t plat_take_write_tracking_ns(uint64_t *faults_out, uint64_t *fault_ns_out, uint64_t *query_ns_out);
+#endif
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)

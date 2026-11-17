@@ -12,6 +12,7 @@
 // (FIFO-ordered descriptor and texture retirement updates without synchronous guest-thread queue drains).
 #ifdef __ANDROID__
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,6 +23,7 @@
 #include "../../platform.h"
 #include "../../rt.h"
 #include "stall_trace.h"
+#include "../../settings.h"
 
 enum {
     REQ_EXEC,
@@ -158,6 +160,28 @@ static uint64_t render_cpu_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static int async_spin_us(void) {
+    static int spin_us = -1;
+    if (spin_us < 0) {
+        const char *e = getenv("LARECOMP_ASYNC_SPIN_US");
+        if (e && *e) {
+            int v = atoi(e);
+            spin_us = v < 0 ? 0 : (v > 2000 ? 2000 : v);
+        } else {
+            int v = g_settings.async_spin_us;
+            spin_us = v < 0 ? 0 : (v > 2000 ? 2000 : v);
+        }
+    }
+    return spin_us;
+}
+
+static inline void cpu_spin_yield(uint32_t iter) {
+#if defined(__aarch64__) || defined(__arm__)
+    __builtin_arm_yield();
+#endif
+    if ((iter & 15u) == 15u) sched_yield();
+}
+
 static bool req_is_state_or_exec(int type) {
     return type == REQ_EXEC || type == REQ_TEX_REG || type == REQ_SMP_REG;
 }
@@ -174,14 +198,30 @@ static void *render_main(void *arg) {
     // excluding descheduling/waits can understate the work seen by Android's frequency governor.
     const char *timing = getenv("LARECOMP_ADPF_CPU_TIME");
     bool cpu_timing = timing && atoi(timing) != 0;
+    const int spin_us = async_spin_us();
     pthread_mutex_lock(&q_lock);
     for (;;) {
         while (q_head == q_tail) {
-            if (vk_has_pending_commands() && q_waiters > 0) {
+            if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) {
                 pthread_mutex_unlock(&q_lock);
                 vk_flush_pending_work();
                 pthread_mutex_lock(&q_lock);
                 continue;
+            }
+            if (spin_us > 0) {
+                uint64_t head_snap = q_head;
+                pthread_mutex_unlock(&q_lock);
+                uint64_t spin_t0 = plat_now_ns();
+                uint64_t spin_limit = (uint64_t)spin_us * 1000ull;
+                uint32_t iter = 0;
+                while (__atomic_load_n(&q_tail, __ATOMIC_ACQUIRE) == head_snap) {
+                    if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) break;
+                    if (plat_now_ns() - spin_t0 >= spin_limit) break;
+                    cpu_spin_yield(++iter);
+                }
+                pthread_mutex_lock(&q_lock);
+                if (q_head != q_tail) break;
+                if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) continue;
             }
             uint64_t w0 = plat_now_ns();
             pthread_cond_wait(&q_more, &q_lock);
@@ -259,7 +299,7 @@ static void *render_main(void *arg) {
         }
         pthread_mutex_lock(&q_lock);
         q_head++;
-        q_done = r.id;
+        __atomic_store_n(&q_done, r.id, __ATOMIC_RELEASE);
         if (r.type == REQ_PRESENT) q_presents--;
         pthread_cond_broadcast(&q_less);
     }
@@ -289,12 +329,13 @@ static uint64_t push(int type, uint64_t a, void *p) {
         }
         pthread_mutex_lock(&q_lock);
     }
-    uint64_t id = ++q_tail;  // (ids 1, 2, ...: the request at index id - 1)
+    uint64_t id = q_tail + 1;  // (ids 1, 2, ...: the request at index id - 1)
     if (type == REQ_EXEC || type == REQ_PRESENT || type == REQ_FENCE) {
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);
         vk_tl(type == REQ_EXEC ? "game: list sent" : type == REQ_PRESENT ? "game: present sent" : "game: fence sent", id, 0);
     }
     q[(id - 1) % QN] = (Req){type, a, p, id};
+    __atomic_store_n(&q_tail, id, __ATOMIC_RELEASE);
     if (type == REQ_PRESENT) q_presents++;
     pthread_cond_signal(&q_more);
     pthread_mutex_unlock(&q_lock);
@@ -307,10 +348,23 @@ void vk_async_wait_id(uint64_t id) {
     uint64_t w0 = plat_now_ns();
     pthread_mutex_lock(&q_lock);
     if (q_done < id) {
-        q_waiters++;
+        __atomic_fetch_add(&q_waiters, 1, __ATOMIC_RELAXED);
         pthread_cond_signal(&q_more);
+        int wait_spin = async_spin_us();
+        if (wait_spin > 100) wait_spin = 100;
+        if (wait_spin > 0) {
+            pthread_mutex_unlock(&q_lock);
+            uint64_t spin_t0 = plat_now_ns();
+            uint64_t spin_limit = (uint64_t)wait_spin * 1000ull;
+            uint32_t iter = 0;
+            while (__atomic_load_n(&q_done, __ATOMIC_ACQUIRE) < id) {
+                if (plat_now_ns() - spin_t0 >= spin_limit) break;
+                cpu_spin_yield(++iter);
+            }
+            pthread_mutex_lock(&q_lock);
+        }
         while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
-        q_waiters--;
+        __atomic_fetch_sub(&q_waiters, 1, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&q_lock);
     uint64_t w1 = plat_now_ns();
@@ -344,7 +398,13 @@ void vk_async_flush_if_needed(uint64_t target_seq) {
 // Until every request queued so far has run (the render thread is idle after it).
 void vk_async_drain(void) {
     if (!g_vk_render_started || vk_async_is_render_thread()) {
-        if (vk_has_pending_commands()) vk_flush_pending_work();
+        if (vk_has_pending_commands()) {
+            uint64_t f0 = plat_now_ns();
+            vk_flush_pending_work();
+            extern bool vk_in_sync_wait(void);
+            extern void vk_record_nvn_sync_wait(uint64_t ns);
+            if (!vk_in_sync_wait()) vk_record_nvn_sync_wait(plat_now_ns() - f0);
+        }
         return;
     }
     uint64_t w0 = plat_now_ns();
@@ -352,10 +412,10 @@ void vk_async_drain(void) {
     pthread_mutex_lock(&q_lock);
     uint64_t id = q_tail;
     if (q_done < id) {
-        q_waiters++;
+        __atomic_fetch_add(&q_waiters, 1, __ATOMIC_RELAXED);
         pthread_cond_signal(&q_more);
         while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
-        q_waiters--;
+        __atomic_fetch_sub(&q_waiters, 1, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&q_lock);
     if (vk_has_pending_commands()) {
@@ -366,6 +426,11 @@ void vk_async_drain(void) {
     }
     kernel_blocking_end();
     uint64_t w1 = plat_now_ns();
+    {
+        extern bool vk_in_sync_wait(void);
+        extern void vk_record_nvn_sync_wait(uint64_t ns);
+        if (!vk_in_sync_wait()) vk_record_nvn_sync_wait(w1 >= w0 ? w1 - w0 : 0);
+    }
     if (w1 - w0 >= 5000000ull) {
         stall_record_wait_event(renderer_present_count(), w0, w1, "async",
                                 "vk_async_drain", vk_async_render_tid(), "vk-render", NULL);

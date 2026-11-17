@@ -20,6 +20,7 @@ extern uint64_t g_forensic_dispatches, g_forensic_dcache_hits, g_forensic_dcache
 extern uint64_t g_forensic_fallbacks, g_forensic_hle_calls, g_forensic_svc_calls;
 extern uint64_t g_forensic_dispatch_overhead_ns;
 void vk_get_forensic_stats(double *cpu_exec_ms, double *gpu_ms, uint64_t *draws);
+void vk_get_frame_split_stats(double *guest_exec_ms, double *sync_wait_ms, double *present_ms, double *copy_fault_ms);
 #include "platform.h"
 #include "../settings.h"
 uint64_t vk_cum_wait_ns(void);  // vulkan/exec.c
@@ -70,6 +71,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     static float fps, avg_ms, max_ms, wait_pct;
     static float p50_ms, p95_ms, p99_ms;
     static double s_overlay_cpu_exec_ms, s_overlay_gpu_ms;
+    static double s_overlay_guest_ms, s_overlay_sync_ms, s_overlay_present_ms, s_overlay_copy_ms;
     static uint64_t s_overlay_draws;
     static PlatDeviceStats ds;
     frames++;
@@ -99,6 +101,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             p99_ms = sorted[(int)(nft * 0.99f)];
         }
         vk_get_forensic_stats(&s_overlay_cpu_exec_ms, &s_overlay_gpu_ms, &s_overlay_draws);
+        vk_get_frame_split_stats(&s_overlay_guest_ms, &s_overlay_sync_ms, &s_overlay_present_ms, &s_overlay_copy_ms);
         plat_device_stats(&ds);
     }
 
@@ -148,6 +151,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     ImGui::TextDisabled("frame avg %.1f ms  max %.0f ms", avg_ms, max_ms);
     ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.9f, 1.0f), "P50: %.1f ms | P95: %.1f ms | P99: %.1f ms", p50_ms, p95_ms, p99_ms);
     ImGui::Text("Render: CPU %.1f ms | GPU %.1f ms (%llu draws)", s_overlay_cpu_exec_ms, s_overlay_gpu_ms, (unsigned long long)s_overlay_draws);
+    ImGui::Text("Frame split: game %.1f ms | sync %.1f ms | present %.1f ms | copy %.1f ms",
+                s_overlay_guest_ms, s_overlay_sync_ms, s_overlay_present_ms, s_overlay_copy_ms);
     {
         uint64_t total_dc = g_forensic_dcache_hits + g_forensic_dcache_misses;
         double hit_rt = total_dc ? (g_forensic_dcache_hits * 100.0 / total_dc) : 100.0;

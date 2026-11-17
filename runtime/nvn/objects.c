@@ -310,12 +310,15 @@ void vk_async_tex_pool_fin(NvnDescPool *d);
 void vk_async_tex_destroy(NvnTexture *t);
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
+void vk_sync_wait_enter(void);
+void vk_sync_wait_leave(void);
 NVN(nvnQueueFinish) {
     if (!vk_has_pending_commands() && (!vk_async_on() || vk_async_queue_idle())) {
         uint64_t sub_seq = vk_submitted_seq();
         if (!sub_seq || vk_completed_seq() >= sub_seq) return;
     }
     uint64_t t0 = plat_now_ns();
+    vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
@@ -325,6 +328,7 @@ NVN(nvnQueueFinish) {
     renderer_sync();
     uint64_t t_end = plat_now_ns();
     kernel_blocking_end();
+    vk_sync_wait_leave();
     extern void vk_record_nvn_sync_wait(uint64_t ns);
     uint64_t dt = t_end - t0;
     vk_record_nvn_sync_wait(dt);
@@ -379,6 +383,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
 #ifdef __ANDROID__
     uint64_t t0 = plat_now_ns();
+    vk_sync_wait_enter();
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (vulkan/exec.c: LARECOMP_FRAME_TIMELINE)
     vk_tl("game: SyncWait begin (fence id, submission)", sync_of(A(0))->lseq, sync_of(A(0))->seq);
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
@@ -485,6 +490,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     }
 #ifdef __ANDROID__
     kernel_blocking_end();
+    vk_sync_wait_leave();
     {
         extern void vk_record_nvn_sync_wait(uint64_t ns);
         extern uint64_t renderer_present_count(void);

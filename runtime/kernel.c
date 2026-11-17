@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "settings.h"
 #ifdef __ANDROID__
 #include "nvn/vulkan/stall_trace.h"
 extern uint64_t renderer_present_count(void);
@@ -265,6 +266,24 @@ static uint64_t tls_next;  // (TLS_BASE moves with the window: kernel_init sets 
 static uint64_t tls_next = TLS_BASE;
 #endif
 uint64_t kernel_heap_size(void) { return heap_size; }  // bytes from HEAP_BASE set by SetHeapSize
+
+uint64_t rt_heap_max_bytes(void) {
+#ifdef __ANDROID__
+    static uint64_t cached = 0;
+    if (!cached) {
+        const char *e = getenv("LARECOMP_HEAP_MB");
+        int mb = (e && *e) ? atoi(e) : g_settings.heap_mb;
+        if (mb <= 0) mb = 2560;
+        if (mb < 1024) mb = 1024;
+        if (mb > (int)(HEAP_MAX >> 20)) mb = (int)(HEAP_MAX >> 20);
+        cached = (uint64_t)mb << 20;
+        LOG("[kernel] guest heap limit: %llu MB (default 2560 MB)\n", (unsigned long long)(cached >> 20));
+    }
+    return cached;
+#else
+    return HEAP_MAX;
+#endif
+}
 // Writable guest data regions (heap, mapped/physical memory, module .data): for debug/runtime memory scans.
 int kernel_data_regions(uint64_t *addr, uint64_t *size, int max) {
     int n = 0;
@@ -1266,7 +1285,8 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     switch (imm) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
-        if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
+        uint64_t heap_cap = rt_heap_max_bytes();
+        if (size > heap_cap) { x[0] = R_OUT_OF_RESOURCE; break; }
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
@@ -1509,10 +1529,15 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 2: v = ALIAS_BASE; break;
         case 3: v = ALIAS_SIZE; break;
         case 4: v = HEAP_BASE; break;
-        case 5: v = HEAP_MAX; break;
-        case 6: case 21: {  // application memory (3.2 GB, as on hardware); LARECOMP_TOTAL_MEM=<hex bytes> (test)
+        case 5: v = rt_heap_max_bytes(); break;
+        case 6: case 21: {  // application memory (capped with heap limit on Android); LARECOMP_TOTAL_MEM=<hex bytes> (test)
             static uint64_t tot = 0;
-            if (!tot) tot = getenv("LARECOMP_TOTAL_MEM") ? strtoull(getenv("LARECOMP_TOTAL_MEM"), NULL, 16) : 0xCD500000ull;
+            if (!tot) {
+                uint64_t cap = rt_heap_max_bytes();
+                uint64_t def_tot = cap < HEAP_MAX ? (cap + 0x4000000ull) : 0xCD500000ull;
+                if (def_tot > 0xCD500000ull) def_tot = 0xCD500000ull;
+                tot = getenv("LARECOMP_TOTAL_MEM") ? strtoull(getenv("LARECOMP_TOTAL_MEM"), NULL, 16) : def_tot;
+            }
             v = tot;
             static int nlog;
             if (nlog++ < 8) LOG("[kernel] GetInfo total memory -> %#llx\n", (unsigned long long)v);

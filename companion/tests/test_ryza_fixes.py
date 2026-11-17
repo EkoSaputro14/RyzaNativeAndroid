@@ -716,7 +716,7 @@ def _verify_p13_sd855_sched_and_mem_opts():
     assert "cbw_patch_clear();" in exec_c
 
     # 5. Unified-memory PSS footprint caps & periodic memory-pressure trimming
-    assert "#define RING_SLICE_SIZE (48ull << 20)" in exec_c and "#define RING_SLOTS 3" in exec_c
+    assert "#define RING_SLICE_SIZE (16ull << 20)" in exec_c and "#define RING_SLOTS 3" in exec_c
     assert "vk_ring_begin_frame(" in exec_c
     assert "192ull" in exec_c and "vc_budget_bytes()" in exec_c
     assert "vk_memory_pressure_tick(" in exec_c and "vk_texture_snapshots_trim()" in exec_c
@@ -883,7 +883,7 @@ def _verify_p13_sprint3_batch_ring_pushdesc_adpf():
     assert "vb_dirty_mask" in exec_c and "vb_pend_buf" in exec_c
 
     # Patch 3: Triple-buffered persistent transient ring + desc_epoch isolation
-    assert "#define RING_SLICE_SIZE (48ull << 20)" in exec_c
+    assert "#define RING_SLICE_SIZE (16ull << 20)" in exec_c
     assert "#define RING_SLOTS 3" in exec_c and "#define RING_OVF_MAX 16" in exec_c
     assert "vk_ring_begin_frame(total_frames + 1);" in device_c
     assert "desc_epoch++;" in exec_c and "vk_pending_seq() ^ (desc_epoch << 40)" in exec_c
@@ -901,3 +901,59 @@ def _verify_p13_sprint3_batch_ring_pushdesc_adpf():
 
 
 _verify_p13_sprint3_batch_ring_pushdesc_adpf()
+
+def _verify_p13_sprint4_heap_split_spin():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    rt_h = (repo_root / "runtime" / "rt.h").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+    platform_h = (repo_root / "runtime" / "platform.h").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    stall_h = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.h").read_text(encoding="utf-8")
+    stall_c = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+
+    # 1. Transient ring shrunk to 3 x 16 MB (48 MB) & guest heap capped to 2560 MB default (configurable via heap_mb)
+    assert "#define RING_SLICE_SIZE (16ull << 20)" in exec_c
+    assert "int heap_mb;" in settings_h
+    assert ".heap_mb = 2560," in settings_c
+    assert "\"heap_mb\"" in settings_c and "heap_mb = %d" in settings_c
+    assert "uint64_t rt_heap_max_bytes(void);" in rt_h
+    assert "uint64_t rt_heap_max_bytes(void)" in kernel_c
+    assert "LARECOMP_HEAP_MB" in kernel_c
+    assert "rt_heap_max_bytes()" in exec_c
+
+    # 2. Fine-grained frame split instrumentation & overlay line
+    assert "void vk_get_frame_split_stats(" in rt_h
+    assert "void vk_get_frame_split_stats(" in exec_c
+    assert "uint64_t plat_take_write_tracking_ns(" in platform_h
+    assert "wt_fault_ns_acc" in android_c and "wt_query_ns_acc" in android_c
+    assert "uint64_t plat_take_write_tracking_ns(" in android_c
+    assert "uint64_t sync_wait_ns;" in stall_h and "uint64_t page_fault_count;" in stall_h
+    assert "sync_wait_ms=%.1f gcopy_ms=%.2f page_fault_ms=%.2f" in stall_c
+    assert "vk_sync_wait_enter();" in objects_c and "vk_sync_wait_leave();" in objects_c
+    assert "vk_in_sync_wait()" in async_c and "bool vk_in_sync_wait(void)" in exec_c
+    assert "Frame split: game %.1f ms | sync %.1f ms | present %.1f ms | copy %.1f ms" in overlay_mm
+    assert " | split game %.1f sync %.1f pres %.1f copy %.1f ms" in exec_c
+    assert device_c.index("uint64_t present_t1 = plat_now_ns();") < device_c.index("vk_ring_begin_frame(total_frames + 1);")
+
+    # 3. Async spin-wait window to keep governor clocks boosted
+    assert "int async_spin_us;" in settings_h
+    assert ".async_spin_us = 250," in settings_c
+    assert "\"async_spin_us\"" in settings_c and "async_spin_us = %d" in settings_c
+    assert "#include <sched.h>" in async_c
+    assert "LARECOMP_ASYNC_SPIN_US" in async_c
+    assert "__builtin_arm_yield();" in async_c and "sched_yield();" in async_c
+    assert "__atomic_store_n(&q_tail, id, __ATOMIC_RELEASE);" in async_c
+    assert "__atomic_store_n(&q_done, r.id, __ATOMIC_RELEASE);" in async_c
+
+    print("  -> PASS: p13 Sprint #4 (48 MB ring, 2560 MB heap cap, frame split telemetry & async spin-wait) verified.")
+
+
+_verify_p13_sprint4_heap_split_spin()

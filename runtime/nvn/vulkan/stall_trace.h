@@ -26,6 +26,10 @@ typedef struct {
     uint64_t gpu_wait_ns;
     uint64_t acquire_ns;
     uint64_t present_ns;
+    uint64_t sync_wait_ns;
+    uint64_t gcopy_ns;
+    uint64_t page_fault_ns;
+    uint64_t page_fault_count;
     uint64_t tex_uploads;
     uint64_t tex_upload_bytes;
     uint64_t tex_deswizzle_ns;
