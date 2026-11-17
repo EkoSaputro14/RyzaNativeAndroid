@@ -298,7 +298,6 @@ bool vk_async_is_render_thread(void);
 void vk_async_drain(void);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
-void vk_async_ensure_submitted(uint64_t seq);
 int vk_async_render_tid(void);
 uint64_t vk_submitted_seq(void);
 uint64_t vk_completed_seq(void);
@@ -464,18 +463,12 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
                 (unsigned long long)st_n, (unsigned long long)(st_n ? st_pos / st_n : 0));
             wb_n = wb_pos = st_n = st_pos = 0;
         }
-        if (vk_async_on()) vk_async_ensure_submitted(target);
         renderer_wait_seq(target);
     } else
 #endif
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else {
-#ifdef __ANDROID__
-        if (vk_async_on()) vk_async_ensure_submitted(sync_of(A(0))->seq);
-#endif
-        renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
-    }
+    else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
 #ifdef __ANDROID__
     kernel_blocking_end();
     {

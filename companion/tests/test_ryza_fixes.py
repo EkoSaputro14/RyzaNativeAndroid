@@ -799,18 +799,19 @@ def _verify_p13_sprint2_sync_tex_and_wait_telemetry():
     kernel_h = (repo_root / "runtime" / "kernel.h").read_text(encoding="utf-8")
     kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
 
-    # 1. nvnQueueFinish() & nvnSyncWait() per-call telemetry + targeted submission flush & fence coalescing
+    # 1. nvnQueueFinish() & nvnSyncWait() per-call telemetry + safe fence/snapshot boundaries (no cross-fence coalescing)
     assert "void stall_record_nvn_sync_call(" in stall_h
     assert "[nvn-sync] op=%s frame=%llu" in stall_c
     assert 'stall_record_nvn_sync_call("nvnQueueFinish"' in objects_c
     assert 'stall_record_nvn_sync_call((flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait"' in objects_c
-    assert "vk_async_ensure_submitted(sync_of(A(0))->seq);" in objects_c
-    assert "void vk_async_ensure_submitted(uint64_t seq)" in async_c
-    assert "bool vk_async_has_more_exec(void)" in async_c
-    assert "bool vk_batch_has_fence(void)" in exec_c
+    assert "vk_async_has_more_exec" not in exec_c and "vk_async_has_more_exec" not in async_c
+    assert "fence_forces_submit" not in exec_c
+    assert "force_submit || list_had_fence" in exec_c
+    assert "guest_copy_flush();" in exec_c and "(batch_lists >= 16)" in exec_c
+    fence_arm = async_c.split("} else if (r.type == REQ_FENCE) {", 1)[1].split("} else if (r.type == REQ_TEX_REG) {", 1)[0]
+    assert "\n            vk_flush_pending_work();\n" in fence_arm
     assert "uint64_t vk_submitted_seq(void)" in exec_c
     assert "#define SUBS 64" in exec_c
-    assert "uint64_t q = submit_seq + (pending ? 1 : 0);" in exec_c and "if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;" in exec_c
 
     # 2. Per-texture telemetry (size, BCn/ASTC, uploaded status, hash/deswizzle/staging/commit ms) & periodic hash fix
     assert "typedef struct StallTexUploadDetail" in stall_h

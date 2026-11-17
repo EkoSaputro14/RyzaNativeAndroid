@@ -134,8 +134,6 @@ uint64_t vk_submitted_seq(void) {
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
-    uint64_t prev = atomic_load_explicit(&done_seq_cache, memory_order_relaxed);
-    if (v > prev) atomic_store_explicit(&done_seq_cache, v, memory_order_release);
     return v;
 }
 
@@ -959,19 +957,11 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 }
 
 static bool list_had_fence;
-static bool batch_had_fence;
 static uint32_t batch_lists;
 static uint64_t batch_start_draws;
 static uint64_t batch_start_upload_bytes;
 
-bool vk_batch_has_fence(void) {
-    return batch_had_fence;
-}
-
-void renderer_submit(void) {
-    batch_had_fence = false;
-    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
-}
+void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
 void renderer_flush(void) {
     renderer_submit();
@@ -984,10 +974,7 @@ bool vk_has_pending_commands(void) {
 }
 
 void vk_flush_pending_work(void) {
-    if (!vk_has_pending_commands()) {
-        batch_had_fence = false;
-        return;
-    }
+    if (!vk_has_pending_commands()) return;
 #ifdef __ANDROID__
     game_pending = true;
 #endif
@@ -1013,13 +1000,11 @@ void renderer_sync(void) {
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
-    bool pending = atomic_load_explicit(&g_batch_pending, memory_order_acquire);
-    uint64_t q = submit_seq + (pending ? 1 : 0);
+    uint64_t q = submit_seq + (atomic_load_explicit(&g_batch_pending, memory_order_acquire) ? 1 : 0);
 #ifdef __ANDROID__
-    if (pending) batch_had_fence = true;
     static int fence_present = -1;
     if (fence_present < 0) fence_present = getenv("LARECOMP_FENCE_PRESENT") != NULL;
-    if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;
+    if (!game_pending && work_seq && !fence_present) q = work_seq;
     static int log = -1;
     if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
     if (log) LOG("[syncseq] t %.2f fence -> seq %llu (submitted %llu, work %llu, begun %d/%d, tid %d)\n", SDL_GetTicksNS() / 1e6,
@@ -9498,20 +9483,22 @@ void backend_execute(uint64_t handle) {
     if (vk_async_on()) vk_async_execute(handle);
     else vk_execute_now(handle);
 }
-extern bool vk_async_has_more_exec(void);
 void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     PROF_T0();
     game_pending = true;  // (renderer_fence_seq)
     if (batch_lists == 0) {
         batch_start_draws = stat_draws;
         batch_start_upload_bytes = stat_upload_bytes;
+    } else {
+        // Guest CPU may modify dynamic bone/UBO/vertex buffers between separate command lists;
+        // invalidate per-submission gcopy snapshots so batched lists never alias stale guest memory.
+        guest_copy_flush();
     }
     list_had_fence = false;
     static int log_lists = -1;
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
     uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
     exec_list(handle, 0);
-    if (list_had_fence) batch_had_fence = true;
     batch_lists++;
     if (log_lists && renderer_present_count() % 120 == 0)
         LOG("[lists] frame %llu: list %llx %llu draws %llu passes %.2f ms\n", (unsigned long long)renderer_present_count(),
@@ -9524,10 +9511,9 @@ void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     uint64_t batch_up_bytes = stat_upload_bytes - batch_start_upload_bytes;
-    bool fence_forces_submit = list_had_fence && !vk_async_has_more_exec();
-    bool should_submit = no_batch || sync_submit || force_submit || fence_forces_submit ||
+    bool should_submit = no_batch || sync_submit || force_submit || list_had_fence ||
                          (stat_draws - batch_start_draws >= 64) ||
-                         (batch_lists >= 32) ||
+                         (batch_lists >= 16) ||
                          (batch_up_bytes >= (8ull << 20));
     if (should_submit) {
         if (sync_submit) renderer_flush();
