@@ -557,6 +557,17 @@ static void create_device(void) {
     }
 #endif
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    g_vk.push_desc = has_ext(ep, ne, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) && !getenv("LARECOMP_NO_PUSH_DESC");
+    if (g_vk.push_desc) {
+        VkPhysicalDevicePushDescriptorPropertiesKHR pdp = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pdp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.max_push_desc = pdp.maxPushDescriptors;
+        if (g_vk.max_push_desc >= 8) ext[n_ext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+        else g_vk.push_desc = false;
+    }
+    LOG("[vk-cap] push_descriptor %s (max %u)\n", g_vk.push_desc ? "on" : "off", g_vk.max_push_desc);
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
 #ifdef __ANDROID__
     if (fault && !fault_have.deviceFault) {
@@ -1610,8 +1621,11 @@ void backend_present(NvnTexture *t) {
     } else {
         renderer_submit();
     }
+    extern void vk_ring_begin_frame(uint64_t frame_index);
+    vk_ring_begin_frame(total_frames + 1);
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
-    vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
+    uint64_t present_t1 = plat_now_ns();
+    vk_prof_frame(total_frames, present_t1 >= t0 ? present_t1 - t0 : 0);
     frames++;
     total_frames++;
     g_frame_counter++;

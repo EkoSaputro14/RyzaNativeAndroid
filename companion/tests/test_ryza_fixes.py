@@ -716,7 +716,8 @@ def _verify_p13_sd855_sched_and_mem_opts():
     assert "cbw_patch_clear();" in exec_c
 
     # 5. Unified-memory PSS footprint caps & periodic memory-pressure trimming
-    assert "#define CHUNK_SIZE (32ull << 20)" in exec_c and "#define RING_KEEP 3" in exec_c
+    assert "#define RING_SLICE_SIZE (48ull << 20)" in exec_c and "#define RING_SLOTS 3" in exec_c
+    assert "vk_ring_begin_frame(" in exec_c
     assert "192ull" in exec_c and "vc_budget_bytes()" in exec_c
     assert "vk_memory_pressure_tick(" in exec_c and "vk_texture_snapshots_trim()" in exec_c
     assert "void vk_texture_snapshots_trim(void)" in textures_c and "2u << 20" in textures_c
@@ -806,10 +807,11 @@ def _verify_p13_sprint2_sync_tex_and_wait_telemetry():
     assert 'stall_record_nvn_sync_call((flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait"' in objects_c
     assert "vk_async_has_more_exec" not in exec_c and "vk_async_has_more_exec" not in async_c
     assert "fence_forces_submit" not in exec_c
-    assert "force_submit || list_had_fence" in exec_c
-    assert "guest_copy_flush();" in exec_c and "(batch_lists >= 16)" in exec_c
+    assert "(list_had_fence && gmem_placed)" in exec_c
+    assert "guest_copy_flush();" in exec_c and "(batch_lists >= 128)" in exec_c and "(stat_draws - batch_start_draws >= 4096)" in exec_c
     fence_arm = async_c.split("} else if (r.type == REQ_FENCE) {", 1)[1].split("} else if (r.type == REQ_TEX_REG) {", 1)[0]
-    assert "\n            vk_flush_pending_work();\n" in fence_arm
+    assert "vk_gmem_placed()" in fence_arm and "vk_flush_pending_work()" in fence_arm
+    assert "vk_async_flush_if_needed(" in objects_c
     assert "uint64_t vk_submitted_seq(void)" in exec_c
     assert "#define SUBS 64" in exec_c
 
@@ -839,3 +841,63 @@ def _verify_p13_sprint2_sync_tex_and_wait_telemetry():
 
 
 _verify_p13_sprint2_sync_tex_and_wait_telemetry()
+
+
+def _verify_p13_sprint3_batch_ring_pushdesc_adpf():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    vk_h = (repo_root / "runtime" / "nvn" / "vulkan" / "vk.h").read_text(encoding="utf-8")
+    shaders_h = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.h").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    platform_h = (repo_root / "runtime" / "platform.h").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+
+    # Patch 1: Command buffer batching & on-demand sync flush (preserving guest_copy_flush skinning safety)
+    assert "(stat_draws - batch_start_draws >= 4096)" in exec_c
+    assert "(batch_lists >= 128)" in exec_c
+    assert "(batch_up_bytes >= (24ull << 20))" in exec_c
+    assert "(list_had_fence && gmem_placed)" in exec_c
+    assert "if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;" in exec_c
+    assert "if (!g_vk.timeline) return 0;" in exec_c
+    assert "next_needs_submit = (nt == REQ_PRESENT || nt == REQ_FLUSH);" in async_c
+    assert "pthread_cond_timedwait" not in async_c
+    assert "vk_async_queue_idle(" in async_c and "vk_async_flush_if_needed(" in async_c
+    assert "vk_async_queue_idle()" in objects_c and "vk_async_flush_if_needed(" in objects_c
+    fence_case = exec_c.split("case CMD_FENCE_SYNC: {", 1)[1].split("case CMD_REPORT_COUNTER:", 1)[0]
+    assert "guest_copy_flush();" in fence_case
+
+    # Patch 2: VK_KHR_push_descriptor for Set 0 + coalesced vkCmdBindVertexBuffers
+    assert "bool push_desc;" in vk_h and "uint32_t max_push_desc;" in vk_h
+    assert "VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME" in device_c
+    assert "vk_set_layout_flags(" in shaders_h and "vk_set_layout_flags(" in shaders_c
+    assert "bool push_set0;" in exec_c and "prog_can_push_set0(" in exec_c
+    assert "VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR" in exec_c
+    assert 'vkGetDeviceProcAddr(g_vk.dev, "vkCmdPushDescriptorSetKHR")' in exec_c
+    assert "if (!cp->p.push_set0)" in exec_c
+    assert "if (pr->push_set0)" in exec_c and "ss.sets[0] == VK_NULL_HANDLE && ss.sets[1] == fset" in exec_c
+    assert "vb_dirty_mask" in exec_c and "vb_pend_buf" in exec_c
+
+    # Patch 3: Triple-buffered persistent transient ring + desc_epoch isolation
+    assert "#define RING_SLICE_SIZE (48ull << 20)" in exec_c
+    assert "#define RING_SLOTS 3" in exec_c and "#define RING_OVF_MAX 16" in exec_c
+    assert "vk_ring_begin_frame(total_frames + 1);" in device_c
+    assert "desc_epoch++;" in exec_c and "vk_pending_seq() ^ (desc_epoch << 40)" in exec_c
+
+    # Patch 4: ADPF nice fallback escalation, honest overlay status & present_ms clock fix
+    assert "void plat_boost_thread_tid(int32_t tid);" in platform_h
+    assert "{-10, -8, -4, -2}" in android_c
+    assert "plat_boost_thread_tid(s_presenting_tid);" in android_c
+    assert "adpf.state > 0 && adpf.threads > 0" in overlay_mm
+    assert "ADPF: %s (nice -10)" in overlay_mm
+    assert "uint64_t present_t1 = plat_now_ns();" in device_c
+    assert "present_t1 >= t0 ? present_t1 - t0 : 0" in device_c
+
+    print("  -> PASS: p13 Sprint #3 (batching + push descriptors + coalesced VBs + persistent ring + ADPF/present_ms fixes) verified.")
+
+
+_verify_p13_sprint3_batch_ring_pushdesc_adpf()

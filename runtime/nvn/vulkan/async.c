@@ -176,36 +176,19 @@ static void *render_main(void *arg) {
     pthread_mutex_lock(&q_lock);
     for (;;) {
         while (q_head == q_tail) {
-            if (vk_has_pending_commands()) {
-                if (q_waiters > 0) {
-                    pthread_mutex_unlock(&q_lock);
-                    vk_flush_pending_work();
-                    pthread_mutex_lock(&q_lock);
-                    continue;
-                }
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_nsec += 1500000;  // 1.5 ms batch coalescing window before auto-flushing open command buffer
-                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
-                uint64_t w0 = plat_now_ns();
-                int wr = pthread_cond_timedwait(&q_more, &q_lock, &ts);
-                uint64_t w1 = plat_now_ns();
-                __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
-                __atomic_fetch_add(&frame_coalesce_ns, w1 - w0, __ATOMIC_RELAXED);
-                if ((wr != 0 && q_head == q_tail) || q_waiters > 0) {
-                    pthread_mutex_unlock(&q_lock);
-                    vk_flush_pending_work();
-                    pthread_mutex_lock(&q_lock);
-                }
-            } else {
-                uint64_t w0 = plat_now_ns();
-                pthread_cond_wait(&q_more, &q_lock);
-                uint64_t w1 = plat_now_ns();
-                __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
-                if (w1 - w0 >= 5000000ull) {
-                    stall_record_wait_event(renderer_present_count(), w0, w1, "async",
-                                            "wait_game_queue_empty", 0, "guest-main", "idle");
-                }
+            if (vk_has_pending_commands() && q_waiters > 0) {
+                pthread_mutex_unlock(&q_lock);
+                vk_flush_pending_work();
+                pthread_mutex_lock(&q_lock);
+                continue;
+            }
+            uint64_t w0 = plat_now_ns();
+            pthread_cond_wait(&q_more, &q_lock);
+            uint64_t w1 = plat_now_ns();
+            __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
+            if (w1 - w0 >= 5000000ull) {
+                stall_record_wait_event(renderer_present_count(), w0, w1, "async",
+                                        "wait_game_queue_empty", 0, "guest-main", "idle");
             }
         }
         Req r = q[q_head % QN];
@@ -214,7 +197,7 @@ static void *render_main(void *arg) {
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
                 int nt = q[scan % QN].type;
                 if (nt == REQ_TEX_REG || nt == REQ_SMP_REG) continue;
-                next_needs_submit = (nt != REQ_EXEC);
+                next_needs_submit = (nt == REQ_PRESENT || nt == REQ_FLUSH);
                 break;
             }
         }
@@ -238,8 +221,11 @@ static void *render_main(void *arg) {
         } else if (r.type == REQ_FLUSH) {
             vk_flush_pending_work();
         } else if (r.type == REQ_FENCE) {
-            vk_flush_pending_work();
-            nvn_sync_set_seq(r.a, renderer_fence_seq());
+            extern bool vk_gmem_placed(void);
+            if (vk_gmem_placed() || getenv("LARECOMP_FENCE_SUBMIT")) vk_flush_pending_work();
+            uint64_t fseq = renderer_fence_seq();
+            if (!fseq) fseq = vk_submitted_seq();
+            nvn_sync_set_seq(r.a, fseq);
         } else if (r.type == REQ_TEX_REG) {
             AsyncTexReg *tr = (AsyncTexReg *)r.p;
             if (tr) {
@@ -331,6 +317,27 @@ void vk_async_wait_id(uint64_t id) {
         stall_record_wait_event(renderer_present_count(), w0, w1, "async",
                                 "vk_async_wait_id", vk_async_render_tid(), "vk-render", NULL);
     }
+}
+
+bool vk_async_queue_idle(void) {
+    if (!g_vk_render_started) return true;
+    pthread_mutex_lock(&q_lock);
+    bool idle = (q_head == q_tail);
+    pthread_mutex_unlock(&q_lock);
+    return idle;
+}
+
+// Flush only if target_seq lives inside the currently-open (unsubmitted) command buffer.
+void vk_async_flush_if_needed(uint64_t target_seq) {
+    if (!target_seq || target_seq <= vk_submitted_seq()) return;
+    if (!vk_async_on() || vk_async_is_render_thread()) {
+        if (vk_has_pending_commands()) vk_flush_pending_work();
+        return;
+    }
+    pthread_mutex_lock(&p_lock);
+    uint64_t fid = push(REQ_FLUSH, 0, NULL);
+    pthread_mutex_unlock(&p_lock);
+    vk_async_wait_id(fid);
 }
 
 // Until every request queued so far has run (the render thread is idle after it).

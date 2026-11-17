@@ -132,6 +132,7 @@ uint64_t vk_submitted_seq(void) {
 }
 
 uint64_t vk_completed_seq(void) {
+    if (!g_vk.timeline) return 0;
     uint64_t v = 0;
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
     return v;
@@ -1000,11 +1001,12 @@ void renderer_sync(void) {
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
-    uint64_t q = submit_seq + (atomic_load_explicit(&g_batch_pending, memory_order_acquire) ? 1 : 0);
+    bool pending = atomic_load_explicit(&g_batch_pending, memory_order_acquire);
+    uint64_t q = submit_seq + (pending ? 1 : 0);
 #ifdef __ANDROID__
     static int fence_present = -1;
     if (fence_present < 0) fence_present = getenv("LARECOMP_FENCE_PRESENT") != NULL;
-    if (!game_pending && work_seq && !fence_present) q = work_seq;
+    if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;
     static int log = -1;
     if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
     if (log) LOG("[syncseq] t %.2f fence -> seq %llu (submitted %llu, work %llu, begun %d/%d, tid %d)\n", SDL_GetTicksNS() / 1e6,
@@ -1055,25 +1057,42 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 }
 
 // ================================================================== transient memory ring
-// Host-visible chunks (device-local when the GPU exposes resizable BAR); a chunk is reused once every
-// submission that allocated from it has completed, and unused chunks above RING_KEEP are freed promptly.
+// Single persistent host-visible ring buffer divided into RING_SLOTS per-frame slices (plus bounded
+// overflow buffers for burst frames > RING_SLICE_SIZE). Eliminates mid-frame vmaCreateBuffer/vmaDestroyBuffer
+// churn while preserving full multi-frame GPU lifetime safety via vk_ring_begin_frame().
 #ifdef __ANDROID__
-#define CHUNK_SIZE (32ull << 20)
-#define RING_KEEP 3
-#define RING_IDLE_FRAMES 120
+#define RING_SLICE_SIZE (48ull << 20)
 #else
-#define CHUNK_SIZE (64ull << 20)
-#define RING_KEEP 6
-#define RING_IDLE_FRAMES 300
+#define RING_SLICE_SIZE (64ull << 20)
 #endif
-typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
-static Chunk *chunks;
-static int nchunks, active = -1;
+#define RING_SLOTS 3
+#define RING_OVF_MAX 16
+typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used; } RingOvf;
+static struct {
+    VkBuffer buf;
+    VmaAllocation mem;
+    uint8_t *ptr;
+    uint64_t cap;
+    uint64_t head[RING_SLOTS];
+    uint64_t seq[RING_SLOTS];
+    RingOvf ovf[RING_SLOTS][RING_OVF_MAX];
+    int novf[RING_SLOTS];
+    int slot;
+    uint64_t frame;
+    bool logged;
+} g_ring;
+static uint64_t desc_epoch;
+static void guest_copy_flush(void);
 
-static int new_chunk(uint64_t size) {
-    chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
-    Chunk *c = &chunks[nchunks];
-    memset(c, 0, sizeof *c);
+static void ring_free_slot_ovf(int slot) {
+    for (int i = 0; i < g_ring.novf[slot]; i++) {
+        if (g_ring.ovf[slot][i].buf)
+            vmaDestroyBuffer(g_vk.vma, g_ring.ovf[slot][i].buf, g_ring.ovf[slot][i].mem);
+    }
+    g_ring.novf[slot] = 0;
+}
+
+static void ring_create_buf(uint64_t size, VkBuffer *out_buf, VmaAllocation *out_mem, uint8_t **out_ptr, bool log_mem) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -1082,30 +1101,53 @@ static int new_chunk(uint64_t size) {
                                   .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (getenv("LARECOMP_VK_RING_SYSMEM")) ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;  // (test: a GPU without resizable BAR)
     VmaAllocationInfo info;
-    VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &c->buf, &c->mem, &info));
-    c->ptr = info.pMappedData;
-    c->size = size;
-    if (!nchunks) {  // where the ring lives: device-local (resizable BAR) or system memory read across PCIe
+    VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, out_buf, out_mem, &info));
+    *out_ptr = info.pMappedData;
+    if (log_mem && !g_ring.logged) {
+        g_ring.logged = true;
         VkMemoryPropertyFlags f;
         vmaGetMemoryTypeProperties(g_vk.vma, info.memoryType, &f);
-        LOG("[vk] transient ring: memory type %u (%s%s%s)\n", info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
+        LOG("[vk] transient ring: %llu MB (%d x %llu MB) memory type %u (%s%s%s)\n",
+            (unsigned long long)(size >> 20), RING_SLOTS, (unsigned long long)(RING_SLICE_SIZE >> 20),
+            info.memoryType, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "device-local " : "system memory ",
             f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "host-visible " : "", f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "cached" : "");
     }
-    return nchunks++;
+}
+
+static void ring_ensure_init(void) {
+    if (g_ring.buf) return;
+    g_ring.cap = (uint64_t)RING_SLOTS * RING_SLICE_SIZE;
+    ring_create_buf(g_ring.cap, &g_ring.buf, &g_ring.mem, &g_ring.ptr, true);
+}
+
+void vk_ring_begin_frame(uint64_t frame_index) {
+    g_ring.frame = frame_index;
+    int next_slot = (int)(frame_index % RING_SLOTS);
+    uint64_t sseq = g_ring.seq[next_slot];
+    if (sseq) {
+        if (sseq > vk_completed_seq()) {
+            wait_why = "ring slot";
+            vk_wait_seq(sseq);
+        }
+#ifdef __ANDROID__
+        gcopy_retire(vk_completed_seq());
+#endif
+    }
+    ring_free_slot_ovf(next_slot);
+    g_ring.head[next_slot] = 0;
+    g_ring.seq[next_slot] = 0;
+    g_ring.slot = next_slot;
+    desc_epoch++;
 }
 
 static void vk_transient_trim(bool aggressive) {
-    int keep = aggressive ? 1 : RING_KEEP;
-    if (nchunks <= keep) return;
     uint64_t done = vk_completed_seq();
-    uint64_t now = renderer_present_count();
-    uint64_t idle_thresh = aggressive ? 15 : RING_IDLE_FRAMES;
-    for (int i = nchunks - 1; i >= 0 && nchunks > keep; i--) {
-        if (i == active || chunks[i].seq > done) continue;
-        if (!aggressive && now - chunks[i].frame < idle_thresh) continue;
-        vmaDestroyBuffer(g_vk.vma, chunks[i].buf, chunks[i].mem);
-        chunks[i] = chunks[--nchunks];
-        if (active == nchunks) active = i;
+    for (int i = 0; i < RING_SLOTS; i++) {
+        if (i == g_ring.slot) continue;
+        if (g_ring.novf[i] > 0 && g_ring.seq[i] <= done) {
+            ring_free_slot_ovf(i);
+            if (aggressive) { g_ring.head[i] = 0; g_ring.seq[i] = 0; }
+        }
     }
 }
 
@@ -1113,34 +1155,61 @@ static void ring_retire(void) { vk_transient_trim(false); }
 
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
+    ring_ensure_init();
+    int slot = g_ring.slot;
     uint64_t pending = vk_pending_seq();
-    if (active >= 0) {
-        Chunk *c = &chunks[active];
-        uint64_t off = (c->used + align - 1) & ~(align - 1);
-        if (off + size <= c->size) {
-            c->used = off + size;
-            c->seq = pending;
+    if (size <= RING_SLICE_SIZE) {
+        uint64_t off = (g_ring.head[slot] + align - 1) & ~(align - 1);
+        if (off + size <= RING_SLICE_SIZE) {
+            g_ring.head[slot] = off + size;
+            if (pending > g_ring.seq[slot]) g_ring.seq[slot] = pending;
             stat_upload_bytes += size;
-            return (VkSpan){c->buf, off, c->ptr + off};
+            uint64_t global_off = (uint64_t)slot * RING_SLICE_SIZE + off;
+            return (VkSpan){g_ring.buf, global_off, g_ring.ptr + global_off};
         }
     }
-    uint64_t done = vk_completed_seq();
+    if (g_ring.novf[slot] > 0) {
+        RingOvf *last = &g_ring.ovf[slot][g_ring.novf[slot] - 1];
+        uint64_t off = (last->used + align - 1) & ~(align - 1);
+        if (off + size <= last->size) {
+            last->used = off + size;
+            if (pending > g_ring.seq[slot]) g_ring.seq[slot] = pending;
+            stat_upload_bytes += size;
+            return (VkSpan){last->buf, off, last->ptr + off};
+        }
+    }
+    if (g_ring.novf[slot] >= RING_OVF_MAX) {
+        if (g_ring.seq[slot] >= pending) renderer_submit();
+        if (g_ring.seq[slot]) {
+            wait_why = "ring overflow";
+            vk_wait_seq(g_ring.seq[slot]);
+        }
 #ifdef __ANDROID__
-    gcopy_retire(done);  // (copies back out of chunks about to be reused)
+        gcopy_retire(vk_completed_seq());
 #endif
-    // Free completed extra chunks promptly after load/burst allocations to keep unified-memory PSS bounded.
-    uint64_t now = renderer_present_count();
-    vk_transient_trim(false);
-    int pick = -1;
-    for (int i = 0; i < nchunks; i++)
-        if (i != active && chunks[i].seq <= done && chunks[i].size >= size) { pick = i; break; }
-    if (pick < 0) pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
-    active = pick;
-    chunks[pick].used = size;
-    chunks[pick].seq = pending;
-    chunks[pick].frame = now;
+        ring_free_slot_ovf(slot);
+        g_ring.head[slot] = 0;
+        g_ring.seq[slot] = 0;
+        desc_epoch++;
+        guest_copy_flush();
+        pending = vk_pending_seq();
+        if (size <= RING_SLICE_SIZE) {
+            g_ring.head[slot] = size;
+            g_ring.seq[slot] = pending;
+            stat_upload_bytes += size;
+            uint64_t global_off = (uint64_t)slot * RING_SLICE_SIZE;
+            return (VkSpan){g_ring.buf, global_off, g_ring.ptr + global_off};
+        }
+    }
+    uint64_t ovf_sz = size > (16ull << 20) ? size : (16ull << 20);
+    RingOvf *o = &g_ring.ovf[slot][g_ring.novf[slot]++];
+    memset(o, 0, sizeof *o);
+    o->size = ovf_sz;
+    o->used = size;
+    ring_create_buf(ovf_sz, &o->buf, &o->mem, &o->ptr, false);
+    if (pending > g_ring.seq[slot]) g_ring.seq[slot] = pending;
     stat_upload_bytes += size;
-    return (VkSpan){chunks[pick].buf, 0, chunks[pick].ptr};
+    return (VkSpan){o->buf, 0, o->ptr};
 }
 
 // GPU -> CPU copies: the ring is write-combined (often device-local over the BAR), where CPU reads crawl (a
@@ -1189,7 +1258,7 @@ static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];
 static VkSpan gmap_copy(void) {
     static struct { uint64_t seq; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
     static int next;
-    uint64_t seq = vk_pending_seq();
+    uint64_t seq = vk_pending_seq() ^ (desc_epoch << 40);
     for (int i = 0; i < 8; i++)
         if (c[i].seq == seq && !memcmp(c[i].tab, gmap_tab, sizeof c[i].tab)) return c[i].span;
     VkSpan sp = vk_transient_copy(gmap_tab, sizeof c[0].tab, 256);
@@ -1203,7 +1272,7 @@ static VkSpan gmap_copy(void) {
 
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
     static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
-    uint64_t seq = vk_pending_seq();
+    uint64_t seq = vk_pending_seq() ^ (desc_epoch << 40);
     if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
     if (last[slot].seq == seq && last[slot].size == size && !memcmp(last[slot].data, data, size)) return last[slot].span;
     VkSpan s = vk_transient_copy(data, size, align);
@@ -1220,7 +1289,7 @@ static uint64_t gcopy_active_seq;
 static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
 static void guest_copy_flush(void) { gcopy_gen++; gcopy_nactive = 0; }
 static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40);
+    uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40);
     if (gcopy_active_seq != seq) return;
     for (int i = 0; i < gcopy_nactive; i++) {
         uint16_t s = gcopy_active[i];
@@ -1230,7 +1299,7 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
 static uint64_t stat_gcopy_calls, stat_gcopy_hits;
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     stat_gcopy_calls++;
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
     if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
@@ -2736,6 +2805,7 @@ typedef struct {
 #endif
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
+    bool push_set0;
     bool vs_uses_vid;
     uint32_t fs_out_mask;  // fi->out_mask: the render targets the fragment shader writes (read by every draw; in
                            // ShaderInfo it sits 1.4 KB in, past the 64 textures - a cache miss each draw, ~7% of the
@@ -2744,11 +2814,24 @@ typedef struct {
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
+static bool prog_can_push_set0(const Prog *p) {
+    if (!g_vk.push_desc) return false;
+    uint32_t cnt = 0;
+    for (int i = 0; i < p->nbinds; i++) {
+        if (p->binds[i].set != 0) continue;
+        if (p->binds[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+            p->binds[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) return false;
+        cnt++;
+    }
+    return cnt <= g_vk.max_push_desc;
+}
+
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
 #ifdef __ANDROID__
     for (int set = 0; set < nsets; set++) descriptor_plan(p->binds, p->nbinds, (uint32_t)set, &p->descriptor_plans[set]);
 #endif
-    p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
+    p->set_layout[0] = vk_set_layout_flags(p->binds, p->nbinds, 0, s0,
+        p->push_set0 ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0);
     if (nsets > 1) p->set_layout[1] = vk_set_layout(p->binds, p->nbinds, 1, s1);
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
                                      .pSetLayouts = p->set_layout};
@@ -2818,12 +2901,13 @@ static void compile_program(void *arg) {
         build_mark_done(&p->state, 2);
         return;
     }
+    p->push_set0 = prog_can_push_set0(p);
 #ifdef __ANDROID__
     {   // Dynamic uniform buffers: every draw copies its constant buffers to a new place in transient memory, and with
         // the offsets inside the sets hardly any set matched the previous draw's - one allocated and written per stage
         // per draw (Qualcomm's driver: ~18% of the render thread). With the offsets given at bind time (stage_set),
         // draws of the same buffers and textures share their sets. The game's constant buffers first, then the
-        // runtime's tables, up to the device's limit. LARECOMP_NO_DYN_UBO=1: off.
+        // runtime's tables, up to the device's limit. Set 0 uses push descriptors when available (dynamic UBOs disallowed there).
         static int off = -1;
         if (off < 0) off = getenv("LARECOMP_NO_DYN_UBO") != NULL;
         uint32_t lim = off ? 0 : g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, used = 0;
@@ -2831,6 +2915,7 @@ static void compile_program(void *arg) {
         for (int pass = 0; pass < 2; pass++)
             for (int i = 0; i < p->nbinds && used < lim; i++) {
                 VkBindingInfo *b = &p->binds[i];
+                if (p->push_set0 && b->set == 0) continue;
                 bool game = b->binding >= 1 && b->binding < 17;
                 if (b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || game != (pass == 0)) continue;
                 b->type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -4753,6 +4838,9 @@ static bool cbwin_bind(int stage, int k, uint64_t addr, uint64_t size, VkDescrip
 }
 static bool gmem_placed_(void) { return gmem_placed; }
 static uint64_t cbwin_row_(uint64_t addr, uint64_t size) { return cbwin_rows(addr, size); }
+bool vk_gmem_placed(void) { return gmem_placed; }
+#else
+bool vk_gmem_placed(void) { return false; }
 #endif
 
 static bool gmem_import(uint64_t size) {
@@ -5843,13 +5931,13 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
             for (int i = 0; i < m && o < 440; i++)
                 o += snprintf(b + o, sizeof b - o, " %llx+%llx", (unsigned long long)r[i].lo, (unsigned long long)(r[i].hi - r[i].lo));
             LOG("[gcopy] frame %llu stages %x %s %d ranges %.1f KB:%s%s\n", (unsigned long long)renderer_present_count(),
-                stage_mask, store ? "STORE" : "load", m, total / 1024.0, b, total > CHUNK_SIZE ? " (TOO MUCH: skipped)" : "");
+                stage_mask, store ? "STORE" : "load", m, total / 1024.0, b, total > RING_SLICE_SIZE ? " (TOO MUCH: skipped)" : "");
         }
     }
     if (m && gres_prepare(r, m, store)) return;  // (the arena: what shaders store stays on the GPU)
     memset(gmap_tab, 0, sizeof gmap_tab);
     gc_size = 0;
-    if (!m || total > CHUNK_SIZE) return;  // (too much: those loads read zero, as without this)
+    if (!m || total > RING_SLICE_SIZE) return;  // (too much: those loads read zero, as without this)
     gc_span = vk_transient(total, 256);
     gc_size = total;
     uint64_t off = 0, seq = vk_pending_seq();
@@ -6218,6 +6306,13 @@ void vk_exec_reset(void) {
     memset(pipe_tab, 0, sizeof pipe_tab);
     g_cs_n = 0;
     gcopy_gen++;
+    desc_epoch++;
+    for (int i = 0; i < RING_SLOTS; i++) {
+        ring_free_slot_ovf(i);
+        g_ring.head[i] = 0;
+        g_ring.seq[i] = 0;
+    }
+    g_ring.slot = 0;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -6335,14 +6430,10 @@ static float g_mirror_w;  // mirror mode's composite: its render target width (r
 
 
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
-static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
-                                 const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
-                                 uint32_t *dyn, uint32_t *ndyn) {
-#ifdef __ANDROID__
-    VkDescriptorSet ds = VK_NULL_HANDLE;  // (allocated at the end, unless this submission already wrote the same set)
-#else
-    VkDescriptorSet ds = vk_alloc_set(layout);
-#endif
+static VkDescriptorSet stage_set(VkCommandBuffer cb, VkPipelineBindPoint bp, Prog *p, VkDescriptorSetLayout layout, uint32_t set,
+                                 int stage, ShaderInfo *si, const float *rscale_row0, const float tint[8], uint32_t gx, uint32_t gy,
+                                 uint32_t gz, const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, uint32_t *ndyn) {
+    VkDescriptorSet ds = VK_NULL_HANDLE;
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -6473,6 +6564,19 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         }
         if (ndyn) *ndyn = nd;
     }
+    if (p->push_set0 && set == 0) {
+        if (ndyn) *ndyn = 0;
+        if (n && cb) {
+            static VkDevice pfn_dev;
+            static PFN_vkCmdPushDescriptorSetKHR pfn_push;
+            if (pfn_dev != g_vk.dev) {
+                pfn_dev = g_vk.dev;
+                pfn_push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(g_vk.dev, "vkCmdPushDescriptorSetKHR");
+            }
+            if (pfn_push) pfn_push(cb, bp, p->layout, 0, (uint32_t)n, w);
+        }
+        return VK_NULL_HANDLE;
+    }
 #ifdef __ANDROID__
     // Draws of one material in a row write the same set over and over (same buffers / offsets / views / samplers): a
     // set written this submission with the same contents (two independent 64-bit hashes of them) is bound again
@@ -6491,7 +6595,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         }
 #undef DS_MIX
         static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[4096];
-        uint64_t seq = vk_pending_seq();
+        uint64_t seq = vk_pending_seq() ^ (desc_epoch << 40);
         uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 4095;
         if (!off && cache[slot].seq == seq && cache[slot].h1 == h1 && cache[slot].h2 == h2) {
             prof_set_hits++;
@@ -6507,6 +6611,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         return ds;
     }
 #else
+    ds = vk_alloc_set(layout);
+    for (int i = 0; i < n; i++) w[i].dstSet = ds;
     if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
     return ds;
 #endif
@@ -6522,6 +6628,7 @@ static void build_compute(void *arg) {
     if (!spv) { build_mark_done(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
+    cp->p.push_set0 = prog_can_push_set0(&cp->p);
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
     VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
     VkSpecializationInfo spec = {3, me, 12, cp->local};
@@ -6670,9 +6777,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     else
 #endif
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
-    VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
+    VkDescriptorSet ds = stage_set(cb, VK_PIPELINE_BIND_POINT_COMPUTE, &cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
+    if (!cp->p.push_set0)
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
@@ -7506,7 +7614,7 @@ static void draw_(CmdRec *r, bool indexed) {
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     cbw_patch_clear();  // (cbwin_bind fills them while the sets are written)
-    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+    VkDescriptorSet vset = stage_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
@@ -7535,7 +7643,7 @@ static void draw_(CmdRec *r, bool indexed) {
             up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
             ndv = 0;  // (the vertex set again, with its constants patched)
             cbw_patch_clear();
-            vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+            vset = stage_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
         }
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
@@ -7586,19 +7694,30 @@ static void draw_(CmdRec *r, bool indexed) {
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
-    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
+    VkDescriptorSet fset = stage_set(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
     up_fix.sx = 0;
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
-    VkDescriptorSet sets[2] = {vset, fset};
     // (the same sets and offsets as the previous draw - the set cache, stage_set: not bound again)
-    uint32_t nd = ndv + ndf;
-    if (ss_need(SS_SETS, ss.layout == pr->layout && ss.sets[0] == vset && ss.sets[1] == fset && ss.ndyn == nd &&
-                       !memcmp(ss.dyn, dyn, nd * sizeof dyn[0]))) {
-        ss.layout = pr->layout, ss.sets[0] = vset, ss.sets[1] = fset;
-        ss.ndyn = nd;
-        memcpy(ss.dyn, dyn, nd * sizeof dyn[0]);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
-        stat_set_binds++;
+    if (pr->push_set0) {
+        if (ss_need(SS_SETS, ss.layout == pr->layout && ss.sets[0] == VK_NULL_HANDLE && ss.sets[1] == fset &&
+                               ss.ndyn == ndf && !memcmp(ss.dyn, dyn + ndv, ndf * sizeof dyn[0]))) {
+            ss.layout = pr->layout; ss.sets[0] = VK_NULL_HANDLE; ss.sets[1] = fset;
+            ss.ndyn = ndf;
+            if (ndf) memcpy(ss.dyn, dyn + ndv, ndf * sizeof dyn[0]);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 1, 1, &fset, ndf, dyn + ndv);
+            stat_set_binds++;
+        }
+    } else {
+        VkDescriptorSet sets[2] = {vset, fset};
+        uint32_t nd = ndv + ndf;
+        if (ss_need(SS_SETS, ss.layout == pr->layout && ss.sets[0] == vset && ss.sets[1] == fset && ss.ndyn == nd &&
+                           !memcmp(ss.dyn, dyn, nd * sizeof dyn[0]))) {
+            ss.layout = pr->layout, ss.sets[0] = vset, ss.sets[1] = fset;
+            ss.ndyn = nd;
+            memcpy(ss.dyn, dyn, nd * sizeof dyn[0]);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
+            stat_set_binds++;
+        }
     }
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), note_gmem_store(0);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1), note_gmem_store(1);
@@ -7679,6 +7798,9 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
+    VkBuffer vb_pend_buf[NUM_STREAMS];
+    VkDeviceSize vb_pend_off[NUM_STREAMS];
+    uint32_t vb_dirty_mask = 0;
     for (int s = 0; s < NUM_STREAMS; s++) {
         if (!(pp->k.used_streams & (1u << s))) continue;
         VkSpan sp;
@@ -7758,14 +7880,14 @@ static void draw_(CmdRec *r, bool indexed) {
                 VkDeviceSize zoff = sp.off;
                 if (!(ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == zoff)) {
                     ss.vb[s] = sp.buf; ss.vo[s] = zoff; ss.vb_known |= 1u << s;
-                    vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &zoff);
+                    vb_pend_buf[s] = sp.buf; vb_pend_off[s] = zoff; vb_dirty_mask |= 1u << s;
                 }
                 continue;
             }
             if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
                 if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
                 ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
-                vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                vb_pend_buf[s] = dbuf; vb_pend_off[s] = doff; vb_dirty_mask |= 1u << s;
                 continue;
             }
             uint64_t stride = pp->k.stride[s], need = 0;
@@ -7797,7 +7919,16 @@ static void draw_(CmdRec *r, bool indexed) {
         VkDeviceSize off = sp.off;
         if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;
         ss.vb[s] = sp.buf; ss.vo[s] = off; ss.vb_known |= 1u << s;
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+        vb_pend_buf[s] = sp.buf; vb_pend_off[s] = off; vb_dirty_mask |= 1u << s;
+    }
+    while (vb_dirty_mask) {
+        int first_b = __builtin_ctz(vb_dirty_mask);
+        int cnt_b = 0;
+        while (first_b + cnt_b < NUM_STREAMS && (vb_dirty_mask & (1u << (first_b + cnt_b)))) {
+            vb_dirty_mask &= ~(1u << (first_b + cnt_b));
+            cnt_b++;
+        }
+        vkCmdBindVertexBuffers(cb, (uint32_t)first_b, (uint32_t)cnt_b, &vb_pend_buf[first_b], &vb_pend_off[first_b]);
     }
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
@@ -9365,6 +9496,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BARRIER: snapshots_flush_fb_dirty("barrier"); break;
         case CMD_FENCE_SYNC: {
             list_had_fence = true;
+            guest_copy_flush();
             static int fence_flush = -1;
             if (fence_flush < 0) fence_flush = getenv("LARECOMP_FENCE_FLUSH") ? 1 : 0;
             if (fence_flush) renderer_flush();
@@ -9511,10 +9643,11 @@ void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
     uint64_t batch_up_bytes = stat_upload_bytes - batch_start_upload_bytes;
-    bool should_submit = no_batch || sync_submit || force_submit || list_had_fence ||
-                         (stat_draws - batch_start_draws >= 64) ||
-                         (batch_lists >= 16) ||
-                         (batch_up_bytes >= (8ull << 20));
+    bool should_submit = no_batch || sync_submit || force_submit ||
+                         (list_had_fence && gmem_placed) ||
+                         (stat_draws - batch_start_draws >= 4096) ||
+                         (batch_lists >= 128) ||
+                         (batch_up_bytes >= (24ull << 20));
     if (should_submit) {
         if (sync_submit) renderer_flush();
         else renderer_submit();

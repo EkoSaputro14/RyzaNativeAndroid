@@ -296,6 +296,8 @@ NVN(nvnQueueFlush) { (void)c; }
 bool vk_async_on(void);
 bool vk_async_is_render_thread(void);
 void vk_async_drain(void);
+bool vk_async_queue_idle(void);
+void vk_async_flush_if_needed(uint64_t target_seq);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
 int vk_async_render_tid(void);
@@ -308,6 +310,10 @@ void vk_async_tex_destroy(NvnTexture *t);
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
 NVN(nvnQueueFinish) {
+    if (!vk_has_pending_commands() && (!vk_async_on() || vk_async_queue_idle())) {
+        uint64_t sub_seq = vk_submitted_seq();
+        if (!sub_seq || vk_completed_seq() >= sub_seq) return;
+    }
     uint64_t t0 = plat_now_ns();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
@@ -463,12 +469,17 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
                 (unsigned long long)st_n, (unsigned long long)(st_n ? st_pos / st_n : 0));
             wb_n = wb_pos = st_n = st_pos = 0;
         }
+        vk_async_flush_if_needed(target);
         renderer_wait_seq(target);
     } else
 #endif
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    else {
+        uint64_t sseq = sync_of(A(0))->seq;
+        vk_async_flush_if_needed(sseq);
+        renderer_wait_seq(sseq);  // only the submission that holds this fence
+    }
 #ifdef __ANDROID__
     kernel_blocking_end();
     {

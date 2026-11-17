@@ -1142,7 +1142,7 @@ static int read_sys_uclamp_min_max(void) {
 }
 
 static int apply_nice_fallback(pid_t target_tid) {
-    static const int prios[] = {-8, -4, -2};
+    static const int prios[] = {-10, -8, -4, -2};
     for (size_t i = 0; i < sizeof(prios) / sizeof(prios[0]); i++) {
         errno = 0;
         if (setpriority(PRIO_PROCESS, (id_t)target_tid, prios[i]) == 0) return prios[i];
@@ -1150,6 +1150,12 @@ static int apply_nice_fallback(pid_t target_tid) {
     errno = 0;
     int cur = getpriority(PRIO_PROCESS, (id_t)target_tid);
     return errno == 0 ? cur : 0;
+}
+
+void plat_boost_thread_tid(int32_t tid) {
+    pid_t target_tid = tid > 0 ? (pid_t)tid : (pid_t)syscall(SYS_gettid);
+    apply_nice_fallback(target_tid);
+    plat_uclamp_min_tid((int32_t)target_tid);
 }
 
 // Per-TID sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN) with kernel cap read from /proc/sys/kernel/sched_util_clamp_min.
@@ -1264,7 +1270,7 @@ void plat_uclamp_min_tid(int32_t tid) {
 void plat_thread_pin_fast(void) {
     pthread_once(&g_topo_once, init_cpu_topology);
     if (g_pin_enabled && g_has_clusters) sched_setaffinity(0, sizeof g_fast_cores, &g_fast_cores);
-    plat_uclamp_min_tid(0);
+    plat_boost_thread_tid(0);
 }
 
 void plat_thread_pin_background(void) {
@@ -1397,9 +1403,13 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
                     LOG("[android] performance hint single session (%d thread%s): on\n", ntids, ntids > 1 ? "s" : "");
                 } else {
                     state[1] = -1;
+                    loaded = -1;  // Disable ADPF cleanly so overlay never reports "ADPF on (0 thr)"
                     s_errors++;
                     s_last_error = errno;
-                    LOG("[android] performance hint single session: not available (%s)\n", strerror(errno));
+                    if (s_presenting_tid > 0) plat_boost_thread_tid(s_presenting_tid);
+                    if (s_render_tid > 0) plat_boost_thread_tid(s_render_tid);
+                    LOG("[android] performance hint single session: not available (%s); nice -10 fallback active\n",
+                        strerror(errno));
                 }
             }
         } else if (!s_tried_add_render && s_session_threads < 2 && s_presenting_tid > 0 && s_render_tid > 0) {
@@ -1421,8 +1431,11 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
                     LOG("[android] performance hint session recreated with 2 threads: on\n");
                 } else {
                     state[0] = state[1] = -1;
+                    loaded = -1;
                     s_errors++;
                     s_last_error = errno;
+                    if (s_presenting_tid > 0) plat_boost_thread_tid(s_presenting_tid);
+                    if (s_render_tid > 0) plat_boost_thread_tid(s_render_tid);
                 }
             }
         }
@@ -1472,7 +1485,13 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
             session[slot] = create(m, &tid, 1, (int64_t)target_ns);
             LOG("[android] performance hint session (%s thread): %s\n", slot ? "render" : "presenting",
                 session[slot] ? "on" : "not available");
-            if (!session[slot]) { s_errors++; s_last_error = errno; return; }
+            if (!session[slot]) {
+                s_errors++;
+                s_last_error = errno;
+                plat_boost_thread_tid(tid);
+                if (!session[0] && !session[1] && state[0] < 0 && state[1] < 0) loaded = -1;
+                return;
+            }
             target[slot] = target_ns;
             state[slot] = 1;
             s_session_threads = (session[0] ? 1 : 0) + (session[1] ? 1 : 0);
