@@ -1889,6 +1889,7 @@ void vk_exec_init(void) {
             g_vk.map_placed ? "yes" : "no", g_vk.mem_dmabuf ? "yes" : "no", g_vk.mem_fd ? "yes" : "no");
     }
     extern bool vk_heap_file_asked(void);
+    extern bool vk_driver_is_turnip(void);
     if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked() && !(g_vk.mem_fd && vk_driver_is_turnip())) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
@@ -5026,6 +5027,7 @@ bool vk_heap_place(uint64_t size) {
 #define NOT_PLACED() (gcopy_mode ? (gres_init(), plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX)) : (void)0, false)
     extern bool vk_heap_file_asked(void);
     extern bool vk_turnip_heap_on(int setting);
+    extern bool vk_driver_is_turnip(void);
     bool turnip = vk_driver_is_turnip();
     bool memfd = vk_heap_file_asked() || (!g_vk.map_placed && g_vk.mem_fd && (g_settings.gpu_heap > 0 || (g_settings.gpu_heap < 0 && turnip)));
     if (g_settings.heap_file && !g_vk.mem_fd)
