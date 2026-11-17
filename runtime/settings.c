@@ -66,7 +66,7 @@ Settings g_settings = {
     .native_code = true,       // (an experiment: runtime/native.c)
     .sync_lag = false,         // (false on Android: avoids CPU race on bone/vertex buffers that causes stretched polygons)
     .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 640 from 1440p down by 4.8x for 45-60 FPS)
-    .heap_mb = 2560,           // (2560 MB default on Android: leaves >= 1100 MB free on 6 GB devices)
+    .heap_mb = 3328,           // (3328 MB / HEAP_MAX default on Android: Ryza requires ~3220 MB Switch heap at boot)
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
@@ -280,7 +280,7 @@ void settings_load(void) {
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
         else if (!strcmp(key, "heap_mb")) {
             int hm = atoi(val);
-            g_settings.heap_mb = hm == 0 ? 2560 : (hm < 1024 ? 1024 : (hm > 3328 ? 3328 : hm));
+            g_settings.heap_mb = (hm <= 0 || hm < 3220) ? 3328 : (hm > 3328 ? 3328 : hm);
         }
         else if (!strcmp(key, "async_spin_us")) {
             int sp = atoi(val);

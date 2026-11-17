@@ -273,11 +273,18 @@ uint64_t rt_heap_max_bytes(void) {
     if (!cached) {
         const char *e = getenv("LARECOMP_HEAP_MB");
         int mb = (e && *e) ? atoi(e) : g_settings.heap_mb;
-        if (mb <= 0) mb = 2560;
-        if (mb < 1024) mb = 1024;
+        if (e && *e) {
+            if (mb <= 0) mb = (int)(HEAP_MAX >> 20);
+            if (mb < 1024) mb = 1024;
+        } else {
+            // Ryza's StandardAllocator requests a fixed 0x62b00000 block on top of ~1.6 GB of engine heaps;
+            // auto-heal any legacy/too-low ini value (< 3220 MB, e.g. 2560) back to HEAP_MAX (3328 MB).
+            if (mb < 3220) mb = (int)(HEAP_MAX >> 20);
+        }
         if (mb > (int)(HEAP_MAX >> 20)) mb = (int)(HEAP_MAX >> 20);
         cached = (uint64_t)mb << 20;
-        LOG("[kernel] guest heap limit: %llu MB (default 2560 MB)\n", (unsigned long long)(cached >> 20));
+        LOG("[kernel] guest heap limit: %llu MB (default %llu MB)\n",
+            (unsigned long long)(cached >> 20), (unsigned long long)(HEAP_MAX >> 20));
     }
     return cached;
 #else

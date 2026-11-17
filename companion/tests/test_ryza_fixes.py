@@ -919,10 +919,11 @@ def _verify_p13_sprint4_heap_split_spin():
     exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
     overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
 
-    # 1. Transient ring shrunk to 3 x 16 MB (48 MB) & guest heap capped to 2560 MB default (configurable via heap_mb)
+    # 1. Transient ring shrunk to 3 x 16 MB (48 MB) & safe 3328 MB (HEAP_MAX) guest heap default (auto-healing < 3220 MB)
     assert "#define RING_SLICE_SIZE (16ull << 20)" in exec_c
     assert "int heap_mb;" in settings_h
-    assert ".heap_mb = 2560," in settings_c
+    assert ".heap_mb = 3328," in settings_c
+    assert "hm < 3220" in settings_c and "mb < 3220" in kernel_c
     assert "\"heap_mb\"" in settings_c and "heap_mb = %d" in settings_c
     assert "uint64_t rt_heap_max_bytes(void);" in rt_h
     assert "uint64_t rt_heap_max_bytes(void)" in kernel_c
@@ -953,7 +954,7 @@ def _verify_p13_sprint4_heap_split_spin():
     assert "__atomic_store_n(&q_tail, id, __ATOMIC_RELEASE);" in async_c
     assert "__atomic_store_n(&q_done, r.id, __ATOMIC_RELEASE);" in async_c
 
-    print("  -> PASS: p13 Sprint #4 (48 MB ring, 2560 MB heap cap, frame split telemetry & async spin-wait) verified.")
+    print("  -> PASS: p13 Sprint #4 (48 MB ring, safe 3328 MB heap cap, frame split telemetry & async spin-wait) verified.")
 
 
 _verify_p13_sprint4_heap_split_spin()

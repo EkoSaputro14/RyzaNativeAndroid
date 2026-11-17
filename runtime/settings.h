@@ -58,7 +58,7 @@ typedef struct {
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
-    int heap_mb;          // guest heap limit in MB (botwrecompandroid.ini heap_mb=, default 2560 on Android; 0 = default)
+    int heap_mb;          // guest heap limit in MB (botwrecompandroid.ini heap_mb=, default 3328 / HEAP_MAX on Android; 0 = default)
     int async_spin_us;    // vk-render / async wait spin-wait window in microseconds before sleeping (default 250; 0 = off)
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
