@@ -526,7 +526,7 @@ def _verify_p13_perf_optimizations():
     assert "MANIFEST_MAGIC 0x52595A32u" in precompute_c
 
     # 2. Command list coalescing / batching, SUBS=32, done_seq_cache, and persistent ga_load_copy
-    assert "#define SUBS 32" in exec_c
+    assert "#define SUBS 64" in exec_c
     assert "done_seq_cache" in exec_c
     assert "vk_execute_list_batch(" in exec_c and "vk_execute_list_batch(" in async_c
     assert "REQ_FLUSH" in async_c
@@ -752,7 +752,7 @@ def _verify_p13_frame_stall_elimination_sprint():
     assert "stall_on_frame_end(&sm);" in exec_c
     assert "stall_format_summary(" in exec_c
     assert "stall_note_acquire(nd);" in device_c
-    assert "stall_note_tex_upload(" in textures_c
+    assert "stall_note_tex_upload" in textures_c
     assert "klock_acquire()" in kernel_c and "wait_owner_id" in kernel_c
 
     # 2. Phase 3 Fix A: Async FIFO descriptor & texture retirement (no synchronous vk_async_drain on guest thread)
@@ -784,3 +784,57 @@ def _verify_p13_frame_stall_elimination_sprint():
 
 
 _verify_p13_frame_stall_elimination_sprint()
+
+
+def _verify_p13_sprint2_sync_tex_and_wait_telemetry():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    stall_h = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.h").read_text(encoding="utf-8")
+    stall_c = (repo_root / "runtime" / "nvn" / "vulkan" / "stall_trace.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    vk_h = (repo_root / "runtime" / "nvn" / "vulkan" / "vk.h").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    kernel_h = (repo_root / "runtime" / "kernel.h").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+
+    # 1. nvnQueueFinish() & nvnSyncWait() per-call telemetry + targeted submission flush & fence coalescing
+    assert "void stall_record_nvn_sync_call(" in stall_h
+    assert "[nvn-sync] op=%s frame=%llu" in stall_c
+    assert 'stall_record_nvn_sync_call("nvnQueueFinish"' in objects_c
+    assert 'stall_record_nvn_sync_call((flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait"' in objects_c
+    assert "vk_async_ensure_submitted(sync_of(A(0))->seq);" in objects_c
+    assert "void vk_async_ensure_submitted(uint64_t seq)" in async_c
+    assert "bool vk_async_has_more_exec(void)" in async_c
+    assert "bool vk_batch_has_fence(void)" in exec_c
+    assert "uint64_t vk_submitted_seq(void)" in exec_c
+    assert "#define SUBS 64" in exec_c
+    assert "uint64_t q = submit_seq + (pending ? 1 : 0);" in exec_c and "if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;" in exec_c
+
+    # 2. Per-texture telemetry (size, BCn/ASTC, uploaded status, hash/deswizzle/staging/commit ms) & periodic hash fix
+    assert "typedef struct StallTexUploadDetail" in stall_h
+    assert "void stall_note_tex_upload_detail(const StallTexUploadDetail *d);" in stall_h
+    assert "[tex-prof] frame=%llu" in stall_c and "[tex-burst] frame=%llu" in stall_c
+    assert "g_tex_over1mb_over50ms_count" in stall_c
+    assert "bool data_hash_valid;" in vk_h
+    assert "if (b->uploaded && !old_hash_valid)" in textures_c
+    assert "stall_note_tex_upload_detail(&td);" in textures_c
+
+    # 3. WAIT_ARBITER / WAIT_CONDVAR / WAIT_MUTEX / WAIT_SYNC telemetry, owner/waker attribution, prio_inv & lock_wait separation
+    assert "typedef struct StallKernelWaitDetail" in stall_h
+    assert "void stall_record_kernel_wait_detail(const StallKernelWaitDetail *d);" in stall_h
+    assert "void stall_record_bg_lock_wait(" in stall_h
+    assert "[wait-diag] frame=%llu kind=%s" in stall_c and "prio_inv=%d" in stall_c
+    assert "last_waker_id" in kernel_h and "host_tid" in kernel_h
+    assert "stamp_waker(" in kernel_c and "guest_collect_bt(" in kernel_c
+    assert "stall_record_kernel_wait_detail(&kd);" in kernel_c
+    assert 'stall_record_bg_lock_wait("kernel", "WAIT_MUTEX", wait_dt);' in kernel_c
+
+    # 4. Monotonic clock unification (plat_now_ns) & guest_exec_ms preservation on >1000 ms stalls
+    assert "stall_note_guest_window(gb_ns);" in exec_c
+    assert exec_c.index("stall_note_guest_window(gb_ns);") < exec_c.index("if (first || p > 1000000000ull) return;")
+    print("  -> PASS: p13 Sprint #2 (nvnSyncWait/QueueFinish telemetry & targeted flush, per-texture telemetry & periodic hash fix, kernel wait/waker/prio_inv diagnostics) verified.")
+
+
+_verify_p13_sprint2_sync_tex_and_wait_telemetry()

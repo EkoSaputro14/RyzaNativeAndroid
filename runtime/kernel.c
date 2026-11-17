@@ -32,14 +32,91 @@ extern uint64_t renderer_present_count(void);
 pthread_mutex_t g_klock = PTHREAD_MUTEX_INITIALIZER;
 static __thread KThread *t_cur;
 
-static inline void klock_acquire(void) {
-    if (pthread_mutex_trylock(&g_klock) == 0) return;
 #ifdef __ANDROID__
+static volatile uint64_t g_klock_holder_id;
+static volatile int g_klock_holder_tid;
+static volatile int g_klock_holder_prio = -1;
+static volatile int g_klock_holder_core = -1;
+static volatile uint64_t g_klock_holder_lr;
+
+static inline void klock_stamp_holder(void) {
+    if (t_cur) {
+        g_klock_holder_id = t_cur->id;
+        g_klock_holder_tid = t_cur->host_tid;
+        g_klock_holder_prio = t_cur->prio;
+        g_klock_holder_core = __atomic_load_n(&t_cur->core, __ATOMIC_RELAXED);
+        g_klock_holder_lr = t_cur->cpu.x[30];
+    } else {
+        g_klock_holder_id = 0;
+        g_klock_holder_tid = (int)gettid();
+        g_klock_holder_prio = -1;
+        g_klock_holder_core = -1;
+        g_klock_holder_lr = 0;
+    }
+}
+
+static void guest_collect_bt(KThread *t, uint64_t bt[4]) {
+    memset(bt, 0, sizeof(uint64_t) * 4);
+    if (!t) return;
+    bt[0] = t->cpu.x[30];
+    uint64_t fp = t->cpu.x[29];
+    for (int i = 1; i < 4; i++) {
+        if (fp < STACK_BASE || fp + 16 > STACK_BASE + STACK_SIZE || (fp & 7) != 0) break;
+        uint64_t next_fp = *(const uint64_t *)(uintptr_t)fp;
+        uint64_t ret_lr = *(const uint64_t *)(uintptr_t)(fp + 8);
+        bt[i] = ret_lr;
+        if (next_fp <= fp || next_fp - fp > (16ull << 20)) break;
+        fp = next_fp;
+    }
+}
+#endif
+
+static inline void klock_acquire(void) {
+    if (pthread_mutex_trylock(&g_klock) == 0) {
+#ifdef __ANDROID__
+        klock_stamp_holder();
+#endif
+        return;
+    }
+#ifdef __ANDROID__
+    uint64_t prev_id = g_klock_holder_id;
+    int prev_tid = g_klock_holder_tid;
+    int prev_prio = g_klock_holder_prio;
+    int prev_core = g_klock_holder_core;
+    uint64_t prev_lr = g_klock_holder_lr;
     uint64_t t0 = plat_now_ns();
     pthread_mutex_lock(&g_klock);
-    uint64_t dt = plat_now_ns() - t0;
-    if (dt >= 1000000ull)
-        stall_record_lock_wait("kernel", "g_klock", dt);
+    uint64_t t1 = plat_now_ns();
+    uint64_t dt = t1 - t0;
+    klock_stamp_holder();
+    if (dt >= 1000000ull) {
+        if (!t_cur || t_cur->id == 0x50)
+            stall_record_lock_wait("kernel", "g_klock", dt);
+        else
+            stall_record_bg_lock_wait("kernel", "g_klock", dt);
+        if (dt >= 5000000ull && t_cur) {
+            StallKernelWaitDetail kd = {
+                .frame_id = renderer_present_count(),
+                .start_ns = t0,
+                .end_ns = t1,
+                .wait_ns = dt,
+                .timeout_ns = -1,
+                .wait_kind_str = "HOST_KLOCK",
+                .waiter_id = t_cur->id,
+                .waiter_host_tid = t_cur->host_tid,
+                .waiter_prio = t_cur->prio,
+                .waiter_core = __atomic_load_n(&t_cur->core, __ATOMIC_RELAXED),
+                .wait_addr = (uint64_t)(uintptr_t)&g_klock,
+                .owner_id = prev_id,
+                .owner_host_tid = prev_tid,
+                .owner_prio = prev_prio,
+                .owner_core = prev_core,
+                .owner_lr = prev_lr,
+            };
+            guest_collect_bt(t_cur, kd.waiter_bt);
+            stall_record_kernel_wait_detail(&kd);
+        }
+    }
 #else
     pthread_mutex_lock(&g_klock);
 #endif
@@ -83,7 +160,31 @@ static void handle_close(uint32_t h) {
 // Threads blocked in WaitSynchronization; object signals wake only these (caller holds g_klock).
 static KThread *g_syncwaiters;
 
-static void wake(KThread *t) { pthread_cond_signal(&t->cond); }
+static void stamp_waker(KThread *t, uint64_t caller_lr) {
+    if (!t) return;
+    if (t_cur) {
+        t->last_waker_id = t_cur->id;
+        t->last_waker_host_tid = t_cur->host_tid;
+        t->last_waker_prio = t_cur->prio;
+        t->last_waker_core = __atomic_load_n(&t_cur->core, __ATOMIC_RELAXED);
+        t->last_waker_lr = t_cur->cpu.x[30];
+    } else {
+        t->last_waker_id = 0;
+#ifdef __ANDROID__
+        t->last_waker_host_tid = (int)gettid();
+#else
+        t->last_waker_host_tid = 0;
+#endif
+        t->last_waker_prio = -1;
+        t->last_waker_core = -1;
+        t->last_waker_lr = caller_lr;
+    }
+}
+
+static void wake(KThread *t) {
+    stamp_waker(t, (uint64_t)(uintptr_t)__builtin_return_address(0));
+    pthread_cond_signal(&t->cond);
+}
 
 void kernel_signal(KObject *o) {
     // caller holds g_klock
@@ -415,6 +516,7 @@ static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
 #ifdef __ANDROID__
+    t->host_tid = (int)gettid();
     plat_thread_pin_fast();  // pin main (t80) & guest worker threads together onto Big/Prime cores
     stall_set_thread_name(t->id == 0x50 ? "guest-main" : "guest-worker", t->id);
     stall_note_active_work(t->id == 0x50 ? "guest_main_exec" : "guest_worker_exec");
@@ -587,11 +689,30 @@ static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
 #ifdef __ANDROID__
     int wait_kind_initial = t ? t->wait_kind : WAIT_NONE;
-    uint64_t wait_owner_id = 0;
-    if (t && wait_kind_initial == WAIT_MUTEX && t->wait_addr) {
-        uint32_t mw = __atomic_load_n(u32p(t->wait_addr), __ATOMIC_RELAXED) & ~WAITERS_BIT;
-        KObject *mo = handle_get(mw);
-        if (mo && mo->type == KOBJ_THREAD) wait_owner_id = ((KThread *)mo)->id;
+    uint64_t wait_addr_initial = t ? t->wait_addr : 0;
+    uint64_t wait_mutex_initial = t ? t->wait_mutex : 0;
+    uint64_t wait_owner_id = 0, wait_owner_lr = 0;
+    int wait_owner_tid = 0, wait_owner_prio = -1, wait_owner_core = -1;
+    if (t) {
+        t->last_waker_id = 0;
+        t->last_waker_host_tid = 0;
+        t->last_waker_prio = -1;
+        t->last_waker_core = -1;
+        t->last_waker_lr = 0;
+        uint64_t m_addr = (wait_kind_initial == WAIT_MUTEX) ? wait_addr_initial
+                        : (wait_kind_initial == WAIT_CONDVAR) ? wait_mutex_initial : 0;
+        if (m_addr) {
+            uint32_t mw = __atomic_load_n(u32p(m_addr), __ATOMIC_RELAXED) & ~WAITERS_BIT;
+            KObject *mo = handle_get(mw);
+            if (mo && mo->type == KOBJ_THREAD) {
+                KThread *mt = (KThread *)mo;
+                wait_owner_id = mt->id;
+                wait_owner_tid = mt->host_tid;
+                wait_owner_prio = mt->prio;
+                wait_owner_core = __atomic_load_n(&mt->core, __ATOMIC_RELAXED);
+                wait_owner_lr = mt->cpu.x[30];
+            }
+        }
     }
     uint64_t wait_t0 = plat_now_ns();
 #endif
@@ -615,6 +736,7 @@ static uint32_t block_current(int64_t timeout_ns) {
                 __asm__ volatile("yield");
             }
             pthread_mutex_lock(&g_klock);
+            klock_stamp_holder();
         }
     }
 #endif
@@ -644,27 +766,67 @@ static uint32_t block_current(int64_t timeout_ns) {
             t->wait_result = R_TIMEOUT;
             break;
         }
+#ifdef __ANDROID__
+        klock_stamp_holder();
+#endif
     }
     waitlist_remove(t);
 #ifdef __ANDROID__
     uint64_t wait_t1 = plat_now_ns();
     uint64_t wait_dt = wait_t1 - wait_t0;
-    if (t && wait_dt >= 5000000ull && (t->id == 0x50 || wait_kind_initial == WAIT_MUTEX)) {
+    if (t && wait_kind_initial == WAIT_MUTEX && wait_dt >= 1000000ull) {
+        if (t->id == 0x50)
+            stall_record_lock_wait("kernel", "WAIT_MUTEX", wait_dt);
+        else
+            stall_record_bg_lock_wait("kernel", "WAIT_MUTEX", wait_dt);
+    }
+    if (t && wait_dt >= 5000000ull) {
         const char *reason = wait_kind_initial == WAIT_MUTEX ? "WAIT_MUTEX"
                            : wait_kind_initial == WAIT_CONDVAR ? "WAIT_CONDVAR"
                            : wait_kind_initial == WAIT_ARBITER ? "WAIT_ARBITER" : "WAIT_KERNEL";
-        char waited_on[32];
-        if (wait_owner_id)
-            snprintf(waited_on, sizeof waited_on, "guest:t%llu", (unsigned long long)wait_owner_id);
-        else
-            snprintf(waited_on, sizeof waited_on, "addr:%#llx", (unsigned long long)(t->wait_addr));
-        if (wait_kind_initial == WAIT_MUTEX) {
-            stall_record_lock_wait("kernel", reason, wait_dt);
+        uint64_t eff_owner_id = wait_owner_id ? wait_owner_id : t->last_waker_id;
+        int eff_owner_tid = wait_owner_id ? wait_owner_tid : t->last_waker_host_tid;
+        int eff_owner_prio = wait_owner_id ? wait_owner_prio : t->last_waker_prio;
+        int eff_owner_core = wait_owner_id ? wait_owner_core : t->last_waker_core;
+        uint64_t eff_owner_lr = wait_owner_id ? wait_owner_lr : t->last_waker_lr;
+        StallKernelWaitDetail kd = {
+            .frame_id = renderer_present_count(),
+            .start_ns = wait_t0,
+            .end_ns = wait_t1,
+            .wait_ns = wait_dt,
+            .timeout_ns = timeout_ns,
+            .wait_kind_str = reason,
+            .waiter_id = t->id,
+            .waiter_host_tid = t->host_tid,
+            .waiter_prio = t->prio,
+            .waiter_core = __atomic_load_n(&t->core, __ATOMIC_RELAXED),
+            .wait_addr = wait_addr_initial,
+            .wait_mutex = wait_mutex_initial,
+            .wait_tag = t->wait_tag,
+            .wait_result = t->wait_result,
+            .owner_id = eff_owner_id,
+            .owner_host_tid = eff_owner_tid,
+            .owner_prio = eff_owner_prio,
+            .owner_core = eff_owner_core,
+            .owner_lr = eff_owner_lr,
+            .waker_id = t->last_waker_id,
+            .waker_host_tid = t->last_waker_host_tid,
+            .waker_prio = t->last_waker_prio,
+            .waker_core = t->last_waker_core,
+            .waker_lr = t->last_waker_lr,
+        };
+        guest_collect_bt(t, kd.waiter_bt);
+        stall_record_kernel_wait_detail(&kd);
+        if (t->id == 0x50 || wait_kind_initial == WAIT_MUTEX) {
+            char waited_on[32];
+            if (wait_owner_id)
+                snprintf(waited_on, sizeof waited_on, "guest:t%llu(p%d)", (unsigned long long)wait_owner_id, wait_owner_prio);
+            else if (t->last_waker_id)
+                snprintf(waited_on, sizeof waited_on, "waker:t%llu(p%d)", (unsigned long long)t->last_waker_id, t->last_waker_prio);
+            else
+                snprintf(waited_on, sizeof waited_on, "addr:%#llx", (unsigned long long)wait_addr_initial);
             stall_record_wait_event(renderer_present_count(), wait_t0, wait_t1, "kernel", reason,
-                                    (int)wait_owner_id, waited_on, NULL);
-        } else {
-            stall_record_wait_event(renderer_present_count(), wait_t0, wait_t1, "kernel", reason,
-                                    (int)wait_owner_id, waited_on, NULL);
+                                    (int)eff_owner_id, waited_on, NULL);
         }
     }
 #endif
@@ -738,6 +900,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
         // the woken thread must reacquire its mutex
         uint64_t m = best->wait_mutex;
         best->wait_result = R_OK;
+        stamp_waker(best, (uint64_t)(uintptr_t)__builtin_return_address(0));
         if (mutex_acquire_or_mark(m, best->wait_tag)) {
             best->wait_kind = WAIT_NONE;
             wake(best);
@@ -866,10 +1029,20 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         if (t->cancel) { t->cancel = false; r = R_CANCELLED; goto out; }
         if (g_rt_unwind) { r = R_CANCELLED; goto out; }
         if (timeout == 0) { r = R_TIMEOUT; goto out; }
+#ifdef __ANDROID__
+        t->last_waker_id = 0;
+        t->last_waker_host_tid = 0;
+        t->last_waker_prio = -1;
+        t->last_waker_core = -1;
+        t->last_waker_lr = 0;
+#endif
         t->in_sync_wait = true;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
+#ifdef __ANDROID__
+        klock_stamp_holder();
+#endif
         for (KThread **p = &g_syncwaiters; *p; p = &(*p)->snext)
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;
@@ -879,14 +1052,50 @@ out:
     pthread_mutex_unlock(&g_klock);
 #ifdef __ANDROID__
     uint64_t sync_t1 = plat_now_ns();
-    if (t && t->id == 0x50 && sync_t1 - sync_t0 >= 5000000ull) {
+    uint64_t sync_dt = sync_t1 - sync_t0;
+    if (t && sync_dt >= 5000000ull) {
         extern uint32_t vi_vsync_handle(void);
         bool is_vsync = false;
         for (int i = 0; i < count && i < 8; i++)
             if (hs[i] && hs[i] == vi_vsync_handle()) { is_vsync = true; break; }
-        stall_record_wait_event(renderer_present_count(), sync_t0, sync_t1, "kernel",
-                                is_vsync ? "WAIT_SYNC_VSYNC" : "WAIT_SYNC", 0,
-                                is_vsync ? "vi_vsync" : "kobject", NULL);
+        const char *reason = is_vsync ? "WAIT_SYNC_VSYNC" : "WAIT_SYNC";
+        StallKernelWaitDetail kd = {
+            .frame_id = renderer_present_count(),
+            .start_ns = sync_t0,
+            .end_ns = sync_t1,
+            .wait_ns = sync_dt,
+            .timeout_ns = timeout,
+            .wait_kind_str = reason,
+            .waiter_id = t->id,
+            .waiter_host_tid = t->host_tid,
+            .waiter_prio = t->prio,
+            .waiter_core = __atomic_load_n(&t->core, __ATOMIC_RELAXED),
+            .wait_addr = count > 0 ? hs[0] : 0,
+            .wait_result = r,
+            .owner_id = t->last_waker_id,
+            .owner_host_tid = t->last_waker_host_tid,
+            .owner_prio = t->last_waker_prio,
+            .owner_core = t->last_waker_core,
+            .owner_lr = t->last_waker_lr,
+            .waker_id = t->last_waker_id,
+            .waker_host_tid = t->last_waker_host_tid,
+            .waker_prio = t->last_waker_prio,
+            .waker_core = t->last_waker_core,
+            .waker_lr = t->last_waker_lr,
+        };
+        guest_collect_bt(t, kd.waiter_bt);
+        stall_record_kernel_wait_detail(&kd);
+        if (t->id == 0x50) {
+            char waited_on[32];
+            if (is_vsync)
+                snprintf(waited_on, sizeof waited_on, "vi_vsync");
+            else if (t->last_waker_id)
+                snprintf(waited_on, sizeof waited_on, "waker:t%llu(p%d)", (unsigned long long)t->last_waker_id, t->last_waker_prio);
+            else
+                snprintf(waited_on, sizeof waited_on, "kobject:%#x", count > 0 ? hs[0] : 0);
+            stall_record_wait_event(renderer_present_count(), sync_t0, sync_t1, "kernel",
+                                    reason, (int)t->last_waker_id, waited_on, NULL);
+        }
     }
 #endif
     return r;

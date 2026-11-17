@@ -298,7 +298,10 @@ bool vk_async_is_render_thread(void);
 void vk_async_drain(void);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
+void vk_async_ensure_submitted(uint64_t seq);
 int vk_async_render_tid(void);
+uint64_t vk_submitted_seq(void);
+uint64_t vk_completed_seq(void);
 void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view);
 void vk_async_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc);
 void vk_async_tex_pool_fin(NvnDescPool *d);
@@ -306,11 +309,25 @@ void vk_async_tex_destroy(NvnTexture *t);
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
 NVN(nvnQueueFinish) {
-    (void)c;
+    uint64_t t0 = plat_now_ns();
+    extern uint64_t renderer_present_count(void);
+    uint64_t frame_id = renderer_present_count();
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
     if (vk_async_on()) vk_async_drain();  // (the render thread's translation first: vulkan/async.c)
+    uint64_t t1 = plat_now_ns();
+    uint64_t sub_seq = vk_submitted_seq();
     renderer_sync();
+    uint64_t t_end = plat_now_ns();
     kernel_blocking_end();
+    extern void vk_record_nvn_sync_wait(uint64_t ns);
+    uint64_t dt = t_end - t0;
+    vk_record_nvn_sync_wait(dt);
+    stall_record_nvn_sync_call("nvnQueueFinish", frame_id, t0, t1, t_end,
+                               c ? c->x[30] : 0, -1, 0, sub_seq, sub_seq, vk_completed_seq());
+    if (dt >= 5000000ull) {
+        stall_record_wait_event(frame_id, t0, t_end, "nvn", "nvnQueueFinish",
+                                vk_async_render_tid(), "vk-render", NULL);
+    }
 }
 #else
 NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
@@ -447,22 +464,35 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
                 (unsigned long long)st_n, (unsigned long long)(st_n ? st_pos / st_n : 0));
             wb_n = wb_pos = st_n = st_pos = 0;
         }
+        if (vk_async_on()) vk_async_ensure_submitted(target);
         renderer_wait_seq(target);
     } else
 #endif
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    else {
+#ifdef __ANDROID__
+        if (vk_async_on()) vk_async_ensure_submitted(sync_of(A(0))->seq);
+#endif
+        renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    }
 #ifdef __ANDROID__
     kernel_blocking_end();
     {
         extern void vk_record_nvn_sync_wait(uint64_t ns);
+        extern uint64_t renderer_present_count(void);
         uint64_t t_end_sync = plat_now_ns();
         uint64_t sync_dt = t_end_sync - t0;
+        uint64_t frame_id = renderer_present_count();
+        NvnSync *so = sync_of(A(0));
         vk_record_nvn_sync_wait(sync_dt);
+        stall_record_nvn_sync_call((flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait",
+                                   frame_id, t0, t1, t_end_sync,
+                                   c ? c->x[30] : 0, (int64_t)A(1),
+                                   so ? so->lseq : 0, so ? so->seq : 0,
+                                   vk_submitted_seq(), vk_completed_seq());
         if (sync_dt >= 5000000ull) {
-            extern uint64_t renderer_present_count(void);
-            stall_record_wait_event(renderer_present_count(), t0, t_end_sync, "nvn",
+            stall_record_wait_event(frame_id, t0, t_end_sync, "nvn",
                                     (flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait",
                                     vk_async_render_tid(), "vk-render", NULL);
         }

@@ -54,6 +54,9 @@ static Req q[QN];
 static uint64_t q_head, q_tail;   // q_tail: next id to queue (ids start at 1), q_head: next to run
 static uint64_t q_done;           // the last id the render thread finished
 static int q_presents;            // PRESENT requests queued and not finished (the game's lead)
+static int q_waiters;             // number of guest threads currently waiting in vk_async_wait_id / vk_async_drain
+static uint64_t q_flush_seq;      // highest submission seq requested by a waiting nvnSyncWait
+static volatile bool g_async_has_more_exec;
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_more = PTHREAD_COND_INITIALIZER, q_less = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t p_lock = PTHREAD_MUTEX_INITIALIZER;  // producers: an id, its list's fences and its push together
@@ -81,6 +84,9 @@ void vk_execute_now(uint64_t handle);    // exec.c: translate and submit a comma
 void vk_execute_list_batch(uint64_t handle, bool force_submit);
 void vk_flush_pending_work(void);
 bool vk_has_pending_commands(void);
+bool vk_batch_has_fence(void);
+uint64_t vk_submitted_seq(void);
+bool vk_async_has_more_exec(void) { return __atomic_load_n(&g_async_has_more_exec, __ATOMIC_RELAXED); }
 void vk_present_now(NvnTexture *t, uint64_t asked);  // device.c: the window's half of backend_present
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq);
 uint64_t renderer_fence_seq(void);
@@ -174,8 +180,21 @@ static void *render_main(void *arg) {
     bool cpu_timing = timing && atoi(timing) != 0;
     pthread_mutex_lock(&q_lock);
     for (;;) {
+        if (vk_has_pending_commands() &&
+            (q_waiters > 0 || q_flush_seq > vk_submitted_seq() ||
+             (q_head == q_tail && vk_batch_has_fence()))) {
+            pthread_mutex_unlock(&q_lock);
+            vk_flush_pending_work();
+            pthread_mutex_lock(&q_lock);
+        }
         while (q_head == q_tail) {
             if (vk_has_pending_commands()) {
+                if (q_waiters > 0 || q_flush_seq > vk_submitted_seq() || vk_batch_has_fence()) {
+                    pthread_mutex_unlock(&q_lock);
+                    vk_flush_pending_work();
+                    pthread_mutex_lock(&q_lock);
+                    continue;
+                }
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_nsec += 1500000;  // 1.5 ms batch coalescing window before auto-flushing open command buffer
@@ -185,7 +204,7 @@ static void *render_main(void *arg) {
                 uint64_t w1 = plat_now_ns();
                 __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&frame_coalesce_ns, w1 - w0, __ATOMIC_RELAXED);
-                if (wr != 0 && q_head == q_tail) {
+                if ((wr != 0 && q_head == q_tail) || q_waiters > 0 || q_flush_seq > vk_submitted_seq()) {
                     pthread_mutex_unlock(&q_lock);
                     vk_flush_pending_work();
                     pthread_mutex_lock(&q_lock);
@@ -203,14 +222,19 @@ static void *render_main(void *arg) {
         }
         Req r = q[q_head % QN];
         bool next_needs_submit = false;
-        if (r.type == REQ_EXEC) {
+        bool has_more_exec = false;
+        if (r.type == REQ_EXEC || r.type == REQ_FENCE) {
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
                 int nt = q[scan % QN].type;
-                if (nt == REQ_TEX_REG || nt == REQ_SMP_REG) continue;
-                next_needs_submit = (nt != REQ_EXEC);
+                if (nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE) continue;
+                if (nt == REQ_EXEC) has_more_exec = true;
+                else next_needs_submit = true;
                 break;
             }
         }
+        bool waiter_urgent = (q_waiters > 0 || q_flush_seq > vk_submitted_seq());
+        __atomic_store_n(&g_async_has_more_exec, has_more_exec && !waiter_urgent, __ATOMIC_RELAXED);
+        if (waiter_urgent) next_needs_submit = true;
         pthread_mutex_unlock(&q_lock);
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
@@ -231,7 +255,10 @@ static void *render_main(void *arg) {
         } else if (r.type == REQ_FLUSH) {
             vk_flush_pending_work();
         } else if (r.type == REQ_FENCE) {
-            vk_flush_pending_work();
+            // Coalesce back-to-back streaming command lists + fences when more EXEC work is already queued
+            // and no thread is waiting. renderer_fence_seq() returns submit_seq + 1 when a batch is open,
+            // and the batch auto-flushes as soon as the queue empties or any thread calls nvnSyncWait.
+            if (!has_more_exec || waiter_urgent) vk_flush_pending_work();
             nvn_sync_set_seq(r.a, renderer_fence_seq());
         } else if (r.type == REQ_TEX_REG) {
             AsyncTexReg *tr = (AsyncTexReg *)r.p;
@@ -312,12 +339,37 @@ void vk_async_wait_id(uint64_t id) {
     if (!id || !g_vk_render_started || vk_async_is_render_thread()) return;
     uint64_t w0 = plat_now_ns();
     pthread_mutex_lock(&q_lock);
-    while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
+    if (q_done < id) {
+        q_waiters++;
+        pthread_cond_signal(&q_more);
+        while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
+        q_waiters--;
+    }
     pthread_mutex_unlock(&q_lock);
     uint64_t w1 = plat_now_ns();
     if (w1 - w0 >= 5000000ull) {
         stall_record_wait_event(renderer_present_count(), w0, w1, "async",
                                 "vk_async_wait_id", vk_async_render_tid(), "vk-render", NULL);
+    }
+}
+
+// Ensure that GPU submission `seq` has been flushed to VkQueue (if `seq > vk_submitted_seq()`)
+// without waiting for newer unrelated async requests in the ring.
+void vk_async_ensure_submitted(uint64_t seq) {
+    if (!seq || !g_vk_render_started || vk_async_is_render_thread()) {
+        if (seq > vk_submitted_seq() && vk_has_pending_commands()) vk_flush_pending_work();
+        return;
+    }
+    if (seq <= vk_submitted_seq()) return;
+    pthread_mutex_lock(&q_lock);
+    if (seq > q_flush_seq) q_flush_seq = seq;
+    pthread_cond_signal(&q_more);
+    pthread_mutex_unlock(&q_lock);
+    if (seq > vk_submitted_seq() && vk_has_pending_commands()) {
+        pthread_mutex_lock(&p_lock);
+        uint64_t fid = push(REQ_FLUSH, 0, NULL);
+        pthread_mutex_unlock(&p_lock);
+        vk_async_wait_id(fid);
     }
 }
 
@@ -331,7 +383,12 @@ void vk_async_drain(void) {
     kernel_blocking_begin();
     pthread_mutex_lock(&q_lock);
     uint64_t id = q_tail;
-    while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
+    if (q_done < id) {
+        q_waiters++;
+        pthread_cond_signal(&q_more);
+        while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
+        q_waiters--;
+    }
     pthread_mutex_unlock(&q_lock);
     if (vk_has_pending_commands()) {
         pthread_mutex_lock(&p_lock);

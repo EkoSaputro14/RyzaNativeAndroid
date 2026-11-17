@@ -29,6 +29,9 @@ struct KThread {
     uint64_t entry, tlr, id;
     uint32_t handle;
     int prio, core;        // core: current virtual core, accessed atomically
+    int host_tid;          // host OS TID (gettid) for telemetry
+    uint64_t last_waker_id, last_waker_lr;
+    int last_waker_host_tid, last_waker_prio, last_waker_core;
     int ideal_core;        // may be -1 (no preference); g_klock
     uint64_t core_mask;    // allowed virtual cores; g_klock
     bool cancel, in_sync_wait;

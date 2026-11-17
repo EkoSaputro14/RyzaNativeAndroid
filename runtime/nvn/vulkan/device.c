@@ -1536,10 +1536,10 @@ void backend_present(NvnTexture *t) {
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded, as before anything outside a pass)
 #endif
     static const float black[4] = {0, 0, 0, 1};
-    uint64_t t0 = SDL_GetTicksNS();
+    uint64_t t0 = plat_now_ns();
     stall_note_active_work("vk_acquire");
     bool have = vk_frame_begin(black);
-    uint64_t nd = SDL_GetTicksNS() - t0;
+    uint64_t nd = plat_now_ns() - t0;
     stall_note_acquire(nd);
     if (nd >= 5000000ull)
         stall_record_wait_event(total_frames, t0, t0 + nd, "vk-present", "vk_acquire_image", 0, "surfaceflinger", NULL);

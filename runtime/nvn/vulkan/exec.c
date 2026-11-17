@@ -60,7 +60,7 @@ static int prof = -1;
 static uint64_t prof_dsw, prof_cbuf, prof_set_hits, prof_set_miss;  // (sets: driver writes, cbuf copies, set cache)
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 static VkQueryPool prof_qp;
-static uint64_t cum_exec, cum_wait, cum_draws, cum_submits, cum_draw_prep;  // (profiling) never reset: hitch log
+static uint64_t cum_exec, cum_wait, cum_draws, cum_submits, cum_draw_prep, cum_submit_ns;  // (profiling) never reset: hitch log
 #ifdef __ANDROID__
 uint64_t vk_cum_wait_ns(void) { return cum_wait; }  // (the performance overlay: time spent waiting on the GPU)
 #endif
@@ -90,7 +90,7 @@ void vk_collect_dead(void);
 // ================================================================== submissions
 // A submission = optional upload command buffer + the main one, signalling the timeline with its number.
 #ifdef __ANDROID__
-#define SUBS 32  // (Increased from 16 to 32: prevents ring slot stalls on multi-pass KTGL frames)
+#define SUBS 64  // (Increased to 64: prevents ring slot wrap-around stalls during streaming upload bursts)
 #else
 #define SUBS 8
 #endif
@@ -126,6 +126,10 @@ static int nlclear;
 static int naliases;
 
 static _Atomic uint64_t done_seq_cache;
+
+uint64_t vk_submitted_seq(void) {
+    return __atomic_load_n(&submit_seq, __ATOMIC_ACQUIRE);
+}
 
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
@@ -183,9 +187,9 @@ void vk_wait_seq(uint64_t seq) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     const char *why_tag = wait_why ? wait_why : "gpu_timeline";
-    uint64_t t0 = SDL_GetTicksNS();
+    uint64_t t0 = plat_now_ns();
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
-    uint64_t dt = SDL_GetTicksNS() - t0;
+    uint64_t dt = plat_now_ns() - t0;
     stat_wait_ns += dt;
     cum_wait += dt;
     wait_account(dt);
@@ -363,6 +367,12 @@ void vk_pace_frame(void) {
     uint64_t p = now - last, wt = w - last_wait;
     bool first = !last;
     last = now, last_wait = w;
+#ifdef __ANDROID__
+    if (!first) {
+        uint64_t gb_ns = p > wt ? p - wt : 0;
+        stall_note_guest_window(gb_ns);
+    }
+#endif
     if (first || p > 1000000000ull) return;  // (Keep reporting ADPF for frames up to 1000 ms so <15 FPS never starves governor)
     double busy = (p > wt ? p - wt : 0) / 1e6;
 #ifdef __ANDROID__
@@ -372,7 +382,6 @@ void vk_pace_frame(void) {
     double render_busy = vk_async_on() ? vk_async_frame_work_ns() / 1e6 : 0;
     double game_busy = busy;
     uint64_t game_busy_ns = (uint64_t)(game_busy * 1e6);
-    stall_note_guest_window(game_busy_ns);
     atomic_fetch_add(&s_game_busy_ns_acc, game_busy_ns);
     atomic_fetch_add(&s_game_busy_frames, 1);
     uint64_t prev_max = atomic_load(&s_game_busy_max_ns);
@@ -916,14 +925,17 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
+        uint64_t sub_t0 = plat_now_ns();
         VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        uint64_t sub_dt = plat_now_ns() - sub_t0;
+        cum_submit_ns += sub_dt;
 #ifdef __ANDROID__
         tl_add((int64_t)plat_now_ns(), wait || signal ? "render: submitted (present)" : "render: submitted", submit_seq + 1, 0);
-        if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, SDL_GetTicksNS() - trace_start);
+        if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, sub_dt);
 #endif
         if (sr == VK_ERROR_DEVICE_LOST) vk_devlost_dump();
         VK_CHECK(sr);
-        PROF_ADD(prof_submit);
+        if (prof) prof_submit += sub_dt;
     }
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
@@ -947,10 +959,19 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 }
 
 static bool list_had_fence;
+static bool batch_had_fence;
 static uint32_t batch_lists;
 static uint64_t batch_start_draws;
+static uint64_t batch_start_upload_bytes;
 
-void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
+bool vk_batch_has_fence(void) {
+    return batch_had_fence;
+}
+
+void renderer_submit(void) {
+    batch_had_fence = false;
+    vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+}
 
 void renderer_flush(void) {
     renderer_submit();
@@ -963,7 +984,10 @@ bool vk_has_pending_commands(void) {
 }
 
 void vk_flush_pending_work(void) {
-    if (!vk_has_pending_commands()) return;
+    if (!vk_has_pending_commands()) {
+        batch_had_fence = false;
+        return;
+    }
 #ifdef __ANDROID__
     game_pending = true;
 #endif
@@ -976,6 +1000,7 @@ void vk_flush_pending_work(void) {
 #endif
     batch_lists = 0;
     batch_start_draws = stat_draws;
+    batch_start_upload_bytes = stat_upload_bytes;
 }
 
 void renderer_sync(void) {
@@ -988,11 +1013,13 @@ void renderer_sync(void) {
 
 uint64_t renderer_fence_seq(void) {
     pthread_mutex_lock(&seq_lock);
-    uint64_t q = submit_seq + (atomic_load_explicit(&g_batch_pending, memory_order_acquire) ? 1 : 0);
+    bool pending = atomic_load_explicit(&g_batch_pending, memory_order_acquire);
+    uint64_t q = submit_seq + (pending ? 1 : 0);
 #ifdef __ANDROID__
+    if (pending) batch_had_fence = true;
     static int fence_present = -1;
     if (fence_present < 0) fence_present = getenv("LARECOMP_FENCE_PRESENT") != NULL;
-    if (!game_pending && work_seq && !fence_present) q = work_seq;
+    if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;
     static int log = -1;
     if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
     if (log) LOG("[syncseq] t %.2f fence -> seq %llu (submitted %llu, work %llu, begun %d/%d, tid %d)\n", SDL_GetTicksNS() / 1e6,
@@ -1451,8 +1478,8 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 // (LARECOMP_VK_PROF) called once per presented frame: frames over 50 ms are logged with where their time went.
 // present_ns: time in backend_present's acquire/blit/present.
 void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
-    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles, l_draw_prep, l_gpu;
-    uint64_t now = SDL_GetTicksNS();
+    static uint64_t last_t, l_exec, l_wait, l_draws, l_subs, l_compiles, l_draw_prep, l_submit_ns, l_gpu;
+    uint64_t now = plat_now_ns();
 #ifdef __ANDROID__
     {
         extern void vk_memory_pressure_tick(uint64_t frame);
@@ -1479,6 +1506,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
         uint64_t ex = cum_exec - l_exec;
         uint64_t wt = cum_wait - l_wait;
         uint64_t dp = cum_draw_prep - l_draw_prep;
+        uint64_t sub_ns = cum_submit_ns - l_submit_ns;
         uint64_t gns = cur_gpu >= l_gpu ? cur_gpu - l_gpu : 0;
         precompute_record_frame_latency(ex, wt);
         uint64_t tex_up = 0, tex_bytes = 0, tex_desw_ns = 0;
@@ -1493,6 +1521,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             .wait_game_coalesce_ns = coalesce_ns,
             .backend_exec_ns = ex,
             .vk_cpu_prep_ns = dp,
+            .vk_submit_ns = sub_ns,
             .gpu_ns = gns,
             .gpu_wait_ns = wt,
             .acquire_ns = stall_take_acquire_ns(),
@@ -1501,6 +1530,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             .tex_upload_bytes = tex_bytes,
             .tex_deswizzle_ns = tex_desw_ns,
             .lock_wait_ns = stall_take_lock_wait_ns(),
+            .bg_lock_wait_ns = stall_take_bg_lock_wait_ns(),
             .draws = cum_draws - l_draws,
             .submits = cum_submits - l_subs,
             .compiles_delta = cur_compiles - l_compiles,
@@ -1523,7 +1553,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
     }
     if (!prof) {
         last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
-        l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_gpu = cur_gpu;
+        l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_submit_ns = cum_submit_ns; l_gpu = cur_gpu;
         return;
     }
     if (last_t && now - last_t > 50000000) {
@@ -1538,7 +1568,7 @@ void vk_prof_frame(uint64_t frame, uint64_t present_ns) {
             (unsigned long long)(cur_compiles - l_compiles), pending_compiles);
     }
     last_t = now; l_exec = cum_exec; l_wait = cum_wait; l_draws = cum_draws; l_subs = cum_submits;
-    l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_gpu = cur_gpu;
+    l_compiles = cur_compiles; l_draw_prep = cum_draw_prep; l_submit_ns = cum_submit_ns; l_gpu = cur_gpu;
 }
 
 static double s_last_cpu_exec_ms, s_last_gpu_ms;
@@ -9468,15 +9498,20 @@ void backend_execute(uint64_t handle) {
     if (vk_async_on()) vk_async_execute(handle);
     else vk_execute_now(handle);
 }
+extern bool vk_async_has_more_exec(void);
 void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     PROF_T0();
     game_pending = true;  // (renderer_fence_seq)
-    if (batch_lists == 0) batch_start_draws = stat_draws;
+    if (batch_lists == 0) {
+        batch_start_draws = stat_draws;
+        batch_start_upload_bytes = stat_upload_bytes;
+    }
     list_had_fence = false;
     static int log_lists = -1;
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
     uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
     exec_list(handle, 0);
+    if (list_had_fence) batch_had_fence = true;
     batch_lists++;
     if (log_lists && renderer_present_count() % 120 == 0)
         LOG("[lists] frame %llu: list %llx %llu draws %llu passes %.2f ms\n", (unsigned long long)renderer_present_count(),
@@ -9488,13 +9523,18 @@ void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     if (no_batch < 0) no_batch = getenv("LARECOMP_VK_NO_BATCH") != NULL;
     static int sync_submit = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
-    bool should_submit = no_batch || sync_submit || force_submit || list_had_fence ||
-                         (stat_draws - batch_start_draws >= 64) || (batch_lists >= 16);
+    uint64_t batch_up_bytes = stat_upload_bytes - batch_start_upload_bytes;
+    bool fence_forces_submit = list_had_fence && !vk_async_has_more_exec();
+    bool should_submit = no_batch || sync_submit || force_submit || fence_forces_submit ||
+                         (stat_draws - batch_start_draws >= 64) ||
+                         (batch_lists >= 32) ||
+                         (batch_up_bytes >= (8ull << 20));
     if (should_submit) {
         if (sync_submit) renderer_flush();
         else renderer_submit();
         batch_lists = 0;
         batch_start_draws = stat_draws;
+        batch_start_upload_bytes = stat_upload_bytes;
     }
     game_pending = false;
 }

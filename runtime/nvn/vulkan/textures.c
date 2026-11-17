@@ -965,6 +965,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         b->wgen = prev_wgen;
         return;
     }
+    uint64_t hash_t0 = plat_now_ns();
     if (b->uploaded && b->dynamic && !always_full && !restyle && !periodic && texture_unchanged(b, mem, total)) return;
     if (!full && !restyle) {
         prof_tex_samples++;
@@ -972,22 +973,33 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (sh == b->sample_hash) return;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
-    uint64_t h = (!b->uploaded && !b->dynamic && total > (1 << 20)) ? fnv_sample(mem, total) : hash_full(mem, total);
+    bool fast_first = !b->uploaded && !b->dynamic && !always_full && total > (1 << 20);
+    uint64_t h = fast_first ? fnv_sample(mem, total) : hash_full(mem, total);
     uint64_t last_full = b->full_frame, old_sample = b->sample_hash;
+    bool old_hash_valid = b->data_hash_valid;
     b->full_frame = frame;
-    b->sample_hash = (!b->uploaded && !b->dynamic && total > (1 << 20)) ? h : fnv_sample(mem, total);
-    if (b->uploaded && h == b->data_hash && !restyle) return;
+    b->sample_hash = fast_first ? h : fnv_sample(mem, total);
+    uint64_t hash_ns = plat_now_ns() - hash_t0;
+    if (b->uploaded && !old_hash_valid) {
+        // First periodic full hash after a fast initial fnv_sample upload (>1 MB):
+        // establish the full hash baseline without triggering a false re-upload or marking dynamic if samples match.
+        b->data_hash = h;
+        b->data_hash_valid = true;
+        if (b->sample_hash == old_sample && !restyle) return;
+    }
+    if (b->uploaded && old_hash_valid && h == b->data_hash && !restyle) return;
     if (b->uploaded && !restyle && !(t->flags & 0x40)) {
         if (dyn_deswizzle_ops_frame > 0 && dyn_deswizzle_bytes_frame + total > (4u << 20)) {
             b->wgen = prev_wgen;
             b->full_frame = last_full;
             b->sample_hash = old_sample;
+            b->data_hash_valid = old_hash_valid;
             return;
         }
         dyn_deswizzle_bytes_frame += total;
         dyn_deswizzle_ops_frame++;
     }
-    if (b->uploaded && h != b->data_hash && !b->dynamic && !always_full) {
+    if (b->uploaded && old_hash_valid && h != b->data_hash && !b->dynamic && !always_full) {
         // LARECOMP_LOG_TEX_MISS=1 (diagnosis): a change the sampled check didn't see, found by the periodic full hash -
         // the texture showed its old contents meanwhile (the stretched-terrain curtains after a tower: gone with
         // LARECOMP_TEX_FULLHASH=1, 2026-10-26)
@@ -999,7 +1011,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 t->format, t->flags, t->target, t->levels, (unsigned long long)t->addr, (unsigned long long)total,
                 (unsigned long long)(frame - last_full), b->sample_hash == old_sample ? "unchanged (missed)" : "changed");
     }
-    if (b->uploaded && h != b->data_hash) b->dynamic = true;
+    bool was_uploaded = b->uploaded;
+    if (b->uploaded && (old_hash_valid ? (h != b->data_hash) : (b->sample_hash != old_sample))) b->dynamic = true;
     if (b->tp > 0) b->tp_gen = texpatch_generation();
     {   // LARECOMP_LOG_STALE_UPLOAD=1 (diagnosis): an upload from guest memory that a render target the GPU drew into
         // covers - its object's own image, where the drawing never reaches memory: the texture reads what was there
@@ -1020,13 +1033,18 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         }
     }
     b->data_hash = h;
+    b->data_hash_valid = !fast_first;
     b->uploaded = true;
 #ifdef __ANDROID__
     if (b->format != mf.vf && !b->astc_bw && !b->bc_vf) return;  // unsupported format: nothing sensible to copy
 #else
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
 #endif
+    uint64_t upload_t0 = plat_now_ns();
+    uint64_t deswizzle_ns = 0, staging_ns = 0, commit_ns = 0;
+    uint64_t t_cmd0 = plat_now_ns();
     VkCommandBuffer cb = vk_upload_cmd();
+    commit_ns += plat_now_ns() - t_cmd0;
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint64_t layer_size = tegra_layer_size(&t->layout);
@@ -1036,7 +1054,6 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     bool linear = (t->flags & 0x50) != 0;
 #define LIN_STRIDE(row_bytes) ((t->flags & 0x10) ? t->stride : (uint64_t)(row_bytes))
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
-    uint64_t upload_t0 = SDL_GetTicksNS();
     uint64_t uploaded_bytes = 0;
     stall_note_active_work("tex_upload");
     for (uint32_t layer = 0; layer < layers; layer++) {
@@ -1044,19 +1061,32 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+                uint64_t t_s0 = plat_now_ns();
                 uint8_t *blocks = texture_scratch((uint64_t)l.wb * l.hb * 16);
-                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * LIN_STRIDE(l.wb * 16), l.wb * 16);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                if (linear) {
+                    for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * LIN_STRIDE(l.wb * 16), l.wb * 16);
+                    staging_ns += plat_now_ns() - t_s0;
+                } else {
+                    staging_ns += plat_now_ns() - t_s0;
+                    uint64_t t_d0 = plat_now_ns();
+                    tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                    deswizzle_ns += plat_now_ns() - t_d0;
+                }
+                uint64_t t_s1 = plat_now_ns();
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
-                uint64_t decode_start = texture_trace_on() ? SDL_GetTicksNS() : 0;
+                staging_ns += plat_now_ns() - t_s1;
+                uint64_t decode_start = plat_now_ns();
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
-                uint64_t decode_ns = decode_start ? SDL_GetTicksNS() - decode_start : 0;
+                uint64_t decode_ns = plat_now_ns() - decode_start;
+                deswizzle_ns += decode_ns;
+                uint64_t t_c0 = plat_now_ns();
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
                 vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                commit_ns += plat_now_ns() - t_c0;
                 uploaded_bytes += (uint64_t)l.w * l.h * 4;
                 texture_trace_record(TEX_TRACE_ASTC, (uint64_t)l.wb * l.hb * 16, (uint64_t)l.w * l.h * 4, decode_ns);
                 continue;
@@ -1065,12 +1095,28 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (b->bc_vf) {  // blocks -> linear block rows -> texels (bc_upload_blocks)
                 uint32_t bsize = fi->bpb;
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+                uint64_t t_s0 = plat_now_ns();
                 uint8_t *blocks = texture_scratch((uint64_t)l.wb * l.hb * bsize);
-                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * bsize, src + (uint64_t)y * LIN_STRIDE(l.wb * bsize), l.wb * bsize);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, bsize, l.block_height_log2, l.block_depth_log2);
-                if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * bsize);
+                if (linear) {
+                    for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * bsize, src + (uint64_t)y * LIN_STRIDE(l.wb * bsize), l.wb * bsize);
+                    staging_ns += plat_now_ns() - t_s0;
+                } else {
+                    staging_ns += plat_now_ns() - t_s0;
+                    uint64_t t_d0 = plat_now_ns();
+                    tegra_deswizzle(src, blocks, l.wb, l.hb, 1, bsize, l.block_height_log2, l.block_depth_log2);
+                    deswizzle_ns += plat_now_ns() - t_d0;
+                }
+                if (b->tp > 0 && layer == 0) {
+                    uint64_t t_tp = plat_now_ns();
+                    texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * bsize);
+                    staging_ns += plat_now_ns() - t_tp;
+                }
                 uint64_t decode_ns = 0;
-                uint64_t out_size = bc_upload_blocks(cb, b, blocks, l.wb, l.hb, bsize, lv, layer, 0, texture_trace_on() ? &decode_ns : NULL);
+                uint64_t t_bc0 = plat_now_ns();
+                uint64_t out_size = bc_upload_blocks(cb, b, blocks, l.wb, l.hb, bsize, lv, layer, 0, &decode_ns);
+                uint64_t bc_total_ns = plat_now_ns() - t_bc0;
+                deswizzle_ns += decode_ns;
+                if (bc_total_ns > decode_ns) commit_ns += bc_total_ns - decode_ns;
                 uploaded_bytes += out_size;
                 texture_trace_record(TEX_TRACE_BC, (uint64_t)l.wb * l.hb * bsize, out_size, decode_ns);
                 continue;
@@ -1080,13 +1126,19 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             uint64_t sz = (uint64_t)row * l.hb * l.d;
             bool expand = mf.expand_rgb && fi->bpb == 3;
             uint32_t out_row = expand ? l.wb * 4 : row;
+            uint64_t t_s0 = plat_now_ns();
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
             uint8_t *lin = expand ? texture_scratch(sz) : s.ptr;
+            staging_ns += plat_now_ns() - t_s0;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
+                uint64_t t_l0 = plat_now_ns();
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * LIN_STRIDE(row), row);
+                staging_ns += plat_now_ns() - t_l0;
             } else {
+                uint64_t t_d0 = plat_now_ns();
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+                deswizzle_ns += plat_now_ns() - t_d0;
             }
             {   // LARECOMP_DUMP_TEX=<w>x<h>x<d>,<path prefix>: level 0 of each upload of that shape, guest bytes (.raw)
                 // and deswizzled (.lin), the first 8 (diagnosis)
@@ -1111,12 +1163,14 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                     ndump++;
                 }
             }
+            uint64_t t_s1 = plat_now_ns();
             if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
             if (expand) {  // RGB8 -> RGBA8
                 uint8_t *o = s.ptr;
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
                 for (uint64_t i = 0; i < n; i++) { o[i * 4] = lin[i * 3]; o[i * 4 + 1] = lin[i * 3 + 1]; o[i * 4 + 2] = lin[i * 3 + 2]; o[i * 4 + 3] = 255; }
             }
+            staging_ns += plat_now_ns() - t_s1;
             uint32_t w = l.w, hh = l.h, d = l.d;
             // the copy stays inside the image's level: a texture allocated at the internal resolution (16:9, render
             // target sized) can still be filled from the CPU - the save slots' screenshots on the title screen. Its
@@ -1130,19 +1184,50 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                                     .imageExtent = {w, b->base_type == VK_IMAGE_VIEW_TYPE_1D || b->base_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? 1 : hh,
                                                     b->depth > 1 ? d : 1}};
             if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) continue;  // packed D/S: no CPU layout
+            uint64_t t_c0 = plat_now_ns();
             if (b->scalable && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->depth == 1 &&
                 (l.w != level_w(b, lv) || l.h != level_h(b, lv))) {  // (guest-size texels into a scaled allocation)
                 upload_scaled(cb, b, s, rg, l.w, l.h);
+                commit_ns += plat_now_ns() - t_c0;
                 uploaded_bytes += (uint64_t)out_row * l.hb * l.d;
                 continue;
             }
             vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
             vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+            commit_ns += plat_now_ns() - t_c0;
             uploaded_bytes += (uint64_t)out_row * l.hb * l.d;
             texture_trace_record(TEX_TRACE_NATIVE, sz, (uint64_t)out_row * l.hb * l.d, 0);
         }
     }
-    stall_note_tex_upload(uploaded_bytes ? uploaded_bytes : total, SDL_GetTicksNS() - upload_t0);
+    uint64_t total_upload_ns = plat_now_ns() - upload_t0;
+    StallTexUploadDetail td = {
+        .addr = t->addr,
+        .total_bytes = total,
+        .staged_bytes = uploaded_bytes ? uploaded_bytes : total,
+        .width = t->width,
+        .height = t->height,
+        .depth = t->depth ? t->depth : 1,
+        .levels = levels,
+        .layers = layers,
+        .nvn_format = t->format,
+#ifdef __ANDROID__
+        .bc_vf = (uint32_t)b->bc_vf,
+#else
+        .bc_vf = 0,
+#endif
+        .astc_bw = b->astc_bw,
+        .astc_bh = b->astc_bh,
+        .was_uploaded = was_uploaded,
+        .is_dynamic = b->dynamic,
+        .is_linear = linear,
+        .is_rt = b->gpu_owned || b->rt_frame != 0,
+        .hash_ns = hash_ns,
+        .deswizzle_ns = deswizzle_ns,
+        .staging_ns = staging_ns,
+        .commit_ns = commit_ns,
+        .total_ns = hash_ns + total_upload_ns,
+    };
+    stall_note_tex_upload_detail(&td);
     stall_note_active_work("vk_exec");
 }
 
