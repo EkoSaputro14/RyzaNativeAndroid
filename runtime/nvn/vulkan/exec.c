@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __ANDROID__
+#include <android/hardware_buffer.h>
 #include <sys/mman.h>
 #endif
 
@@ -1888,7 +1889,7 @@ void vk_exec_init(void) {
             g_vk.map_placed ? "yes" : "no", g_vk.mem_dmabuf ? "yes" : "no", g_vk.mem_fd ? "yes" : "no");
     }
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked() && !(g_vk.mem_fd && vk_driver_is_turnip())) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -2598,7 +2599,7 @@ static void begin_pass(void) {
                     (void *)st.rt.color[i], st.rt.has_cview[i], st.rt.cview[i].setmask, st.rt.cview[i].min_layer,
                     st.rt.cview[i].num_layers, st.rt.cview[i].base_level);
     }
-    ss_forget();  // (whatever ran between the passes may have set its own state)
+    // Vulkan dynamic rendering / render passes preserve pipeline, dynamic state, sets, and VB/IB across passes.
     in_pass = true;
     pass_written = 0;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -2880,7 +2881,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     if (color) memcpy(pc, color, 16);
     pc[4] = dval;
     vkCmdPushConstants(cb, pc_layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
-    ss.known &= ~SS_SETS;  // (another layout: the draws' sets are bound again)
+    ss_forget();  // (helper shader bound its own pipeline, viewport, scissor, and sets)
     vkCmdDraw(cb, 3, 1, 0, 0);
 }
 
@@ -5024,12 +5025,13 @@ bool vk_heap_place(uint64_t size) {
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
 #define NOT_PLACED() (gcopy_mode ? (gres_init(), plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX)) : (void)0, false)
     extern bool vk_heap_file_asked(void);
-    bool memfd = vk_heap_file_asked() || (!g_vk.map_placed && g_vk.mem_fd && g_settings.gpu_heap > 0);
+    extern bool vk_turnip_heap_on(int setting);
+    bool turnip = vk_driver_is_turnip();
+    bool memfd = vk_heap_file_asked() || (!g_vk.map_placed && g_vk.mem_fd && (g_settings.gpu_heap > 0 || (g_settings.gpu_heap < 0 && turnip)));
     if (g_settings.heap_file && !g_vk.mem_fd)
         LOG("[vk] game memory through a shared file: on in the settings, but this driver can't export its memory (no "
             "VK_KHR_external_memory_fd) - using persistent device-local host-visible coherent arena\n");
     if ((!g_vk.map_placed && !memfd) || getenv("LARECOMP_VK_NO_PLACED")) return NOT_PLACED();
-    extern bool vk_turnip_heap_on(int setting);
     if (memfd ? g_settings.gpu_heap == 0 : !vk_turnip_heap_on(g_settings.gpu_heap)) {
         LOG("[vk] guest heap as GPU memory: off (%s) - using persistent device-local host-visible coherent arena\n",
             g_settings.gpu_heap < 0 ? "automatic: not Turnip" : "settings");
@@ -5049,8 +5051,11 @@ bool vk_heap_place(uint64_t size) {
             fclose(f);
         }
         long budget_kb = (long)(rt_heap_max_bytes() >> 10);
-        long need_kb = budget_kb + 512L * 1024L;
-        if (((total_kb && total_kb < 6800L * 1024L && g_settings.gpu_heap <= 0) || (avail_kb && avail_kb < need_kb)) &&
+        // Turnip placed/dma-buf heap mappings are demand-paged on KGSL/MSM; allow 6 GB devices (~5.5 GB MemTotal)
+        // when at least 1.4 GB is available so Turnip doesn't fall back to CPU copies unnecessarily.
+        long min_total_kb = turnip ? 5000L * 1024L : 6800L * 1024L;
+        long need_kb = turnip ? 1400L * 1024L : (budget_kb + 512L * 1024L);
+        if (((total_kb && total_kb < min_total_kb && g_settings.gpu_heap <= 0) || (avail_kb && avail_kb < need_kb)) &&
             !getenv("LARECOMP_HEAP_ANY_RAM")) {
             LOG("[vk] full guest heap placement deferred (MemTotal %ld MB, MemAvail %ld MB, budget %ld MB): "
                 "using 128 MB persistent device-local host-visible coherent arena + dirty-range coalescing\n",
@@ -5065,76 +5070,101 @@ bool vk_heap_place(uint64_t size) {
             (unsigned long long)(size >> 20), (unsigned long long)align);
         return NOT_PLACED();
     }
-    VkExternalMemoryBufferCreateInfo ebi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT};
-    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = memfd ? &ebi : NULL, .size = size,
-                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};  // (ubo_direct)
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
-    // The exported file's kind: opaque first, a dma-buf where the opaque one takes no host-visible coherent memory (the
-    // Xclipse 530's driver, #234) - or first with LARECOMP_VK_MEMFD_DMABUF=1 (a test)
-    VkExternalMemoryHandleTypeFlagBits ht = memfd && g_vk.mem_dmabuf && getenv("LARECOMP_VK_MEMFD_DMABUF")
-                                                ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-    VkBuffer buf;
-    VkMemoryRequirements mr;
-    int type;
     const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (;;) {
-        ebi.handleTypes = ht;
-        if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) return NOT_PLACED();
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkMemoryRequirements mr = {0};
+    int type = -1;
+    void *p = NULL;
+    VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
+    VkExternalMemoryHandleTypeFlagBits ht = g_vk.mem_dmabuf && getenv("LARECOMP_VK_MEMFD_DMABUF")
+                                                ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                                                : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+    // Try placed maps first (unless memfd was forced/preferred), then OPAQUE_FD, then DMA_BUF_BIT_EXT.
+    for (int attempt = memfd ? 1 : 0; attempt < 3; attempt++) {
+        bool try_memfd = (attempt > 0);
+        if (try_memfd && !g_vk.mem_fd) break;
+        if (attempt == 1) {
+            ht = g_vk.mem_dmabuf && getenv("LARECOMP_VK_MEMFD_DMABUF")
+                     ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                     : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        } else if (attempt == 2) {
+            if (!g_vk.mem_dmabuf || ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) break;
+            ht = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            LOG("[vk] game memory through a shared file: opaque fd unavailable/unusable - trying dma-buf fallback\n");
+        }
+
+        VkExternalMemoryBufferCreateInfo ebi = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = ht};
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = try_memfd ? &ebi : NULL, .size = size,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+        buf = VK_NULL_HANDLE;
+        mem = VK_NULL_HANDLE;
+        p = NULL;
+        type = -1;
+        if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) {
+            r = VK_ERROR_INITIALIZATION_FAILED;
+            continue;
+        }
         vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
-        type = -1;  // host-visible and coherent (the CPU writes, the GPU reads and writes); cached when there is one
         for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
             VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
             if (!(mr.memoryTypeBits & (1u << i)) || (f & need) != need) continue;
             if (type < 0 || (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) type = (int)i;
             if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) break;
         }
-        if (type >= 0 || !memfd || !g_vk.mem_dmabuf || ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) break;
-        LOG("[vk] game memory through a shared file: the opaque file takes memory types 0x%x, none the CPU can use - "
-            "trying a dma-buf\n", mr.memoryTypeBits);
-        vkDestroyBuffer(g_vk.dev, buf, NULL);
-        ht = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    }
-    {   // LARECOMP_VK_MEMFD_TYPE=<n> (a test): the exported file's memory type - which one a driver gives a map the CPU
-        // runs fast in and the GPU sees, memfd_probe.c tells
-        const char *e = getenv("LARECOMP_VK_MEMFD_TYPE");
-        if (memfd && e && atoi(e) >= 0 && (uint32_t)atoi(e) < mp.memoryTypeCount && (mr.memoryTypeBits & (1u << atoi(e)))) type = atoi(e);
-    }
-    VkDeviceMemory mem = VK_NULL_HANDLE;
-    VkExportMemoryAllocateInfo exi = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .handleTypes = ht};
-    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = memfd ? &exi : NULL,
-                               .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)type};
-    VkResult r = type < 0 ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
-    if (r == VK_SUCCESS) r = vkBindBufferMemory(g_vk.dev, buf, mem, 0);
-    void *p = NULL;
-    if (r == VK_SUCCESS && memfd) {  // (the file mapped over the heap's anonymous pages; the map keeps it open)
-        int fd = -1;
-        VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = mem, .handleType = ht};
-        r = vkGetMemoryFdKHR(g_vk.dev, &gi, &fd);
-        if (r == VK_SUCCESS) {
-            p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-            if (p == MAP_FAILED) p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
-            close(fd);
+        {
+            const char *e = getenv("LARECOMP_VK_MEMFD_TYPE");
+            if (try_memfd && e && atoi(e) >= 0 && (uint32_t)atoi(e) < mp.memoryTypeCount && (mr.memoryTypeBits & (1u << atoi(e))))
+                type = atoi(e);
         }
-    } else if (r == VK_SUCCESS) {
-        VkMemoryMapPlacedInfoEXT pl = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
-        VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pl, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
-                                 .memory = mem, .offset = 0, .size = VK_WHOLE_SIZE};
-        r = vkMapMemory2KHR(g_vk.dev, &mi, &p);
-    }
-    if (r != VK_SUCCESS || p != (void *)(uintptr_t)HEAP_BASE) {
-        // (memory types the buffer takes: with an exported file on an Xclipse 530 none of them was host-visible and
-        // coherent, -8, #234)
-        LOG("[vk] heap placement failed (%d, mapped at %p, type %d, the buffer's memory types 0x%x%s): using persistent "
-            "device-local host-visible coherent arena\n", r, p, type, mr.memoryTypeBits, memfd ? ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", a dma-buf" : ", an exported file" : "");
-        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // (freeing a placed map unmaps it: the window gets its pages back)
+        VkExportMemoryAllocateInfo exi = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, .handleTypes = ht};
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = try_memfd ? &exi : NULL,
+                                   .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)type};
+        r = type < 0 ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
+        if (r == VK_SUCCESS) r = vkBindBufferMemory(g_vk.dev, buf, mem, 0);
+        if (r == VK_SUCCESS && try_memfd) {
+            int fd = -1;
+            VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = mem, .handleType = ht};
+            r = vkGetMemoryFdKHR(g_vk.dev, &gi, &fd);
+            if (r == VK_SUCCESS && fd >= 0) {
+                p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+                if (p == MAP_FAILED) p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
+                close(fd);
+            } else if (fd >= 0) {
+                close(fd);
+            }
+        } else if (r == VK_SUCCESS) {
+            VkMemoryMapPlacedInfoEXT pl = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT, .pPlacedAddress = (void *)(uintptr_t)HEAP_BASE};
+            VkMemoryMapInfoKHR mi = {.sType = VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR, .pNext = &pl, .flags = VK_MEMORY_MAP_PLACED_BIT_EXT,
+                                     .memory = mem, .offset = 0, .size = VK_WHOLE_SIZE};
+            r = vkMapMemory2KHR(g_vk.dev, &mi, &p);
+        }
+        if (r == VK_SUCCESS && p == (void *)(uintptr_t)HEAP_BASE) {
+            memfd = try_memfd;
+            break;
+        }
+        LOG("[vk] heap placement attempt %d failed (%d, mapped at %p, type %d, types 0x%x%s)\n",
+            attempt, r, p, type, mr.memoryTypeBits,
+            try_memfd ? (ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? ", dma-buf" : ", opaque-fd") : ", placed");
+        if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
         if (p == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
-        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        if (buf) vkDestroyBuffer(g_vk.dev, buf, NULL);
+        mem = VK_NULL_HANDLE;
+        buf = VK_NULL_HANDLE;
+    }
+
+    if (r != VK_SUCCESS || p != (void *)(uintptr_t)HEAP_BASE || !buf) {
+        LOG("[vk] heap placement failed (%d, mapped at %p, type %d): using persistent device-local host-visible coherent arena\n",
+            r, p, type);
         return NOT_PLACED();
     }
+    plat_write_tracking_reset_range(HEAP_BASE, HEAP_BASE + size);
     gmem_buf = buf;
     gmem_mem = mem;
     gmem_size = size;
@@ -5399,6 +5429,10 @@ static GaRes ga_res[GA_NRES];
 static int ga_nres;
 static VkBuffer ga_buf;
 static VmaAllocation ga_mem;
+#ifdef __ANDROID__
+static AHardwareBuffer *ga_ahb;
+static VkDeviceMemory ga_ahb_mem;
+#endif
 static uint8_t *ga_ptr;
 static uint64_t ga_res_top, ga_head = GA_RES, ga_seg_seq[GA_SIZE / GA_SEG], ga_seg_gen[GA_SIZE / GA_SEG];
 int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
@@ -5466,8 +5500,76 @@ static bool gres_init(void) {
                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
                 ai.memoryTypeBits |= 1u << i;
     }
-    VmaAllocationInfo inf;
-    if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &ga_buf, &ga_mem, &inf) != VK_SUCCESS || !inf.pMappedData) {
+    VmaAllocationInfo inf = {0};
+    bool vma_ok = vmaCreateBuffer(g_vk.vma, &bi, &ai, &ga_buf, &ga_mem, &inf) == VK_SUCCESS && inf.pMappedData != NULL;
+#ifdef __ANDROID__
+    if (!vma_ok && g_vk.mem_ahb) {
+        AHardwareBuffer_Desc ahb_desc = {
+            .width = (uint32_t)GA_SIZE,
+            .height = 1,
+            .layers = 1,
+            .format = AHARDWAREBUFFER_FORMAT_BLOB,
+            .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                     AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER,
+        };
+        AHardwareBuffer *ahb = NULL;
+        PFN_vkGetAndroidHardwareBufferPropertiesANDROID fn_ahb_props =
+            (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(g_vk.dev, "vkGetAndroidHardwareBufferPropertiesANDROID");
+        if (fn_ahb_props && AHardwareBuffer_allocate(&ahb_desc, &ahb) == 0 && ahb) {
+            VkExternalMemoryBufferCreateInfo ebi = {
+                .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
+            };
+            VkBufferCreateInfo abi = bi;
+            abi.pNext = &ebi;
+            VkBuffer abuf = VK_NULL_HANDLE;
+            if (vkCreateBuffer(g_vk.dev, &abi, NULL, &abuf) == VK_SUCCESS) {
+                VkAndroidHardwareBufferPropertiesANDROID ahbp = {
+                    .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
+                };
+                if (fn_ahb_props(g_vk.dev, ahb, &ahbp) == VK_SUCCESS && ahbp.memoryTypeBits) {
+                    uint32_t mti = (uint32_t)__builtin_ctz(ahbp.memoryTypeBits);
+                    VkImportAndroidHardwareBufferInfoANDROID imp = {
+                        .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+                        .buffer = abuf ? NULL : NULL,
+                    };
+                    imp.buffer = ahb;
+                    VkMemoryDedicatedAllocateInfo dai = {
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                        .pNext = &imp,
+                        .buffer = abuf,
+                    };
+                    VkMemoryAllocateInfo mai = {
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                        .pNext = &dai,
+                        .allocationSize = ahbp.allocationSize,
+                        .memoryTypeIndex = mti,
+                    };
+                    VkDeviceMemory amem = VK_NULL_HANDLE;
+                    void *aptr = NULL;
+                    if (vkAllocateMemory(g_vk.dev, &mai, NULL, &amem) == VK_SUCCESS &&
+                        vkBindBufferMemory(g_vk.dev, abuf, amem, 0) == VK_SUCCESS &&
+                        AHardwareBuffer_lock(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
+                                             -1, NULL, &aptr) == 0 && aptr) {
+                        ga_buf = abuf;
+                        ga_ahb = ahb;
+                        ga_ahb_mem = amem;
+                        ga_ptr = (uint8_t *)aptr;
+                        gres_state = 1;
+                        ga_noncoherent = false;
+                        LOG("[vk] global memory arena: %llu MB backed by zero-copy AHardwareBuffer (type %u)\n",
+                            (unsigned long long)(GA_SIZE >> 20), mti);
+                        return true;
+                    }
+                    if (amem) vkFreeMemory(g_vk.dev, amem, NULL);
+                }
+                vkDestroyBuffer(g_vk.dev, abuf, NULL);
+            }
+            AHardwareBuffer_release(ahb);
+        }
+    }
+#endif
+    if (!vma_ok) {
         LOG("[vk] global memory arena: not available\n");
         return false;
     }
@@ -6005,7 +6107,7 @@ static bool gsnap_prepare(void) {
 }
 
 static struct {
-    uint64_t seq, sbuf_gen, gc_size;
+    uint64_t seq, gcopy_gen, sbuf_gen, gc_size;
     unsigned stage_mask;
     int m;
     GcRange r[GMAP_MAX];
@@ -6018,14 +6120,17 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
     if (!store && s_gprep_cache.seq == vk_pending_seq() && s_gprep_cache.sbuf_gen == sbuf_gen &&
         s_gprep_cache.stage_mask == stage_mask && s_gprep_cache.gc_size > 0) {
         bool clean = true;
-        for (int i = 0; i < s_gprep_cache.m; i++) {
-            uint32_t now_pt = 0;
-            if (vk_pages_changed(HEAP_BASE + s_gprep_cache.r[i].lo,
-                                 s_gprep_cache.r[i].hi - s_gprep_cache.r[i].lo,
-                                 s_gprep_cache.pt_gen[i], &now_pt) != 0) {
-                clean = false;
-                break;
+        if (s_gprep_cache.gcopy_gen != gcopy_gen) {
+            for (int i = 0; i < s_gprep_cache.m; i++) {
+                uint32_t now_pt = 0;
+                if (vk_pages_changed(HEAP_BASE + s_gprep_cache.r[i].lo,
+                                     s_gprep_cache.r[i].hi - s_gprep_cache.r[i].lo,
+                                     s_gprep_cache.pt_gen[i], &now_pt) != 0) {
+                    clean = false;
+                    break;
+                }
             }
+            if (clean) s_gprep_cache.gcopy_gen = gcopy_gen;
         }
         if (clean) {
             memcpy(gmap_tab, s_gprep_cache.tab, sizeof gmap_tab);
@@ -6098,6 +6203,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
     if (m && gres_prepare(r, m, store)) {
         if (!store && m <= GMAP_MAX) {
             s_gprep_cache.seq = vk_pending_seq();
+            s_gprep_cache.gcopy_gen = gcopy_gen;
             s_gprep_cache.sbuf_gen = sbuf_gen;
             s_gprep_cache.stage_mask = stage_mask;
             s_gprep_cache.gc_size = gc_size;
@@ -6320,6 +6426,15 @@ static void vc_mark_sbufs(int stage) {
 }
 
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+#ifdef __ANDROID__
+    if (gmem_buf) {
+        const char *e = getenv("LARECOMP_VK_VCACHE");
+        if (!e || atoi(e) <= 0) {
+            prof_vc_bypass++;
+            return false;
+        }
+    }
+#endif
     if (vc_on < 0 || !vc_on) {
         const char *e = getenv("LARECOMP_VK_VCACHE");
         vc_on = (!e || atoi(e) != 0) && pt_init();
@@ -7581,8 +7696,9 @@ static void draw_(CmdRec *r, bool indexed) {
         k.depth = pass_depth;
         k.stencil = pass_stencil;
         k.samples = pass_samples;
-        for (int i = 0; i < 32; i++) {
-            if (!(pr->vi->attr_mask & (1u << i))) continue;
+        for (uint32_t am = pr->vi->attr_mask; am; ) {
+            int i = __builtin_ctz(am);
+            am &= am - 1;
             k.attr_mask |= 1u << i;
             uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
             uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
@@ -7610,8 +7726,9 @@ static void draw_(CmdRec *r, bool indexed) {
             k.used_streams |= 1u << stream;
             if (need_conv) k.conv_streams |= (uint16_t)(1u << stream);
         }
-        for (int s = 0; s < 16; s++) {
-            if (!(k.used_streams & (1u << s))) continue;
+        for (uint32_t us = k.used_streams & 0xFFFFu; us; ) {
+            int s = __builtin_ctz(us);
+            us &= us - 1;
             k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
             k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
             if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
@@ -7983,8 +8100,9 @@ static void draw_(CmdRec *r, bool indexed) {
     VkBuffer vb_pend_buf[NUM_STREAMS];
     VkDeviceSize vb_pend_off[NUM_STREAMS];
     uint32_t vb_dirty_mask = 0;
-    for (int s = 0; s < NUM_STREAMS; s++) {
-        if (!(pp->k.used_streams & (1u << s))) continue;
+    for (uint32_t uvb = pp->k.used_streams; uvb; ) {
+        int s = __builtin_ctz(uvb);
+        uvb &= uvb - 1;
         VkSpan sp;
         if (s == ZERO_BINDING_FLOAT) {
             static const float zero_f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -8020,14 +8138,16 @@ static void draw_(CmdRec *r, bool indexed) {
             if (nverts > (1u << 22)) nverts = (1u << 22);
             if (v_start > nverts) v_start = nverts;
             uint32_t nat_s = 0;
-            for (int i = 0; i < 32; i++) if ((pp->k.attr_mask & (1u << i)) && pp->k.attr_bind[i] == (uint32_t)s) nat_s++;
+            for (uint32_t cam = pp->k.attr_mask; cam; ) { int i = __builtin_ctz(cam); cam &= cam - 1; if (pp->k.attr_bind[i] == (uint32_t)s) nat_s++; }
             uint64_t total_bytes = conv_stride ? nverts * conv_stride : (uint64_t)nat_s * 16u;
             if (!total_bytes) total_bytes = 16;
             uint64_t vct0 = plat_now_ns();
             sp = vk_transient(total_bytes, 16);
             memset(sp.ptr, 0, (size_t)total_bytes);
-            for (int i = 0; i < 32; i++) {
-                if (!(pp->k.attr_mask & (1u << i)) || pp->k.attr_bind[i] != (uint32_t)s) continue;
+            for (uint32_t cam = pp->k.attr_mask; cam; ) {
+                int i = __builtin_ctz(cam);
+                cam &= cam - 1;
+                if (pp->k.attr_bind[i] != (uint32_t)s) continue;
                 uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
                 uint32_t afmt = a & 0xFF, raw_off = a >> 13;
                 uint32_t dst_off = pp->k.attr_off[i];
@@ -9143,7 +9263,7 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
-    ss.known &= ~SS_SETS;  // (another layout: the draws' sets are bound again)
+    ss_forget();  // (helper shader bound its own pipeline, viewport, scissor, and sets)
     vkCmdDraw(cb, 3, 1, 0, 0);
     vk_end_rendering(cb);
 }
@@ -9317,7 +9437,7 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     VkRect2D sc = {{(int32_t)vx, (int32_t)vy}, {(uint32_t)vw, (uint32_t)vh}};
     vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
-    ss.known &= ~SS_SETS;  // (another layout: the draws' sets are bound again)
+    ss_forget();  // (helper shader bound its own pipeline, viewport, scissor, and sets)
     vkCmdDraw(cb, 3, 1, 0, 0);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
@@ -9399,7 +9519,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vkCmdSetScissor(cb, 0, 1, &sc);
     float pv[8] = {renderer_origin_lower_left() && !strstr(path, "window") ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
     vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
-    ss.known &= ~SS_SETS;  // (another layout: the draws' sets are bound again)
+    ss_forget();  // (helper shader bound its own pipeline, viewport, scissor, and sets)
     vkCmdDraw(cb, 3, 1, 0, 0);
     vk_end_rendering(cb);
     vk_full_barrier(cb);

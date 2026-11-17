@@ -31,6 +31,7 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
 // of [addr, addr+size) made writable before the OS itself writes there (a read into guest memory can't fault: EFAULT).
 // No-ops elsewhere (Windows tracks writes itself).
 void plat_write_tracking_enable(uint64_t lo, uint64_t hi);
+void plat_write_tracking_reset_range(uint64_t lo, uint64_t hi);
 void plat_write_prepare(uint64_t addr, uint64_t size);
 #ifdef __ANDROID__
 uint64_t plat_take_write_tracking_ns(uint64_t *faults_out, uint64_t *fault_ns_out, uint64_t *query_ns_out);
@@ -114,6 +115,7 @@ void plat_adpf_stats(PlatAdpfStats *out);
 // - plat_uclamp_min_tid: applies per-TID sched_setattr(SCHED_FLAG_UTIL_CLAMP_MIN) or nice fallback (0 = calling thread)
 // - plat_thread_unpin: keeps legacy non-hot thread callers isolated to Little cores
 void plat_thread_pin_fast(void);
+void plat_refresh_fast_affinity(void);
 void plat_thread_pin_background(void);
 void plat_uclamp_min_tid(int32_t tid);
 void plat_boost_thread_tid(int32_t tid);

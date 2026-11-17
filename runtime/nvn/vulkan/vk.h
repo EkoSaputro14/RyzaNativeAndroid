@@ -59,6 +59,7 @@ typedef struct {
     bool map_placed;              // VK_EXT_map_memory_placed: the guest heap mapped as GPU memory (exec.c vk_heap_place)
     bool mem_fd;                  // VK_KHR_external_memory_fd: the same through an exported file mapped there (vk_heap_place)
     bool mem_dmabuf;              // VK_EXT_external_memory_dma_buf: that file as a dma-buf, when the opaque one won't do
+    bool mem_ahb;                 // VK_ANDROID_external_memory_android_hardware_buffer: zero-copy AHB arena fallback
     uint64_t placed_align;
     bool exec_stats;              // (Android, LARECOMP_SHADER_STATS=1) the compiler's statistics of each pipeline, logged
     bool fp16_supported;          // SPIR-V RelaxedPrecision / shaderFloat16 support for fragment shaders

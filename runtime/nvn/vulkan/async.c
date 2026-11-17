@@ -312,7 +312,7 @@ static uint64_t push(int type, uint64_t a, void *p) {
         g_vk_render_started = true;
         pthread_create(&g_vk_render_thread, NULL, render_main, NULL);
     }
-    int max_ahead = (g_settings.sync_lag >= 2 && ahead < 2) ? 2 : ahead;
+    int max_ahead = (g_settings.sync_lag >= 1 && ahead < 2) ? 2 : ahead;
     if (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= max_ahead)) {
         bool pres_wait = (type == REQ_PRESENT && q_presents >= max_ahead);
         pthread_mutex_unlock(&q_lock);

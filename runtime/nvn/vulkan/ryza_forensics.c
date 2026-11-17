@@ -69,10 +69,10 @@ RyzaTestResult g_ryza_test_result = {
 #define RYZA_BUILD_COMMIT "local"
 #endif
 #ifndef RYZA_VERSION_CODE
-#define RYZA_VERSION_CODE "45"
+#define RYZA_VERSION_CODE "48"
 #endif
 #ifndef RYZA_VERSION_NAME
-#define RYZA_VERSION_NAME "0.3.2-forensic-p15"
+#define RYZA_VERSION_NAME "0.3.2-forensic-p16"
 #endif
 #ifndef RYZA_BUILD_VARIANT
 #define RYZA_BUILD_VARIANT "precomputed-render-pipeline"

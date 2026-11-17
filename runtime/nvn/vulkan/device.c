@@ -494,7 +494,7 @@ static void create_device(void) {
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
 #endif
-    const char *ext[32];
+    const char *ext[48];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 #ifdef __ANDROID__
@@ -592,18 +592,38 @@ static void create_device(void) {
     // (a dma-buf, the other file type: where the opaque one takes no memory the CPU can use - Xclipse 530, #234)
     g_vk.mem_dmabuf = g_vk.mem_fd && has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     if (g_vk.mem_dmabuf) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    g_vk.mem_ahb = has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+                   (g_vk.api >= VK_API_VERSION_1_1 || has_ext(ep, ne, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME));
+    if (g_vk.mem_ahb) {
+        ext[n_ext++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
+        if (has_ext(ep, ne, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME))
+            ext[n_ext++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
+    }
     // (which ways this driver could export memory at all: a report from a Mali or an Xclipse says what to try next -
     // the option did nothing on a Mali-G720 r49p1 with no word in the log, #249)
     LOG("[vk-cap] memory export: fd %s, dma-buf %s, Android hardware buffer %s, placed maps %s, host import %s\n",
         g_vk.mem_fd ? "yes" : "no", has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) ? "yes" : "no",
-        has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) ? "yes" : "no",
+        g_vk.mem_ahb ? "yes" : "no",
         has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) ? "yes" : "no",
         has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) ? "yes" : "no");
     // the guest heap as GPU memory mapped at its own address (exec.c vk_heap_place; Turnip has it)
-    g_vk.map_placed =has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+    g_vk.map_placed = has_ext(ep, ne, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has_ext(ep, ne, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     if (g_vk.map_placed) {
-        ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
-        ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT pf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pf};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 qp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &qp);
+        g_vk.placed_align = pp.minPlacedMemoryMapAlignment;
+        if (pf.memoryMapPlaced) {
+            placed.memoryMapPlaced = VK_TRUE;
+            ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
+            ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
+        } else {
+            g_vk.map_placed = false;
+        }
     }
     const char *pv = getenv("LARECOMP_PACE_VSYNC");
     display_timing = has_ext(ep, ne, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && (!pv || atoi(pv));
@@ -844,23 +864,9 @@ static void create_device(void) {
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
 #endif
 #ifdef __ANDROID__
-    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
     if (g_vk.map_placed) {
-        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT pf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
-        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &pf};
-        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
-        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
-        VkPhysicalDeviceProperties2 qp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pp};
-        vkGetPhysicalDeviceProperties2(g_vk.phys, &qp);
-        g_vk.placed_align = pp.minPlacedMemoryMapAlignment;
-        if (pf.memoryMapPlaced) {
-            placed.memoryMapPlaced = VK_TRUE;
-            placed.pNext = f.pNext;
-            f.pNext = &placed;
-        } else {
-            g_vk.map_placed = false;
-            n_ext -= 2;  // (the two map extensions were the last added)
-        }
+        placed.pNext = f.pNext;
+        f.pNext = &placed;
     }
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
@@ -2018,7 +2024,7 @@ bool vk_turnip_path_on(int setting) {
 // likely cause of the terrain striped on an Adreno 750 (issue #129: BOTW's terrain decals read the targets they write).
 bool vk_turnip_heap_on(int setting) {
     if (setting >= 0 || vk_adreno_8xx(g_vk.props.deviceName)) return vk_turnip_path_on(setting);
-    return g_vk.map_placed && vk_driver_is_turnip();
+    return (g_vk.map_placed || g_vk.mem_fd) && vk_driver_is_turnip();
 }
 static bool g_lrz_at_start = true;
 bool vk_lrz_at_start(void) { return g_lrz_at_start; }  // (the start screen: a change needs a restart)

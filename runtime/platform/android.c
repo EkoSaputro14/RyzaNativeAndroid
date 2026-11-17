@@ -385,6 +385,16 @@ static void wt_lock(void) {
 }
 static void wt_unlock(void) { atomic_flag_clear_explicit(&wt_spin, memory_order_release); }
 
+void plat_write_tracking_reset_range(uint64_t lo, uint64_t hi) {
+    if (!wt_state || hi <= lo || hi <= wt_lo || lo >= wt_hi) return;
+    uint64_t a = lo < wt_lo ? wt_lo : (lo & ~0xFFFull);
+    uint64_t e = hi > wt_hi ? wt_hi : ((hi + 0xFFFull) & ~0xFFFull);
+    if (e <= a) return;
+    wt_lock();
+    memset(wt_state + ((a - wt_lo) >> 12), 0, (size_t)((e - a) >> 12));
+    wt_unlock();
+}
+
 void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
     if (wt_state || getenv("LARECOMP_NO_WRITE_TRACKING")) return;
     lo &= ~0xFFFull;
@@ -1018,6 +1028,7 @@ static void find_sources(void) {
 }
 
 void plat_device_stats(PlatDeviceStats *out) {
+    plat_refresh_fast_affinity();
     find_sources();
     pthread_mutex_lock(&g_ds_lock);
     *out = g_ds;
@@ -1090,10 +1101,36 @@ typedef struct APerformanceHintSession APerformanceHintSession;
 // LARECOMP_PIN=0 disables cluster pinning.
 static cpu_set_t g_all_cores;
 static cpu_set_t g_fast_cores;
+static cpu_set_t g_gold_cores;
+static cpu_set_t g_prime_cores;
+static cpu_set_t g_active_fast_cores;
 static cpu_set_t g_little_cores;
 static pthread_once_t g_topo_once = PTHREAD_ONCE_INIT;
 static bool g_has_clusters;
 static bool g_pin_enabled;
+static int g_ncores_conf;
+static int g_gold_cnt, g_prime_cnt;
+static uint64_t g_fast_core_mask, g_gold_core_mask, g_prime_core_mask, g_active_fast_mask;
+static bool g_prime_avoided;
+static pthread_mutex_t g_fast_tid_lock = PTHREAD_MUTEX_INITIALIZER;
+static int32_t g_fast_tids[64];
+static int g_fast_ntids;
+
+static long read_cpu_long(const char *path) {
+    FILE *f = fopen(path, "re");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+static bool cpu_is_online(int c) {
+    char path[96];
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/online", c);
+    long v = read_cpu_long(path);
+    return v != 0;  // cpu0 or kernels without 'online' node count as online
+}
 
 static void init_cpu_topology(void) {
     const char *pin_env = getenv("LARECOMP_PIN");
@@ -1104,27 +1141,60 @@ static void init_cpu_topology(void) {
         for (int c = 0; c < 8; c++) CPU_SET(c, &g_all_cores);
     }
 
-    long min_mhz = 0, max_mhz = 0, mhz[64] = {0};
+    long nconf = sysconf(_SC_NPROCESSORS_CONF);
+    if (nconf < 8) nconf = 8;
+    if (nconf > 64) nconf = 64;
+    if (nconf > CPU_SETSIZE) nconf = CPU_SETSIZE;
+    g_ncores_conf = (int)nconf;
+
+    long mhz[64] = {0};
+    // Probe policy*/related_cpus first so hotplugged-offline cores are still classified accurately.
+    DIR *pd = opendir("/sys/devices/system/cpu/cpufreq");
+    if (pd) {
+        for (struct dirent *e; (e = readdir(pd));) {
+            if (strncmp(e->d_name, "policy", 6) != 0) continue;
+            char pmax[128], prel[128];
+            snprintf(pmax, sizeof pmax, "/sys/devices/system/cpu/cpufreq/%s/cpuinfo_max_freq", e->d_name);
+            long pm = read_cpu_long(pmax);
+            if (pm <= 0) continue;
+            for (int kind = 0; kind < 2; kind++) {
+                snprintf(prel, sizeof prel, "/sys/devices/system/cpu/cpufreq/%s/%s",
+                         e->d_name, kind == 0 ? "related_cpus" : "affected_cpus");
+                FILE *rf = fopen(prel, "re");
+                if (!rf) continue;
+                int cpu = -1;
+                while (fscanf(rf, "%d", &cpu) == 1) {
+                    if (cpu >= 0 && cpu < 64 && mhz[cpu] <= 0) mhz[cpu] = pm;
+                }
+                fclose(rf);
+                break;
+            }
+        }
+        closedir(pd);
+    }
+
+    long min_mhz = 0, max_mhz = 0;
     int n = 0;
-    for (int c = 0; c < CPU_SETSIZE && c < 64; c++) {
-        if (!CPU_ISSET(c, &g_all_cores)) continue;
-        char path[96];
-        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
-        FILE *f = fopen(path, "re");
-        if (!f) continue;
-        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
-        fclose(f);
+    for (int c = 0; c < g_ncores_conf; c++) {
+        if (mhz[c] <= 0) {
+            char path[96];
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            long v = read_cpu_long(path);
+            if (v > 0) mhz[c] = v;
+        }
         if (mhz[c] > 0) {
             if (!min_mhz || mhz[c] < min_mhz) min_mhz = mhz[c];
             if (mhz[c] > max_mhz) max_mhz = mhz[c];
+            n = c + 1;
         }
-        n = c + 1;
     }
 
     CPU_ZERO(&g_fast_cores);
+    CPU_ZERO(&g_gold_cores);
+    CPU_ZERO(&g_prime_cores);
     CPU_ZERO(&g_little_cores);
-    int fast_cnt = 0, little_cnt = 0;
-    uint64_t fast_mask = 0, little_mask = 0;
+    int fast_cnt = 0, little_cnt = 0, gold_cnt = 0, prime_cnt = 0;
+    uint64_t fast_mask = 0, little_mask = 0, gold_mask = 0, prime_mask = 0;
     if (min_mhz > 0 && max_mhz > min_mhz) {
         for (int c = 0; c < n; c++) {
             if (mhz[c] <= 0) continue;
@@ -1132,19 +1202,135 @@ static void init_cpu_topology(void) {
                 CPU_SET(c, &g_fast_cores);
                 fast_cnt++;
                 fast_mask |= (1ull << c);
+                if (mhz[c] < max_mhz) {
+                    CPU_SET(c, &g_gold_cores);
+                    gold_cnt++;
+                    gold_mask |= (1ull << c);
+                }
             } else {
                 CPU_SET(c, &g_little_cores);
                 little_cnt++;
                 little_mask |= (1ull << c);
             }
         }
+        if (gold_cnt > 0) {
+            for (int c = 0; c < n; c++) {
+                if (mhz[c] == max_mhz) {
+                    CPU_SET(c, &g_prime_cores);
+                    prime_cnt++;
+                    prime_mask |= (1ull << c);
+                }
+            }
+        } else {
+            g_gold_cores = g_fast_cores;
+            gold_cnt = fast_cnt;
+            gold_mask = fast_mask;
+        }
     }
 
+    g_gold_cnt = gold_cnt;
+    g_prime_cnt = prime_cnt;
+    g_fast_core_mask = fast_mask;
+    g_gold_core_mask = gold_mask;
+    g_prime_core_mask = prime_mask;
+    g_active_fast_cores = g_fast_cores;
+    g_active_fast_mask = fast_mask;
     g_has_clusters = (fast_cnt > 0 && little_cnt > 0);
-    LOG("[android] CPU topology (%d cores): fast=0x%llx (%d cores, >%ld MHz), little=0x%llx (%d cores, %ld MHz), pin=%s\n",
-        n, (unsigned long long)fast_mask, fast_cnt, min_mhz / 1000,
+    LOG("[android] CPU topology (%d cores): fast=0x%llx (%d cores, gold=0x%llx prime=0x%llx, >%ld MHz), little=0x%llx (%d cores, %ld MHz), pin=%s\n",
+        n, (unsigned long long)fast_mask, fast_cnt,
+        (unsigned long long)gold_mask, (unsigned long long)prime_mask, min_mhz / 1000,
         (unsigned long long)little_mask, little_cnt, min_mhz / 1000,
         (g_pin_enabled && g_has_clusters) ? "on" : "off");
+}
+
+static void register_fast_tid(int32_t tid) {
+    if (tid <= 0) return;
+    pthread_mutex_lock(&g_fast_tid_lock);
+    bool seen = false;
+    for (int i = 0; i < g_fast_ntids; i++) {
+        if (g_fast_tids[i] == tid) { seen = true; break; }
+    }
+    if (!seen && g_fast_ntids < (int)(sizeof(g_fast_tids) / sizeof(g_fast_tids[0])))
+        g_fast_tids[g_fast_ntids++] = tid;
+    pthread_mutex_unlock(&g_fast_tid_lock);
+}
+
+void plat_refresh_fast_affinity(void) {
+    pthread_once(&g_topo_once, init_cpu_topology);
+    if (!g_pin_enabled || !g_has_clusters || g_prime_cnt <= 0 || g_gold_cnt <= 0) return;
+
+    static atomic_uint_fast64_t next_check_ns;
+    uint64_t now = plat_now_ns();
+    uint64_t due = atomic_load_explicit(&next_check_ns, memory_order_relaxed);
+    if (now < due) return;
+    if (!atomic_compare_exchange_strong_explicit(&next_check_ns, &due, now + 500000000ull,
+                                                 memory_order_relaxed, memory_order_relaxed))
+        return;
+
+    long gold_cur_max = 0, gold_cap_max = 0, prime_cur_max = 0, prime_cap_max = 0;
+    int gold_on = 0, prime_on = 0;
+    cpu_set_t online_fast, online_gold;
+    CPU_ZERO(&online_fast);
+    CPU_ZERO(&online_gold);
+    uint64_t online_fast_mask = 0, online_gold_mask = 0;
+
+    for (int c = 0; c < g_ncores_conf; c++) {
+        if (!CPU_ISSET(c, &g_fast_cores)) continue;
+        if (!cpu_is_online(c)) continue;
+        CPU_SET(c, &online_fast);
+        online_fast_mask |= (1ull << c);
+        char pcur[96], pcap[96];
+        snprintf(pcur, sizeof pcur, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+        snprintf(pcap, sizeof pcap, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", c);
+        long cur = read_cpu_long(pcur);
+        long cap = read_cpu_long(pcap);
+        if (CPU_ISSET(c, &g_prime_cores)) {
+            prime_on++;
+            if (cur > prime_cur_max) prime_cur_max = cur;
+            if (cap > prime_cap_max) prime_cap_max = cap;
+        } else if (CPU_ISSET(c, &g_gold_cores)) {
+            gold_on++;
+            CPU_SET(c, &online_gold);
+            online_gold_mask |= (1ull << c);
+            if (cur > gold_cur_max) gold_cur_max = cur;
+            if (cap > gold_cap_max) gold_cap_max = cap;
+        }
+    }
+
+    bool avoid_prime = false;
+    if (gold_on > 0) {
+        if (prime_on == 0) avoid_prime = true;
+        else if (prime_cap_max > 0 && gold_cap_max > 0 && prime_cap_max + 150000 < gold_cap_max) avoid_prime = true;
+        else if (prime_cur_max > 0 && gold_cur_max > 0 && prime_cur_max + 200000 < gold_cur_max && prime_cur_max < 1500000)
+            avoid_prime = true;
+    }
+
+    cpu_set_t target = avoid_prime ? (online_gold_mask ? online_gold : g_gold_cores)
+                                   : (online_fast_mask ? online_fast : g_fast_cores);
+    uint64_t target_mask = avoid_prime ? (online_gold_mask ? online_gold_mask : g_gold_core_mask)
+                                       : (online_fast_mask ? online_fast_mask : g_fast_core_mask);
+
+    pthread_mutex_lock(&g_fast_tid_lock);
+    bool changed = (avoid_prime != g_prime_avoided) || (target_mask != g_active_fast_mask);
+    g_active_fast_cores = target;
+    g_active_fast_mask = target_mask;
+    g_prime_avoided = avoid_prime;
+    if (changed && target_mask) {
+        int alive = 0;
+        for (int i = 0; i < g_fast_ntids; i++) {
+            pid_t tid = (pid_t)g_fast_tids[i];
+            errno = 0;
+            if (sched_setaffinity(tid, sizeof target, &target) != 0 && errno == ESRCH) continue;
+            g_fast_tids[alive++] = g_fast_tids[i];
+        }
+        g_fast_ntids = alive;
+        LOG("[android] thermal-aware affinity: %s (gold=%ld/%ld MHz, prime=%ld/%ld MHz, mask=0x%llx, threads=%d)\n",
+            avoid_prime ? "avoiding throttled prime -> gold cluster" : "all fast cores active",
+            gold_cur_max / 1000, gold_cap_max / 1000,
+            prime_cur_max / 1000, prime_cap_max / 1000,
+            (unsigned long long)target_mask, alive);
+    }
+    pthread_mutex_unlock(&g_fast_tid_lock);
 }
 
 static int read_sys_uclamp_min_max(void) {
@@ -1290,7 +1476,14 @@ void plat_uclamp_min_tid(int32_t tid) {
 
 void plat_thread_pin_fast(void) {
     pthread_once(&g_topo_once, init_cpu_topology);
-    if (g_pin_enabled && g_has_clusters) sched_setaffinity(0, sizeof g_fast_cores, &g_fast_cores);
+    if (g_pin_enabled && g_has_clusters) {
+        register_fast_tid((int32_t)syscall(SYS_gettid));
+        plat_refresh_fast_affinity();
+        pthread_mutex_lock(&g_fast_tid_lock);
+        cpu_set_t mask = g_active_fast_cores;
+        pthread_mutex_unlock(&g_fast_tid_lock);
+        sched_setaffinity(0, sizeof mask, &mask);
+    }
     plat_boost_thread_tid(0);
 }
 
@@ -1340,8 +1533,10 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         s_uclamp_applied[slot & 1] = true;
         plat_thread_pin_fast();
     }
+    plat_refresh_fast_affinity();
     if (slot == 0) {  // Presenting thread (game's main loop)
         s_presenting_tid = (int32_t)gettid();
+        register_fast_tid(s_presenting_tid);
         s_game_cpu = sched_getcpu();
         if (s_last_render_ns > work_ns) work_ns = s_last_render_ns;
         float gms = (float)(game_ns ? game_ns : work_ns) / 1e6f;
@@ -1352,6 +1547,7 @@ static void adpf_work_locked(int slot, uint64_t work_ns, uint64_t target_ns, uin
         s_target_ms = (float)target_ns / 1e6f;
     } else {          // Render thread (Vulkan command translation)
         s_render_tid = (int32_t)gettid();
+        register_fast_tid(s_render_tid);
         s_render_cpu = sched_getcpu();
         s_last_render_ns = work_ns;
         float rms = (float)work_ns / 1e6f;
