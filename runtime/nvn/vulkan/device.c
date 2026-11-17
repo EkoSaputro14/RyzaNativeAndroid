@@ -751,9 +751,13 @@ static void create_device(void) {
 #ifdef __ANDROID__
     {   // Adreno has no uniformAndStorageBuffer8BitAccess, and no shader uses 8-bit uniform buffers
         // (docs/las/ANDROID-PORT.md, Fase 0): the 8-bit features only when the driver has them
+        f12.shaderFloat16 = h12.shaderFloat16;
         f12.shaderInt8 = h12.shaderInt8;
         f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess;
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
+        g_vk.fp16_supported = true;
+        LOG("[vk-cap] fp16_shaders=%d (device shaderFloat16=%s, SPIR-V RelaxedPrecision active)\n",
+            g_settings.fp16_shaders, h12.shaderFloat16 ? "on" : "mediump");
         // nor 16-bit storage: no translated or built-in shader declares it, and the Adreno 610 under Turnip lacks it
         // (LAS Recomp's issue #4). LARECOMP_VK_NO_STORAGE16=1 (test): as if it lacked it.
         if (env_on("LARECOMP_VK_NO_STORAGE16"))
@@ -783,7 +787,7 @@ static void create_device(void) {
     VkPhysicalDeviceTimelineSemaphoreFeatures e_tl = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
                                                       .timelineSemaphore = VK_TRUE};
     VkPhysicalDeviceShaderFloat16Int8Features e_i8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-                                                      .shaderInt8 = h12.shaderInt8, .pNext = &e_tl};
+                                                      .shaderFloat16 = h12.shaderFloat16, .shaderInt8 = h12.shaderInt8, .pNext = &e_tl};
     VkPhysicalDevice8BitStorageFeatures e_b8 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
                                                 .storageBuffer8BitAccess = h12.storageBuffer8BitAccess,
                                                 .uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess,
@@ -993,8 +997,19 @@ static VkPresentModeKHR present_mode(void) {
     // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
     // 60). No tearing. LARECOMP_VK_PRESENT=fifo|immediate|mailbox to choose.
     const char *e = getenv("LARECOMP_VK_PRESENT");
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
-                          : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR want;
+    if (e && *e) {
+        want = !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+             : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    } else {
+#ifdef __ANDROID__
+        want = g_settings.present_mode == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR
+             : g_settings.present_mode == 2 ? VK_PRESENT_MODE_FIFO_KHR
+                                            : VK_PRESENT_MODE_MAILBOX_KHR;
+#else
+        want = VK_PRESENT_MODE_MAILBOX_KHR;
+#endif
+    }
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -1064,8 +1079,13 @@ static void create_swapchain(void) {
 #endif
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
+#ifdef __ANDROID__
+    uint32_t count = (uint32_t)(g_settings.swapchain_images >= 2 && g_settings.swapchain_images <= 5
+                                ? g_settings.swapchain_images : 3);
+#else
     uint32_t count = caps.minImageCount + 1;
     if (count > 3 && caps.minImageCount <= 3) count = 3;  // triple buffering: cuts BufferQueue/swapchain stall vs 5+ images
+#endif
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count < caps.minImageCount) count = caps.minImageCount;
     const char *sc_env = getenv("LARECOMP_SWAP_IMAGES");  // (a test switch: as many as a driver that makes more)
@@ -1243,8 +1263,14 @@ bool vk_frame_begin(const float clear[4]) {
     if (!w || !h) return false;  // minimised
 #ifdef __ANDROID__
     if (!android_surface_ready()) return false;
-#endif
+    static int last_sc_images = -1, last_present_mode = -1;
+    bool sc_cfg_changed = (last_sc_images != g_settings.swapchain_images || last_present_mode != g_settings.present_mode);
+    last_sc_images = g_settings.swapchain_images;
+    last_present_mode = g_settings.present_mode;
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height || sc_cfg_changed) recreate_swapchain();
+#else
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+#endif
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
@@ -1610,6 +1636,8 @@ void backend_present(NvnTexture *t) {
         widescreen_set_factor((float)shape);
         renderer_set_scale((float)sx, (float)sy);
         renderer_set_scene_scale((float)os.scene_sx, (float)os.scene_sy);
+        float sh_scale = (g_settings.shadow_scale >= 0.25f && g_settings.shadow_scale <= 1.0f) ? g_settings.shadow_scale : 1.0f;
+        renderer_set_shadow_scale(sh_scale, sh_scale);
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);

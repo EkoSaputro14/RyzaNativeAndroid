@@ -269,24 +269,17 @@ uint64_t kernel_heap_size(void) { return heap_size; }  // bytes from HEAP_BASE s
 
 uint64_t rt_heap_max_bytes(void) {
 #ifdef __ANDROID__
-    static uint64_t cached = 0;
-    if (!cached) {
-        const char *e = getenv("LARECOMP_HEAP_MB");
-        int mb = (e && *e) ? atoi(e) : g_settings.heap_mb;
-        if (e && *e) {
-            if (mb <= 0) mb = (int)(HEAP_MAX >> 20);
-            if (mb < 1024) mb = 1024;
-        } else {
-            // Ryza's StandardAllocator requests a fixed 0x62b00000 block on top of ~1.6 GB of engine heaps;
-            // auto-heal any legacy/too-low ini value (< 3220 MB, e.g. 2560) back to HEAP_MAX (3328 MB).
-            if (mb < 3220) mb = (int)(HEAP_MAX >> 20);
-        }
-        if (mb > (int)(HEAP_MAX >> 20)) mb = (int)(HEAP_MAX >> 20);
-        cached = (uint64_t)mb << 20;
-        LOG("[kernel] guest heap limit: %llu MB (default %llu MB)\n",
-            (unsigned long long)(cached >> 20), (unsigned long long)(HEAP_MAX >> 20));
+    const char *e = getenv("LARECOMP_HEAP_MB");
+    int mb = (e && *e) ? atoi(e) : (g_settings.heap_mb > 0 ? g_settings.heap_mb : 2560);
+    if (mb < 1536) mb = 1536;
+    if (mb > 3584) mb = 3584;
+    uint64_t cap = (uint64_t)mb << 20;
+    static int logged_mb;
+    if (logged_mb != mb) {
+        logged_mb = mb;
+        LOG("[kernel] guest heap limit: %d MB (default 2560 MB)\n", mb);
     }
-    return cached;
+    return cap;
 #else
     return HEAP_MAX;
 #endif
@@ -1293,14 +1286,18 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x01: {  // SetHeapSize
         uint64_t size = x[1];
         uint64_t heap_cap = rt_heap_max_bytes();
-        if (size > heap_cap) { x[0] = R_OUT_OF_RESOURCE; break; }
+        if (size > HEAP_MAX) { x[0] = R_OUT_OF_RESOURCE; break; }
+        uint64_t target_size = size > heap_cap ? heap_cap : size;
         heap_size = size;
         region_remove(HEAP_BASE);
         if (size) region_add(HEAP_BASE, size, 5, 3);
 #ifdef __ANDROID__
         {   // the heap as GPU memory where the driver allows it (nvn/vulkan/exec.c vk_heap_place), before the game writes it
             extern bool vk_heap_place(uint64_t size);
-            LOG("[kernel] SetHeapSize %llu MB\n", (unsigned long long)(size >> 20));
+            LOG("[kernel] SetHeapSize %llu MB (requested %llu MB, limit %llu MB)\n",
+                (unsigned long long)(target_size >> 20),
+                (unsigned long long)(size >> 20),
+                (unsigned long long)(heap_cap >> 20));
             vk_heap_place(size);
         }
 #endif
@@ -1536,14 +1533,16 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         case 2: v = ALIAS_BASE; break;
         case 3: v = ALIAS_SIZE; break;
         case 4: v = HEAP_BASE; break;
-        case 5: v = rt_heap_max_bytes(); break;
-        case 6: case 21: {  // application memory (capped with heap limit on Android); LARECOMP_TOTAL_MEM=<hex bytes> (test)
+        case 5: {
+            (void)rt_heap_max_bytes();  // log configured heap_mb limit early
+            v = HEAP_MAX;
+            break;
+        }
+        case 6: case 21: {  // application memory; keep virtual ceiling >= 0xCD500000 so Ryza 0x62b00000 StandardAllocator never fails
             static uint64_t tot = 0;
             if (!tot) {
-                uint64_t cap = rt_heap_max_bytes();
-                uint64_t def_tot = cap < HEAP_MAX ? (cap + 0x4000000ull) : 0xCD500000ull;
-                if (def_tot > 0xCD500000ull) def_tot = 0xCD500000ull;
-                tot = getenv("LARECOMP_TOTAL_MEM") ? strtoull(getenv("LARECOMP_TOTAL_MEM"), NULL, 16) : def_tot;
+                (void)rt_heap_max_bytes();
+                tot = getenv("LARECOMP_TOTAL_MEM") ? strtoull(getenv("LARECOMP_TOTAL_MEM"), NULL, 16) : 0xCD500000ull;
             }
             v = tot;
             static int nlog;

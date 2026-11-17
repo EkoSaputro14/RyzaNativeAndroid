@@ -625,17 +625,17 @@ static void tab_display(void) {
         int ui = 1;
         for (int i = 0; i < NUP; i++) if (up_mode[i] == g_settings.upscaler) ui = i;
         char udm[768];
-        if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, tr("%s\n\nNot used at Match display: the game already renders at your display's resolution."), tr(ud));
+        if (g_settings.res_mode == RES_MATCH && g_settings.render_scale >= 0.99f) {  // (renders at the window's size: nothing to scale up)
+            snprintf(udm, sizeof udm, tr("%s\n\nNot used at Match display (1.0x render scale): the game already renders at your display's resolution."), tr(ud));
             ud = udm;
             opt_disable_next();
         }
 #ifdef __ANDROID__
-        enum { UP_DEFAULT = 2 };  // (Snapdragon GSR 1: settings.c)
+        enum { UP_DEFAULT = 0 };  // (Bilinear default on Android: settings.c)
 #else
         enum { UP_DEFAULT = 1 };
 #endif
-        if (opt_choice("Upscaler", &ui, ups, NUP, UP_DEFAULT, ud)) g_settings.upscaler = up_mode[ui];
+        if (opt_choice("Upscaler", &ui, ups, NUP, UP_DEFAULT, ud)) { g_settings.upscaler = up_mode[ui]; settings_save(); }
     }
     {   // the final image's lines (nvn/output_scale.c): the screen's, or fewer, scaled up to it when presented
         static const char *outs[] = {"Auto", "Screen", "1080p", "900p", "720p"};
@@ -667,10 +667,95 @@ static void tab_display(void) {
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
 #ifdef __ANDROID__
-    opt_toggle("Sync lag", &g_settings.sync_lag, true,
-               "The game starts its next frame while the GPU still finishes the last one: a few more fps. What the game reads "
-               "back from the GPU then comes a frame late, and Link's legs can sink into the ground while he stands "
-               "still. Turn it off if that bothers you. Applies at once.");
+    {
+        static const char *rs_names[] = {"50% (0.50x)", "60% (0.60x)", "68% (0.68x)", "75% (0.75x)", "100% (1.00x)"};
+        static const float rs_vals[] = {0.50f, 0.60f, 0.68f, 0.75f, 1.00f};
+        int rsi = 2;
+        float best_d = 999.0f;
+        for (int i = 0; i < 5; i++) {
+            float d = fabsf(g_settings.render_scale - rs_vals[i]);
+            if (d < best_d) { best_d = d; rsi = i; }
+        }
+        if (opt_choice("3D render scale", &rsi, rs_names, 5, 2,
+                       "Scales offscreen 3D scene color and depth render targets while keeping the HUD and presentation sharp. "
+                       "Lower values (0.50x - 0.68x) significantly reduce Adreno fragment shader and bandwidth load. Applies at once.", false)) {
+            g_settings.render_scale = rs_vals[rsi];
+            settings_save();
+        }
+    }
+    {
+        static const char *sh_names[] = {"25% (0.25x)", "50% (0.50x)", "100% (1.00x)"};
+        static const float sh_vals[] = {0.25f, 0.50f, 1.00f};
+        int shi = 2;
+        float best_d = 999.0f;
+        for (int i = 0; i < 3; i++) {
+            float d = fabsf(g_settings.shadow_scale - sh_vals[i]);
+            if (d < best_d) { best_d = d; shi = i; }
+        }
+        if (opt_choice("Shadow scale", &shi, sh_names, 3, 2,
+                       "Scales depth-only shadow map render targets (>= 512x512) to reduce shadow pass rasterization and depth bandwidth "
+                       "on mid-range mobile GPUs. Applies at once.", false)) {
+            g_settings.shadow_scale = sh_vals[shi];
+            settings_save();
+        }
+    }
+    {
+        static const char *sl_names[] = {"Off (0)", "On - 1 Frame (1)", "Store Guard (2)"};
+        int sli = g_settings.sync_lag < 0 ? 0 : (g_settings.sync_lag > 2 ? 2 : g_settings.sync_lag);
+        if (opt_choice("Sync lag", &sli, sl_names, 3, 1,
+                       "Controls CPU/GPU frame pipelining in nvnSyncWait. 0: CPU waits for the current frame's GPU work to finish. "
+                       "1 (default): CPU overlaps the next frame while the GPU renders the previous frame. 2: also waits for global memory stores. Applies at once.", false)) {
+            g_settings.sync_lag = sli;
+            settings_save();
+        }
+    }
+    {
+        static const char *sc_names[] = {"2 (Double)", "3 (Triple)", "4", "5"};
+        static const int sc_vals[] = {2, 3, 4, 5};
+        int sci = 1;
+        for (int i = 0; i < 4; i++) if (sc_vals[i] == g_settings.swapchain_images) sci = i;
+        if (opt_choice("Swapchain images", &sci, sc_names, 4, 1,
+                       "Number of Vulkan swapchain images requested from Android SurfaceFlinger. 3 (Triple buffering) minimizes "
+                       "BufferQueue acquire stalls compared to 5 images. Applies at once.", false)) {
+            g_settings.swapchain_images = sc_vals[sci];
+            settings_save();
+        }
+    }
+    {
+        static const char *pm_names[] = {"Immediate (0)", "Mailbox (1)", "FIFO / VSync (2)"};
+        int pmi = g_settings.present_mode < 0 ? 1 : (g_settings.present_mode > 2 ? 2 : g_settings.present_mode);
+        if (opt_choice("Present mode", &pmi, pm_names, 3, 1,
+                       "Vulkan presentation mode. Mailbox (1): tear-free low-latency presentation without blocking the render thread on vsync. "
+                       "FIFO (2): strict vsync queue. Immediate (0): lowest latency if supported by driver. Applies at once.", false)) {
+            g_settings.present_mode = pmi;
+            settings_save();
+        }
+    }
+    {
+        static const char *hm_names[] = {"2048 MB", "2560 MB", "3072 MB", "3328 MB"};
+        static const int hm_vals[] = {2048, 2560, 3072, 3328};
+        int hmi = 1;
+        int best_d = 99999;
+        for (int i = 0; i < 4; i++) {
+            int d = abs(g_settings.heap_mb - hm_vals[i]);
+            if (d < best_d) { best_d = d; hmi = i; }
+        }
+        if (opt_choice("Guest heap limit", &hmi, hm_names, 4, 1,
+                       "Target guest heap memory budget in MB (botwrecompandroid.ini heap_mb=). 2560 MB leaves more free system RAM on 6 GB "
+                       "devices to prevent zRAM reclaim stutters. Applies when the game starts.", false)) {
+            g_settings.heap_mb = hm_vals[hmi];
+            settings_save();
+        }
+    }
+    {
+        bool fp16_on = g_settings.fp16_shaders != 0;
+        if (opt_toggle("FP16 fragment shaders", &fp16_on, true,
+                       "Emits SPIR-V RelaxedPrecision decorations on fragment shader float math and texture samples so Adreno GPUs execute "
+                       "ALU instructions in 16-bit half registers at 2x rate. Applies to shaders compiled from now on.")) {
+            g_settings.fp16_shaders = fp16_on ? 1 : 0;
+            settings_save();
+        }
+    }
     opt_toggle("Native game code (experimental)", &g_settings.native_code, false,
                "Runs the game's own code directly on the phone's CPU instead of the game code built at setup: no build "
                "needed. An experiment - report what goes wrong. Applies the next time the game starts.");

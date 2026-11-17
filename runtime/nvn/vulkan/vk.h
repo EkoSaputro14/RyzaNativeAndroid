@@ -61,6 +61,7 @@ typedef struct {
     bool mem_dmabuf;              // VK_EXT_external_memory_dma_buf: that file as a dma-buf, when the opaque one won't do
     uint64_t placed_align;
     bool exec_stats;              // (Android, LARECOMP_SHADER_STATS=1) the compiler's statistics of each pipeline, logged
+    bool fp16_supported;          // SPIR-V RelaxedPrecision / shaderFloat16 support for fragment shaders
     uint32_t api;                 // the device's Vulkan version as used: 1.3, or 1.1 / 1.2 with extensions (device.c)
 #endif
     // window
@@ -104,7 +105,7 @@ void vk_readback_ready(uint64_t size);  // after the copy's submission is done, 
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
 // ---- textures (textures.c)
-enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2 };  // render-target scale groups (textures.c)
+enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2, RS_SHADOW = 3 };  // render-target scale groups (textures.c)
 typedef struct TexBackend {
     VkImage image;
     VmaAllocation mem;
@@ -145,6 +146,9 @@ uint8_t vk_texture_scale_group(NvnTexture *t);
 void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // (a pass's attachment the size of a scaled one)
 void renderer_get_scene_scale(float *sx, float *sy);
 void renderer_set_scene_scale(float sx, float sy);
+void renderer_get_shadow_scale(float *sx, float *sy);
+void renderer_set_shadow_scale(float sx, float sy);
+void vk_promote_shadow_rt(NvnTexture *t);
 // View of t (optionally through an NVN texture view) for rendering or sampling.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,

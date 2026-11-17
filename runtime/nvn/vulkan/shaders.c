@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "../../settings.h"
 #include "shaders.h"
 #include "shader_cache.h"
 
@@ -115,6 +116,97 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
     return out;
 }
 
+// Fragment shaders on mobile (Adreno 6xx/7xx/8xx): decorate 32-bit float variables and float-producing ALU / sample
+// instructions with SPIR-V RelaxedPrecision (DEC_RELAXED_PRECISION = 0) when fp16_shaders=1 so the GPU executes
+// fragment math in 16-bit half registers at 2x throughput and halves register file pressure.
+static bool frag_fp16_inst(const uint32_t *w, uint32_t wc, uint32_t op, const uint8_t *f32_type, uint32_t bound) {
+    if (wc < 3 || w[1] >= bound || !f32_type[w[1]]) return false;
+    if (float_arith(w, wc, op)) return true;
+    switch (op) {
+    case 12:  // OpExtInst (GLSL.std.450 math returning float/vec/mat)
+    case 61:  // OpLoad
+    case 79: case 80: case 81: case 82:  // OpVectorShuffle, OpCompositeConstruct, OpCompositeExtract, OpCompositeInsert
+    case 87: case 88: case 89: case 90: case 91: case 92: case 93: case 94: case 95: case 96: case 97: case 98: case 99:  // OpImageSample* / Fetch / Gather
+    case 169: // OpSelect
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
+    enum { OP_DECORATE = 71, DEC_RELAXED_PRECISION = 0, DEC_BUILT_IN = 11 };
+    size_t n = *nwords, insert = 0, count = 0;
+    uint32_t bound = spv[3];
+    if (!bound || bound > (1u << 20)) return spv;
+    uint8_t *done = calloc(bound, 1);
+    uint8_t *builtin = calloc(bound, 1);
+    uint8_t *f32_type = calloc(bound, 1);
+    uint8_t *f32_ptr = calloc(bound, 1);
+    if (!done || !builtin || !f32_type || !f32_ptr) {
+        free(done); free(builtin); free(f32_type); free(f32_ptr);
+        return spv;
+    }
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
+        if (!wc || i + wc > n) break;
+        const uint32_t *w = spv + i;
+        if (!insert && op >= 19 && op <= 39) insert = i;
+        if (op == OP_DECORATE && wc >= 3 && w[1] < bound) {
+            if (w[2] == DEC_RELAXED_PRECISION) done[w[1]] = 1;
+            else if (w[2] == DEC_BUILT_IN) builtin[w[1]] = 1;
+        } else if (op == 22 && wc >= 3 && w[1] < bound && w[2] == 32) {
+            f32_type[w[1]] = 1;  // OpTypeFloat 32
+        } else if ((op == 23 || op == 24) && wc >= 3 && w[1] < bound && w[2] < bound && f32_type[w[2]]) {
+            f32_type[w[1]] = 1;  // OpTypeVector / OpTypeMatrix of f32
+        } else if (op == 32 && wc >= 4 && w[1] < bound && w[3] < bound && f32_type[w[3]]) {
+            f32_ptr[w[1]] = 1;   // OpTypePointer to f32 scalar/vec/mat
+        }
+        i += wc;
+    }
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
+        if (!wc || i + wc > n) break;
+        const uint32_t *w = spv + i;
+        bool want = false;
+        if (op == 59 && wc >= 4 && w[1] < bound && w[2] < bound && f32_ptr[w[1]] && !builtin[w[2]]) want = true;
+        else if (frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]]) want = true;
+        if (want && !done[w[2]]) count++;
+        i += wc;
+    }
+    if (!insert || !count) {
+        free(done); free(builtin); free(f32_type); free(f32_ptr);
+        return spv;
+    }
+    uint32_t *out = malloc((n + count * 3) * 4);
+    if (!out) {
+        free(done); free(builtin); free(f32_type); free(f32_ptr);
+        return spv;
+    }
+    memcpy(out, spv, insert * 4);
+    size_t o = insert;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
+        if (!wc || i + wc > n) break;
+        const uint32_t *w = spv + i;
+        bool want = false;
+        if (op == 59 && wc >= 4 && w[1] < bound && w[2] < bound && f32_ptr[w[1]] && !builtin[w[2]]) want = true;
+        else if (frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]]) want = true;
+        if (want && !done[w[2]]) {
+            done[w[2]] = 1;
+            out[o++] = 3u << 16 | OP_DECORATE;
+            out[o++] = w[2];
+            out[o++] = DEC_RELAXED_PRECISION;
+        }
+        i += wc;
+    }
+    memcpy(out + o, spv + insert, (n - insert) * 4);
+    *nwords = o + (n - insert);
+    free(done); free(builtin); free(f32_type); free(f32_ptr);
+    free(spv);
+    return out;
+}
+
 // SPIR-V words of src, or NULL (error logged with the source). *nwords set on success. Thread-safe: one shaderc
 // compiler per thread (a shared one behind a lock serialised all the pipeline workers).
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
@@ -138,7 +230,9 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     bool optimized = getenv("LARECOMP_VK_OPT") != NULL;
 #ifdef __ANDROID__
+    bool fp16_frag = (stage == STAGE_FRAGMENT && g_settings.fp16_shaders != 0);
     uint64_t h = vk_shader_source_hash(src, stage, optimized);
+    if (fp16_frag) h ^= 0x517cc1b727220a95ull;
     uint32_t api = g_vk.api ? g_vk.api : VK_API_VERSION_1_3;  // (0: no device yet - as 1.3)
     if (api < VK_API_VERSION_1_3) h ^= (uint64_t)api << 32;  // (older SPIR-V for a device below 1.3, below)
 #else
@@ -172,6 +266,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
         *nwords = n / 4;
         strip_names(out, nwords);
         if (stage == STAGE_VERTEX) out = no_contraction(out, nwords);
+#ifdef __ANDROID__
+        if (fp16_frag) out = relaxed_precision_frag(out, nwords);
+#endif
         if (!nocache) cache_store(h, out, *nwords);
     }
     shaderc_result_release(r);

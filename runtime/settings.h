@@ -25,7 +25,8 @@ typedef struct {
     int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
-    float render_scale;  // Explicit internal 3D scene resolution scale factor (e.g. 0.65 .. 0.75 on Adreno 6xx; 0 = auto)
+    float render_scale;  // Explicit internal 3D scene resolution scale factor (0.5 .. 1.0; default 0.68 on Android)
+    float shadow_scale;  // Shadow map resolution scale factor (0.25, 0.5, 1.0; default 1.0)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
     int out_lines;       // Output resolution: the final image (scene + HUD) at most this many lines, scaled up to the
                          // screen at the end (0: the screen's own; 1080 / 900 / 720; OUT_AUTO: 1080 on taller
@@ -47,7 +48,7 @@ typedef struct {
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
-    bool sync_lag;        // Android: the game's next frame overlaps the GPU's last (nvn/objects.c nvnSyncWait); on by default
+    int sync_lag;         // Android: 0 = Off, 1 = 1-frame CPU/GPU pipeline (default), 2 = store-guarded lag (nvn/objects.c)
     // Driver compatibility (the start screen's Settings > Prelaunch, ui/launcher.mm; from LASRecompAndroid), for GPUs
     // where a Turnip path draws wrong: read when the game starts (gpu_heap, inplace_reads) or when the app starts
     // (turnip_lrz, log_file). -1 Automatic: on for the Adreno 8xx GPUs these paths were made on, off elsewhere
@@ -58,7 +59,10 @@ typedef struct {
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
-    int heap_mb;          // guest heap limit in MB (botwrecompandroid.ini heap_mb=, default 3328 / HEAP_MAX on Android; 0 = default)
+    int heap_mb;          // guest heap target in MB (botwrecompandroid.ini heap_mb=, default 2560, valid 1536..3584)
+    int swapchain_images; // Vulkan swapchain image count (botwrecompandroid.ini swapchain_images=, default 3, valid 2..5)
+    int present_mode;     // Vulkan present mode (0 = Immediate, 1 = Mailbox [default], 2 = FIFO / VSync)
+    int fp16_shaders;     // SPIR-V fragment shader FP16 RelaxedPrecision (0 = Off / FP32, 1 = On / FP16 [default])
     int async_spin_us;    // vk-render / async wait spin-wait window in microseconds before sleeping (default 250; 0 = off)
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start

@@ -256,14 +256,23 @@ static void bc_decode(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t 
 //   RS_SCENE  the 3D scene's targets (1600x900 docked, the game's dynamic sizes down to 1280x720, their fractions):
 //             the internal resolution (Video > Internal resolution)
 #ifdef __ANDROID__
-static float g_rs[3][2] = {{1, 1}, {0.6666667f, 0.6666667f}, {0.68f, 0.68f}};
+static float g_rs[4][2] = {{1, 1}, {0.6666667f, 0.6666667f}, {0.68f, 0.68f}, {1.0f, 1.0f}};
 #else
-static float g_rs[3][2] = {{1, 1}, {1, 1}, {1, 1}};
+static float g_rs[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
 #endif
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
 void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
 void renderer_set_scene_scale(float sx, float sy) { g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy; }
+void renderer_get_shadow_scale(float *sx, float *sy) { *sx = g_rs[RS_SHADOW][0]; *sy = g_rs[RS_SHADOW][1]; }
+void renderer_set_shadow_scale(float sx, float sy) {
+    if (sx < 0.25f) sx = 0.25f;
+    if (sx > 1.0f) sx = 1.0f;
+    if (sy < 0.25f) sy = 0.25f;
+    if (sy > 1.0f) sy = 1.0f;
+    g_rs[RS_SHADOW][0] = sx;
+    g_rs[RS_SHADOW][1] = sy;
+}
 uint64_t renderer_present_count(void);
 static bool rs_stale(const TexBackend *b) {
     return b->rs_group && (b->sx != g_rs[b->rs_group][0] || b->sy != g_rs[b->rs_group][1]);
@@ -1297,6 +1306,26 @@ void vk_promote_scene_rt(NvnTexture *t) {
     b->rs_group = RS_SCENE;
     destroy_image(b);
     create_image(t, b);
+}
+
+// Promote a depth-only shadow map render target (>= 512x512 non-16:9 depth attachment) to RS_SHADOW
+// when shadow_scale < 1.0, reducing shadow map rasterization and depth bandwidth on mobile GPUs.
+void vk_promote_shadow_rt(NvnTexture *t) {
+    if (!t || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & 1)) return;
+    if (t->width < 512 || t->height < 512 || !renderer_format_is_depth(t->format)) return;
+    float a = (float)t->width / (float)t->height;
+    if (a >= 1.74f && a <= 1.81f) return;  // 16:9 depth buffers belong to RS_SCENE
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_NO_SCALE") == NULL;
+    if (!on) return;
+    TexBackend *b = tex_backend(t);
+    if (b->rs_group != RS_NONE && b->rs_group != RS_SHADOW) return;
+    if (b->rs_group == RS_NONE && g_rs[RS_SHADOW][0] >= 0.99f && g_rs[RS_SHADOW][1] >= 0.99f) return;
+    if (b->rs_group != RS_SHADOW) {
+        b->rs_group = RS_SHADOW;
+        destroy_image(b);
+        create_image(t, b);
+    }
 }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 

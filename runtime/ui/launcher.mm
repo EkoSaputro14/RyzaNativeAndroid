@@ -1629,6 +1629,39 @@ static void prelaunch_tab(float sc) {
                                   "some Adreno GPUs. Automatic: on for Adreno 8xx GPUs, off for the others. Applies when "
                                   "BOTWRecompAndroid restarts."));
         ImGui::Spacing();
+        ImGui::Text("%s", tr("Guest heap limit (heap_mb)"));
+        {
+            static const int hm_opts[] = {2048, 2560, 3072, 3328};
+            ImGui::PushID("heap_mb_pre");
+            for (int i = 0; i < 4; i++) {
+                char lbl[32];
+                snprintf(lbl, sizeof lbl, "%d MB", hm_opts[i]);
+                if (i > 0) ImGui::SameLine();
+                if (ImGui::RadioButton(lbl, g_settings.heap_mb == hm_opts[i])) {
+                    g_settings.heap_mb = hm_opts[i];
+                    changed = true;
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::TextDisabled("%s", tr("Target guest heap memory limit in MB (default 2560 MB on 6 GB devices; persisted in botwrecompandroid.ini)."));
+        ImGui::Spacing();
+        ImGui::Text("%s", tr("CPU/GPU pipeline (sync_lag) & Fragment FP16 (fp16_shaders)"));
+        {
+            ImGui::PushID("synclag_pre");
+            changed |= ImGui::RadioButton(tr("Sync lag 0 (Off)"), &g_settings.sync_lag, 0);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("Sync lag 1 (1-Frame)"), &g_settings.sync_lag, 1);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("Sync lag 2 (Store Guard)"), &g_settings.sync_lag, 2);
+            ImGui::PopID();
+            bool fp16_b = g_settings.fp16_shaders != 0;
+            if (ImGui::Checkbox(tr("FP16 fragment shaders (SPIR-V RelaxedPrecision)"), &fp16_b)) {
+                g_settings.fp16_shaders = fp16_b ? 1 : 0;
+                changed = true;
+            }
+        }
+        ImGui::Spacing();
         ImGui::Text("%s", tr("Driver variables"));  // (#227: g_settings.driver_env, vulkan/device.c)
         ImGui::SetNextItemWidth(-FLT_MIN);
         changed |= ImGui::InputTextWithHint("##driverenv", "FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1", g_settings.driver_env,

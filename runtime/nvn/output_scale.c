@@ -125,13 +125,14 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         if (mode != RES_MATCH) hs = fmin(base * share, hs);
     }
 #ifdef __ANDROID__
-    // Mobile GPU optimization (Adreno 618 / 720p targets): scale default 1x mode by render_scale (default 0.68x -> ~870x490)
-    // to reduce fragment shader fillrate & ALU pressure by >50%, while respecting explicit 50%/75%/100%/forced settings.
-    if (mode == 1 && forced <= 0) {
+    // Mobile GPU optimization (Adreno 618 / 720p targets): apply configurable render_scale (botwrecompandroid.ini render_scale=)
+    // across 1x and Match display modes to reduce fragment shader fillrate & ALU pressure, while respecting explicit forced scales.
+    if (forced <= 0 && (mode == 1 || mode == RES_MATCH)) {
         double target_rs = (g_settings.render_scale >= 0.25f && g_settings.render_scale <= 2.0f)
                                ? (double)g_settings.render_scale
                                : 0.68;
-        if (hs > target_rs) hs = target_rs;
+        if (mode == 1) hs = target_rs;
+        else if (target_rs != 1.0) hs *= target_rs;
     }
 #endif
     hs = fmax(hs, 0.1);

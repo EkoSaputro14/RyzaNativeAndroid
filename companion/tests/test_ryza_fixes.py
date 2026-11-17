@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 45" in gradle_kts and "0.3.2-forensic-p13" in gradle_kts
+    assert "versionCode = 46" in gradle_kts and "0.3.2-forensic-p14" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 45" in gradle_kts and "0.3.2-forensic-p13" in gradle_kts
+    assert "versionCode = 46" in gradle_kts and "0.3.2-forensic-p14" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -922,8 +922,7 @@ def _verify_p13_sprint4_heap_split_spin():
     # 1. Transient ring shrunk to 3 x 16 MB (48 MB) & safe 3328 MB (HEAP_MAX) guest heap default (auto-healing < 3220 MB)
     assert "#define RING_SLICE_SIZE (16ull << 20)" in exec_c
     assert "int heap_mb;" in settings_h
-    assert ".heap_mb = 3328," in settings_c
-    assert "hm < 3220" in settings_c and "mb < 3220" in kernel_c
+    assert ".heap_mb = 2560," in settings_c
     assert "\"heap_mb\"" in settings_c and "heap_mb = %d" in settings_c
     assert "uint64_t rt_heap_max_bytes(void);" in rt_h
     assert "uint64_t rt_heap_max_bytes(void)" in kernel_c
@@ -968,9 +967,10 @@ def _verify_p13_sprint5_synclag_and_present_latency():
     device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
 
     # 1. Remove forced sync_lag=0 override; default sync_lag=1 while respecting botwrecompandroid.ini
-    assert ".sync_lag = true," in settings_c
+    assert ".sync_lag = 1," in settings_c
     assert "g_settings.sync_lag = false;" not in settings_c
     assert "forced sync_lag=" not in settings_c
+    assert "forced upscaler=" not in settings_c
     assert "void nvn_note_newest_fence_lseq(uint64_t lseq)" in objects_c
     assert "nvn_note_newest_fence_lseq(id);" in async_c
     assert "if (lag > 0 && env_lag < 0 && g_game_version >= 182)" in objects_c
@@ -986,3 +986,72 @@ def _verify_p13_sprint5_synclag_and_present_latency():
 
 
 _verify_p13_sprint5_synclag_and_present_latency()
+
+
+def _verify_p14_zero_hardcoding_and_gpu_optimizations():
+    from pathlib import Path
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+    heaps_c = (repo_root / "runtime" / "hle" / "heaps.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    output_scale_c = (repo_root / "runtime" / "nvn" / "output_scale.c").read_text(encoding="utf-8")
+    vk_h = (repo_root / "runtime" / "nvn" / "vulkan" / "vk.h").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+
+    # 1. Zero hardcoded overrides + full INI keys & auto-generation
+    for field in [
+        "float render_scale;",
+        "float shadow_scale;",
+        "int sync_lag;",
+        "int heap_mb;",
+        "int swapchain_images;",
+        "int present_mode;",
+        "int fp16_shaders;",
+    ]:
+        assert field in settings_h, f"Missing {field} in settings.h"
+    assert "g_settings.upscaler = UPSCALE_BILINEAR;" not in settings_c.split("fclose(f);")[1]
+    assert "if (!f) {" in settings_c and "settings_save();" in settings_c.split("while (fgets")[0]
+    for key in ["sync_lag", "heap_mb", "swapchain_images", "present_mode", "upscaler", "render_scale", "shadow_scale", "fp16_shaders"]:
+        assert f'"{key}"' in settings_c, f"Missing INI parser for {key}"
+        assert f"{key} =" in settings_c, f"Missing INI writer for {key}"
+
+    # 2. Safe 2560 MB heap default + MADV_DONTNEED poison page reclaim
+    assert "default 2560 MB" in kernel_c
+    assert "reclaim_poisoned_arena" in heaps_c and "MADV_DONTNEED" in heaps_c
+    assert "int lag = env_lag >= 0 ? env_lag : g_settings.sync_lag;" in objects_c
+
+    # 3. Configurable swapchain_images & present_mode with live swapchain recreation
+    assert "g_settings.swapchain_images" in device_c
+    assert "g_settings.present_mode" in device_c
+    assert "sc_cfg_changed" in device_c
+
+    # 4. Internal 3D render_scale & shadow_scale (RS_SHADOW)
+    assert "RS_SHADOW = 3" in vk_h
+    assert "void vk_promote_shadow_rt(NvnTexture *t)" in textures_c
+    assert "vk_promote_shadow_rt(st.rt.depth);" in exec_c
+    assert "renderer_set_shadow_scale(" in device_c
+    assert "mode == 1 || mode == RES_MATCH" in output_scale_c
+
+    # 5. SPIR-V Fragment Shader FP16 / RelaxedPrecision
+    assert "relaxed_precision_frag(" in shaders_c
+    assert "DEC_RELAXED_PRECISION = 0" in shaders_c
+    assert "fp16_frag" in shaders_c
+
+    # 6. Exposed in Menu, Overlay, and Prelaunch UI
+    for ui_txt, name in [(menu_mm, "menu.mm"), (overlay_mm, "perf_overlay.mm")]:
+        for term in ["render_scale", "shadow_scale", "sync_lag", "swapchain_images", "present_mode", "heap_mb", "fp16_shaders"]:
+            assert term in ui_txt, f"Missing {term} in {name}"
+    assert "heap_mb" in launcher_mm and "sync_lag" in launcher_mm and "fp16_shaders" in launcher_mm
+
+    print("  -> PASS: p14 (Zero hardcoding INI + UI controls + 2560MB safe heap + shadow_scale + render_scale + FP16 RelaxedPrecision) verified.")
+
+
+_verify_p14_zero_hardcoding_and_gpu_optimizations()

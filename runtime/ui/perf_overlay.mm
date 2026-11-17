@@ -218,6 +218,106 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     }
 
     ImGui::Separator();
+    if (ImGui::CollapsingHeader("Performance Tuning (botwrecompandroid.ini)")) {
+        bool ini_dirty = false;
+        ImGui::Text("sync_lag:");
+        ImGui::SameLine();
+        for (int sl = 0; sl <= 2; sl++) {
+            char lbl[16];
+            snprintf(lbl, sizeof lbl, "%d##sl", sl);
+            bool sel = (g_settings.sync_lag == sl);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.sync_lag = sl; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (sl < 2) ImGui::SameLine();
+        }
+        ImGui::SameLine();
+        ImGui::Text("| swap_imgs:");
+        ImGui::SameLine();
+        for (int si = 3; si <= 5; si++) {
+            char lbl[16];
+            snprintf(lbl, sizeof lbl, "%d##si", si);
+            bool sel = (g_settings.swapchain_images == si);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.swapchain_images = si; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (si < 5) ImGui::SameLine();
+        }
+
+        static const char *const pm_lbls[] = {"Imm", "Mailbox", "FIFO"};
+        ImGui::Text("present:");
+        ImGui::SameLine();
+        for (int pm = 0; pm <= 2; pm++) {
+            char lbl[24];
+            snprintf(lbl, sizeof lbl, "%s##pm", pm_lbls[pm]);
+            bool sel = (g_settings.present_mode == pm);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.present_mode = pm; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (pm < 2) ImGui::SameLine();
+        }
+        ImGui::SameLine();
+        ImGui::Text("| upscaler:");
+        ImGui::SameLine();
+        static const struct { const char *name; int val; } up_opts[] = {{"Off", UPSCALE_BILINEAR}, {"Sharp", UPSCALE_FSR1}, {"SGSR", UPSCALE_SGSR1}};
+        for (int u = 0; u < 3; u++) {
+            char lbl[24];
+            snprintf(lbl, sizeof lbl, "%s##up", up_opts[u].name);
+            bool sel = (g_settings.upscaler == up_opts[u].val);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.upscaler = up_opts[u].val; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (u < 2) ImGui::SameLine();
+        }
+
+        static const float rs_presets[] = {0.50f, 0.60f, 0.68f, 0.75f, 1.00f};
+        ImGui::Text("render_scale:");
+        ImGui::SameLine();
+        for (int i = 0; i < 5; i++) {
+            char lbl[20];
+            snprintf(lbl, sizeof lbl, "%.2fx##rs", rs_presets[i]);
+            bool sel = fabsf(g_settings.render_scale - rs_presets[i]) < 0.02f;
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.render_scale = rs_presets[i]; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (i < 4) ImGui::SameLine();
+        }
+
+        static const float sh_presets[] = {0.25f, 0.50f, 1.00f};
+        ImGui::Text("shadow_scale:");
+        ImGui::SameLine();
+        for (int i = 0; i < 3; i++) {
+            char lbl[20];
+            snprintf(lbl, sizeof lbl, "%.2fx##sh", sh_presets[i]);
+            bool sel = fabsf(g_settings.shadow_scale - sh_presets[i]) < 0.02f;
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.shadow_scale = sh_presets[i]; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (i < 2) ImGui::SameLine();
+        }
+        ImGui::SameLine();
+        ImGui::Text("| fp16:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.fp16_shaders ? "ON##fp16" : "OFF##fp16")) {
+            g_settings.fp16_shaders = g_settings.fp16_shaders ? 0 : 1;
+            ini_dirty = true;
+        }
+
+        static const int hm_presets[] = {2048, 2560, 3072, 3328};
+        ImGui::Text("heap_mb:");
+        ImGui::SameLine();
+        for (int i = 0; i < 4; i++) {
+            char lbl[20];
+            snprintf(lbl, sizeof lbl, "%d##hm", hm_presets[i]);
+            bool sel = (g_settings.heap_mb == hm_presets[i]);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.heap_mb = hm_presets[i]; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (i < 3) ImGui::SameLine();
+        }
+        if (ini_dirty) settings_save();
+    }
+    ImGui::Separator();
     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "BUILD: %s", ryza_get_build_fingerprint());
     ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "3D Draws: %llu | Char: %llu | Captured: %u/32",
                        (unsigned long long)g_ryza_3d_draw_count,

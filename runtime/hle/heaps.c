@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <sys/mman.h>
+#include "../settings.h"
+#endif
 
 #include "../hle.h"
 
@@ -125,9 +129,31 @@ HLE_FUNC("_ZN2nn4lmem20AllocateFromUnitHeapEPNS0_6detail8HeapHeadE", heap_alloc_
     if (!c->x[0]) fail_once("unit heap allocation", lr, head);
 }
 
+#ifdef __ANDROID__
+// Atelier Ryza debug-fills newly carved sub-heaps (including the 1579 MB 0x62b00000 StandardAllocator)
+// with 0xef via memset right before calling Initialize, faulting in >1.5 GB of unused physical RAM.
+// Reclaim those 0xef-poisoned physical pages back to demand-zero before Initialize writes its header.
+static void reclaim_poisoned_arena(uint64_t addr, uint64_t size) {
+    if (size < (16ull << 20)) return;
+    if (addr < HEAP_BASE || addr >= HEAP_BASE + HEAP_MAX || size > HEAP_BASE + HEAP_MAX - addr) return;
+    uint64_t lo = (addr + 0x10000ull) & ~0xfffull;
+    uint64_t hi = (addr + size) & ~0xfffull;
+    if (hi > lo) {
+        madvise((void *)(uintptr_t)lo, (size_t)(hi - lo), MADV_DONTNEED);
+        LOG("[heaps] reclaimed %llu MB of pre-poisoned physical pages in [%#llx, %#llx) (heap_mb=%d)\n",
+            (unsigned long long)((hi - lo) >> 20), (unsigned long long)lo, (unsigned long long)hi, g_settings.heap_mb);
+    }
+}
+#endif
+
 // nn::lmem::CreateFrameHeap(void *addr, size_t size, int opt)
 HLE_FUNC("_ZN2nn4lmem15CreateFrameHeapEPvmi", heap_create_frame) {
-    uint64_t lr = c->x[30], size = c->x[1];
+    uint64_t lr = c->x[30], addr = c->x[0], size = c->x[1];
+#ifdef __ANDROID__
+    reclaim_poisoned_arena(addr, size);
+#else
+    (void)addr;
+#endif
     CALL("_ZN2nn4lmem15CreateFrameHeapEPvmi");
     if (ENV("LARECOMP_LOG_HEAPS"))
         LOG("[heaps] frame heap %#llx bytes from lr %llx\n", (unsigned long long)size, (unsigned long long)lr);
@@ -141,14 +167,24 @@ HLE_FUNC("_ZN2nn4lmem21AllocateFromFrameHeapEPNS0_6detail8HeapHeadEmi", heap_all
 
 // nn::mem::StandardAllocator::Initialize(void *addr, size_t size[, bool])
 HLE_FUNC("_ZN2nn3mem17StandardAllocator10InitializeEPvm", heap_std_init) {
-    uint64_t lr = c->x[30], size = c->x[2];
+    uint64_t lr = c->x[30], addr = c->x[1], size = c->x[2];
+#ifdef __ANDROID__
+    reclaim_poisoned_arena(addr, size);
+#else
+    (void)addr;
+#endif
     CALL("_ZN2nn3mem17StandardAllocator10InitializeEPvm");
     if (ENV("LARECOMP_LOG_HEAPS"))
         LOG("[heaps] standard allocator %#llx bytes from lr %llx\n", (unsigned long long)size, (unsigned long long)lr);
 }
 
 HLE_FUNC("_ZN2nn3mem17StandardAllocator10InitializeEPvmb", heap_std_init_b) {
-    uint64_t lr = c->x[30], size = c->x[2];
+    uint64_t lr = c->x[30], addr = c->x[1], size = c->x[2];
+#ifdef __ANDROID__
+    reclaim_poisoned_arena(addr, size);
+#else
+    (void)addr;
+#endif
     CALL("_ZN2nn3mem17StandardAllocator10InitializeEPvmb");
     if (ENV("LARECOMP_LOG_HEAPS"))
         LOG("[heaps] standard allocator %#llx bytes (b) from lr %llx\n", (unsigned long long)size, (unsigned long long)lr);

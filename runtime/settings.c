@@ -56,17 +56,22 @@ Settings g_settings = {
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
     .res_mode = 1,
-    .render_scale = 0.68f,  // (0.68x internal 3D resolution default on Android: ~870x490, cuts Adreno 618 fragment load by 54%)  // (1x: the Switch's 900p scene, the HUD at the screen's resolution - Match display drew the scene at
-                    // 2560x1440 on the POCO F7 Ultra: 22 fps)
+    .render_scale = 0.68f,  // (0.68x internal 3D resolution default on Android: ~870x490, cuts Adreno 618 fragment load by 54%)
+    .shadow_scale = 1.0f,   // (1.0x shadow map resolution default; configurable 0.25, 0.5, 1.0)
 #else
     .show_fps = false,
+    .render_scale = 1.0f,
+    .shadow_scale = 1.0f,
 #endif
 #ifdef __ANDROID__
-    .upscaler = UPSCALE_BILINEAR,  // (one pass: ~1 ms on the Adreno 830 to 2560x1440, FSR 1's two ~2.7 ms; 40 fps against 38)
+    .upscaler = UPSCALE_BILINEAR,  // (configurable in botwrecompandroid.ini: 0/bilinear, 1/fsr1/sharp, 2/sgsr1)
     .native_code = true,       // (an experiment: runtime/native.c)
-    .sync_lag = true,          // (true on Android: 1-frame CPU/GPU pipelining; override via sync_lag=0 in botwrecompandroid.ini)
-    .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 640 from 1440p down by 4.8x for 45-60 FPS)
-    .heap_mb = 3328,           // (3328 MB / HEAP_MAX default on Android: Ryza requires ~3220 MB Switch heap at boot)
+    .sync_lag = 1,             // (1 = 1-frame CPU/GPU pipelining default; 0 = off, 2 = store-guarded lag)
+    .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 6xx from 1440p down by 4.8x)
+    .heap_mb = 2560,           // (2560 MB default guest heap target on 6 GB Android devices; configurable 1536..3584 MB)
+    .swapchain_images = 3,     // (3 = triple buffering default; configurable 2..5)
+    .present_mode = 1,         // (1 = Mailbox default, 0 = Immediate, 2 = FIFO / VSync)
+    .fp16_shaders = 1,         // (1 = FP16 RelaxedPrecision fragment shaders on Adreno default; 0 = FP32)
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
@@ -206,6 +211,8 @@ void settings_reset_defaults(void) {
     g_settings.aspect = d->aspect;
     g_settings.fullscreen = d->fullscreen;
     g_settings.res_mode = d->res_mode;
+    g_settings.render_scale = d->render_scale;
+    g_settings.shadow_scale = d->shadow_scale;
     g_settings.upscaler = d->upscaler;
     g_settings.out_lines = d->out_lines;
     g_settings.antialias = d->antialias;
@@ -223,6 +230,11 @@ void settings_reset_defaults(void) {
     g_settings.event_fps_unlock = d->event_fps_unlock;
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
+    g_settings.heap_mb = d->heap_mb;
+    g_settings.swapchain_images = d->swapchain_images;
+    g_settings.present_mode = d->present_mode;
+    g_settings.fp16_shaders = d->fp16_shaders;
+    g_settings.async_spin_us = d->async_spin_us;
     g_settings.native_code = d->native_code;
     g_settings.files_in_place = d->files_in_place;
 #endif
@@ -234,7 +246,14 @@ void settings_load(void) {
     if (loaded) return;
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
-    if (!f) return;
+    if (!f) {
+        settings_save();
+        LOG("[settings] created default %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d)\n",
+            SETTINGS_FILE, g_settings.sync_lag, g_settings.heap_mb, g_settings.swapchain_images,
+            g_settings.present_mode, g_settings.upscaler, g_settings.render_scale,
+            g_settings.shadow_scale, g_settings.fp16_shaders);
+        return;
+    }
 #ifdef __ANDROID__
     char line[640];  // (touch_layout: 24 numbers)
 #else
@@ -268,7 +287,11 @@ void settings_load(void) {
         else if (!strcmp(key, "cutscenes_60")) g_settings.event_fps_unlock = atoi(val) != 0;
         else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : !strcmp(val, "45") ? 4 : 0;
         else if (!strcmp(key, "shader_int32")) g_settings.shader_int32 = atoi(val) != 0;
-        else if (!strcmp(key, "sync_lag")) g_settings.sync_lag = atoi(val) != 0;
+        else if (!strcmp(key, "sync_lag")) {
+            int sl = (!strcmp(val, "true") || !strcmp(val, "on")) ? 1
+                   : (!strcmp(val, "false") || !strcmp(val, "off")) ? 0 : atoi(val);
+            g_settings.sync_lag = sl < 0 ? 0 : (sl > 2 ? 2 : sl);
+        }
         else if (!strcmp(key, "native_code")) g_settings.native_code = atoi(val) != 0;
         else if (!strcmp(key, "files_in_place")) g_settings.files_in_place = atoi(val) != 0;
         else if (!strcmp(key, "gpu_heap")) g_settings.gpu_heap = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
@@ -280,7 +303,19 @@ void settings_load(void) {
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
         else if (!strcmp(key, "heap_mb")) {
             int hm = atoi(val);
-            g_settings.heap_mb = (hm <= 0 || hm < 3220) ? 3328 : (hm > 3328 ? 3328 : hm);
+            g_settings.heap_mb = hm <= 0 ? 2560 : (hm < 1536 ? 1536 : (hm > 3584 ? 3584 : hm));
+        }
+        else if (!strcmp(key, "swapchain_images")) {
+            int si = atoi(val);
+            g_settings.swapchain_images = si < 2 ? 2 : (si > 5 ? 5 : si);
+        }
+        else if (!strcmp(key, "present_mode")) {
+            if (!strcmp(val, "immediate") || !strcmp(val, "0")) g_settings.present_mode = 0;
+            else if (!strcmp(val, "fifo") || !strcmp(val, "vsync") || !strcmp(val, "2")) g_settings.present_mode = 2;
+            else g_settings.present_mode = 1;
+        }
+        else if (!strcmp(key, "fp16_shaders")) {
+            g_settings.fp16_shaders = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
         }
         else if (!strcmp(key, "async_spin_us")) {
             int sp = atoi(val);
@@ -333,10 +368,14 @@ void settings_load(void) {
             float rs = (float)atof(val);
             if (rs >= 0.25f && rs <= 2.0f) g_settings.render_scale = rs;
         }
-        else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
-            g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
+        else if (!strcmp(key, "shadow_scale")) {
+            float ss = (float)atof(val);
+            if (ss >= 0.25f && ss <= 1.0f) g_settings.shadow_scale = ss;
+        }
+        else if (!strcmp(key, "upscaler"))  // (0/off/bilinear, 1/sharp/fsr1/cas/metalfx, 2/sgsr1)
+            g_settings.upscaler = (!strcmp(val, "bilinear") || !strcmp(val, "off") || !strcmp(val, "0")) ? UPSCALE_BILINEAR
 #ifndef __APPLE__
-                                : !strcmp(val, "sgsr1") ? UPSCALE_SGSR1
+                                : (!strcmp(val, "sgsr1") || !strcmp(val, "2")) ? UPSCALE_SGSR1
 #endif
                                 : UPSCALE_SHARP;
         else if (!strcmp(key, "output")) {  // ("auto", "screen", or the final image's lines: 1080 / 900 / 720)
@@ -370,13 +409,14 @@ void settings_load(void) {
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
 #ifdef __ANDROID__
-    g_settings.upscaler = UPSCALE_BILINEAR;
-    if (g_settings.out_lines <= 0 || g_settings.out_lines == OUT_AUTO) g_settings.out_lines = 720;
     if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.68f;
+    if (g_settings.shadow_scale <= 0.0f) g_settings.shadow_scale = 1.0f;
 #endif
     extern int g_exec_mode;
-    LOG("[settings] loaded %s (sync_lag=%d, forced upscaler=%d, exec_mode=%d)\n",
-        SETTINGS_FILE, g_settings.sync_lag, g_settings.upscaler, g_exec_mode);
+    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, exec_mode=%d)\n",
+        SETTINGS_FILE, g_settings.sync_lag, g_settings.heap_mb, g_settings.swapchain_images,
+        g_settings.present_mode, g_settings.upscaler, g_settings.render_scale,
+        g_settings.shadow_scale, g_settings.fp16_shaders, g_exec_mode);
 }
 
 void settings_save(void) {
@@ -384,7 +424,10 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# BOTWRecompAndroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "# Internal 3D scene resolution scale (0.50 .. 1.00; default 0.68)\n");
     if (g_settings.render_scale > 0.0f) fprintf(f, "render_scale = %.2f\n", g_settings.render_scale);
+    fprintf(f, "# Shadow map resolution scale (0.25, 0.50, 1.00; default 1.00)\n");
+    if (g_settings.shadow_scale > 0.0f) fprintf(f, "shadow_scale = %.2f\n", g_settings.shadow_scale);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
@@ -408,7 +451,11 @@ void settings_save(void) {
     fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\ngpu_model = %s\n", TRI(g_settings.gpu_heap),
             TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), g_settings.log_file, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
-    fprintf(f, "heap_mb = %d\nasync_spin_us = %d\n", g_settings.heap_mb, g_settings.async_spin_us);
+    fprintf(f, "# Pipeline & memory tuning: sync_lag (0=off, 1=1-frame pipeline, 2=store guard), heap_mb (1536..3584, default 2560)\n");
+    fprintf(f, "# Swapchain & shader tuning: swapchain_images (2..5, default 3), present_mode (0=immediate, 1=mailbox, 2=fifo), fp16_shaders (0=FP32, 1=FP16)\n");
+    fprintf(f, "heap_mb = %d\nswapchain_images = %d\npresent_mode = %d\nfp16_shaders = %d\nasync_spin_us = %d\n",
+            g_settings.heap_mb, g_settings.swapchain_images, g_settings.present_mode,
+            g_settings.fp16_shaders, g_settings.async_spin_us);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,

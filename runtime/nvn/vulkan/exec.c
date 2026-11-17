@@ -2376,6 +2376,9 @@ static void begin_pass(void) {
                 if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) vk_make_scalable_like(all[k], all[i]);
             break;
         }
+        if (st.rt.ncolor == 0 && st.rt.depth) {
+            vk_promote_shadow_rt(st.rt.depth);
+        }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
@@ -9072,8 +9075,8 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         const char *e = getenv("LARECOMP_PRESENT_UPSCALE");
         pmode = !e ? UPSCALE_BILINEAR : !strcmp(e, "sgsr") ? UPSCALE_SGSR1 : !strcmp(e, "setting") ? 99 : UPSCALE_BILINEAR;
     }
-    int up = pmode == 99 ? g_settings.upscaler : pmode;
-    if (pmode == UPSCALE_BILINEAR) fsr = false;
+    int up = pmode == 99 ? g_settings.upscaler : (pmode == UPSCALE_BILINEAR && !scene_up.t ? g_settings.upscaler : pmode);
+    if (up == UPSCALE_BILINEAR) fsr = false;
     if (!smaa && !fxaa && !fsr) return v;
     gp_mark(cb, "present: %s%s %ux%u -> %ux%u", smaa ? "smaa " : fxaa ? "fxaa " : "", !fsr ? "" : up == UPSCALE_SGSR1 ? "sgsr1" : "easu+rcas",
             b->width, b->height, ow, oh);
