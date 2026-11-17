@@ -296,6 +296,7 @@ NVN(nvnQueueFlush) { (void)c; }
 bool vk_async_on(void);
 bool vk_async_is_render_thread(void);
 void vk_async_drain(void);
+bool vk_has_pending_commands(void);
 bool vk_async_queue_idle(void);
 void vk_async_flush_if_needed(uint64_t target_seq);
 uint64_t vk_async_fence(uint64_t guest_sync);
@@ -477,7 +478,9 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     else if (whole) renderer_sync();
     else {
         uint64_t sseq = sync_of(A(0))->seq;
+#ifdef __ANDROID__
         vk_async_flush_if_needed(sseq);
+#endif
         renderer_wait_seq(sseq);  // only the submission that holds this fence
     }
 #ifdef __ANDROID__
