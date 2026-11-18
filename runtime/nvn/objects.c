@@ -315,8 +315,10 @@ void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
 void vk_sync_wait_enter(void);
 void vk_sync_wait_leave(void);
-static _Atomic uint64_t g_last_present_fence_lseq;
-static _Atomic uint64_t g_lag_prev_newest_seq;
+uint64_t renderer_fence_seq(void);
+void renderer_wait_seq(uint64_t seq);
+static uint64_t g_last_present_fence_lseq;
+static uint64_t g_lag_prev_newest_seq;
 
 NVN(nvnQueueFinish) {
     if (!vk_has_pending_commands() && (!vk_async_on() || vk_async_queue_idle())) {
