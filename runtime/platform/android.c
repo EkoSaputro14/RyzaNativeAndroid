@@ -1112,6 +1112,7 @@ static int g_ncores_conf;
 static int g_gold_cnt, g_prime_cnt;
 static uint64_t g_fast_core_mask, g_gold_core_mask, g_prime_core_mask, g_active_fast_mask;
 static bool g_prime_avoided;
+static bool g_all_fallback;
 static pthread_mutex_t g_fast_tid_lock = PTHREAD_MUTEX_INITIALIZER;
 static int32_t g_fast_tids[64];
 static int g_fast_ntids;
@@ -1257,7 +1258,7 @@ static void register_fast_tid(int32_t tid) {
 
 void plat_refresh_fast_affinity(void) {
     pthread_once(&g_topo_once, init_cpu_topology);
-    if (!g_pin_enabled || !g_has_clusters || g_prime_cnt <= 0 || g_gold_cnt <= 0) return;
+    if (!g_pin_enabled || !g_has_clusters) return;
 
     static atomic_uint_fast64_t next_check_ns;
     uint64_t now = plat_now_ns();
@@ -1267,23 +1268,35 @@ void plat_refresh_fast_affinity(void) {
                                                  memory_order_relaxed, memory_order_relaxed))
         return;
 
+    long little_cur_max = 0, fast_cur_max = 0;
     long gold_cur_max = 0, gold_cap_max = 0, prime_cur_max = 0, prime_cap_max = 0;
     int gold_on = 0, prime_on = 0;
-    cpu_set_t online_fast, online_gold;
+    cpu_set_t online_fast, online_gold, online_all;
     CPU_ZERO(&online_fast);
     CPU_ZERO(&online_gold);
-    uint64_t online_fast_mask = 0, online_gold_mask = 0;
+    CPU_ZERO(&online_all);
+    uint64_t online_fast_mask = 0, online_gold_mask = 0, online_all_mask = 0;
 
     for (int c = 0; c < g_ncores_conf; c++) {
-        if (!CPU_ISSET(c, &g_fast_cores)) continue;
         if (!cpu_is_online(c)) continue;
-        CPU_SET(c, &online_fast);
-        online_fast_mask |= (1ull << c);
+        CPU_SET(c, &online_all);
+        if (c < 64) online_all_mask |= (1ull << c);
+
         char pcur[96], pcap[96];
         snprintf(pcur, sizeof pcur, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
         snprintf(pcap, sizeof pcap, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", c);
         long cur = read_cpu_long(pcur);
+
+        if (CPU_ISSET(c, &g_little_cores) || (c < 4 && !CPU_ISSET(c, &g_fast_cores))) {
+            if (cur > little_cur_max) little_cur_max = cur;
+        }
+        if (!CPU_ISSET(c, &g_fast_cores)) continue;
+
         long cap = read_cpu_long(pcap);
+        CPU_SET(c, &online_fast);
+        if (c < 64) online_fast_mask |= (1ull << c);
+        if (cur > fast_cur_max) fast_cur_max = cur;
+
         if (CPU_ISSET(c, &g_prime_cores)) {
             prime_on++;
             if (cur > prime_cur_max) prime_cur_max = cur;
@@ -1291,30 +1304,41 @@ void plat_refresh_fast_affinity(void) {
         } else if (CPU_ISSET(c, &g_gold_cores)) {
             gold_on++;
             CPU_SET(c, &online_gold);
-            online_gold_mask |= (1ull << c);
+            if (c < 64) online_gold_mask |= (1ull << c);
             if (cur > gold_cur_max) gold_cur_max = cur;
             if (cap > gold_cap_max) gold_cap_max = cap;
         }
     }
 
     bool avoid_prime = false;
-    if (gold_on > 0) {
+    if (g_prime_cnt > 0 && gold_on > 0) {
         if (prime_on == 0) avoid_prime = true;
         else if (prime_cap_max > 0 && gold_cap_max > 0 && prime_cap_max + 150000 < gold_cap_max) avoid_prime = true;
         else if (prime_cur_max > 0 && gold_cur_max > 0 && prime_cur_max + 200000 < gold_cur_max && prime_cur_max < 1500000)
             avoid_prime = true;
     }
 
-    cpu_set_t target = avoid_prime ? (online_gold_mask ? online_gold : g_gold_cores)
-                                   : (online_fast_mask ? online_fast : g_fast_cores);
-    uint64_t target_mask = avoid_prime ? (online_gold_mask ? online_gold_mask : g_gold_core_mask)
-                                       : (online_fast_mask ? online_fast_mask : g_fast_core_mask);
+    bool fallback_all = (fast_cur_max > 0 && little_cur_max > 0 && fast_cur_max < little_cur_max);
+
+    cpu_set_t target;
+    uint64_t target_mask;
+    if (fallback_all) {
+        target = online_all_mask ? online_all : g_all_cores;
+        target_mask = online_all_mask ? online_all_mask : 0xffull;
+    } else if (avoid_prime) {
+        target = online_gold_mask ? online_gold : g_gold_cores;
+        target_mask = online_gold_mask ? online_gold_mask : g_gold_core_mask;
+    } else {
+        target = online_fast_mask ? online_fast : g_fast_cores;
+        target_mask = online_fast_mask ? online_fast_mask : g_fast_core_mask;
+    }
 
     pthread_mutex_lock(&g_fast_tid_lock);
-    bool changed = (avoid_prime != g_prime_avoided) || (target_mask != g_active_fast_mask);
+    bool changed = (avoid_prime != g_prime_avoided) || (fallback_all != g_all_fallback) || (target_mask != g_active_fast_mask);
     g_active_fast_cores = target;
     g_active_fast_mask = target_mask;
     g_prime_avoided = avoid_prime;
+    g_all_fallback = fallback_all;
     if (changed && target_mask) {
         int alive = 0;
         for (int i = 0; i < g_fast_ntids; i++) {
@@ -1324,8 +1348,10 @@ void plat_refresh_fast_affinity(void) {
             g_fast_tids[alive++] = g_fast_tids[i];
         }
         g_fast_ntids = alive;
-        LOG("[android] thermal-aware affinity: %s (gold=%ld/%ld MHz, prime=%ld/%ld MHz, mask=0x%llx, threads=%d)\n",
-            avoid_prime ? "avoiding throttled prime -> gold cluster" : "all fast cores active",
+        LOG("[android] thermal-aware affinity: %s (fast=%ld MHz, little=%ld MHz, gold=%ld/%ld MHz, prime=%ld/%ld MHz, mask=0x%llx, threads=%d)\n",
+            fallback_all ? "thermal throttle (fast < little) -> all cores (0xff)"
+                         : (avoid_prime ? "avoiding throttled prime -> gold cluster" : "all fast cores active"),
+            fast_cur_max / 1000, little_cur_max / 1000,
             gold_cur_max / 1000, gold_cap_max / 1000,
             prime_cur_max / 1000, prime_cap_max / 1000,
             (unsigned long long)target_mask, alive);

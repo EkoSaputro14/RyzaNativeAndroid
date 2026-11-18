@@ -302,6 +302,27 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             g_settings.fp16_shaders = g_settings.fp16_shaders ? 0 : 1;
             ini_dirty = true;
         }
+        ImGui::SameLine();
+        ImGui::Text("| skip_postfx:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.skip_postfx ? "ON##postfx" : "OFF##postfx")) {
+            g_settings.skip_postfx = g_settings.skip_postfx ? 0 : 1;
+            ini_dirty = true;
+        }
+
+        static const int tf_presets[] = {0, 20, 30, 45, 60};
+        ImGui::Text("target_fps:");
+        ImGui::SameLine();
+        for (int i = 0; i < 5; i++) {
+            char lbl[20];
+            if (tf_presets[i] == 0) snprintf(lbl, sizeof lbl, "Off##tf");
+            else snprintf(lbl, sizeof lbl, "%d##tf", tf_presets[i]);
+            bool sel = (g_settings.target_fps == tf_presets[i]);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(lbl)) { g_settings.target_fps = tf_presets[i]; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (i < 4) ImGui::SameLine();
+        }
 
         static const int hm_presets[] = {2048, 2560, 3072, 3328};
         ImGui::Text("heap_mb:");

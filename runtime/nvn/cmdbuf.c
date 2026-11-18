@@ -781,8 +781,25 @@ NVN(nvnCommandBufferCopyCommands) {
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerDynamic) { (void)c; }
 NVN(nvnCommandBufferInsertDebugMarkerStatic) { (void)c; }
-NVN(nvnCommandBufferPushDebugGroup) { (void)c; }
-NVN(nvnCommandBufferPushDebugGroupDynamic) { (void)c; }
-NVN(nvnCommandBufferPushDebugGroupStatic) { (void)c; }
-NVN(nvnCommandBufferPopDebugGroup) { (void)c; }
-NVN(nvnCommandBufferPopDebugGroupId) { (void)c; }
+static void record_push_debug_group(Cpu *c, uint64_t desc_addr) {
+    Snap s = snap(c);
+    char name[64] = {0};
+    uint32_t len = 0;
+    if (desc_addr >= 0x10000ull) {
+        const char *src = (const char *)(uintptr_t)desc_addr;
+        while (len < sizeof(name) - 1 && src[len]) {
+            name[len] = src[len];
+            len++;
+        }
+        name[len] = 0;
+    }
+    CmdRec *r = record(c, CMD_PUSH_DEBUG_GROUP, len + 1, &s);
+    if (!r) return;
+    r->x[0] = len;
+    memcpy(r->extra, name, len + 1);
+}
+NVN(nvnCommandBufferPushDebugGroup) { record_push_debug_group(c, A(1)); }
+NVN(nvnCommandBufferPushDebugGroupDynamic) { record_push_debug_group(c, A(2)); }
+NVN(nvnCommandBufferPushDebugGroupStatic) { record_push_debug_group(c, A(2)); }
+NVN(nvnCommandBufferPopDebugGroup) { Snap s = snap(c); record(c, CMD_POP_DEBUG_GROUP, 0, &s); }
+NVN(nvnCommandBufferPopDebugGroupId) { Snap s = snap(c); record(c, CMD_POP_DEBUG_GROUP, 0, &s); }

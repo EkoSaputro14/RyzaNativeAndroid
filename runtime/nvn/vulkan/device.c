@@ -11,6 +11,8 @@
 #ifdef __ANDROID__
 #include <android/native_window.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <time.h>
 #endif
 
 #include "../../paths.h"
@@ -1194,7 +1196,9 @@ int vk_between_fps(void) {
 static void android_frame_rate(struct ANativeWindow *aw) {
     static struct ANativeWindow *asked_aw;
     static float asked = -1;
-    float want = g_settings.fps_mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f;
+    float want = g_settings.target_fps > 0
+                     ? (float)g_settings.target_fps
+                     : (g_settings.fps_mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f);
     if (aw == asked_aw && want == asked) return;
     // (libnativewindow's, looked up, not linked. Android 12+: with the change strategy ALWAYS - the plain call changes
     // the refresh only when it's seamless, and 120 -> 90 Hz isn't on the POCO F7 Ultra: it stayed at 120)
@@ -1544,6 +1548,29 @@ void backend_present(NvnTexture *t);
 static void present_game_half(void) {
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
+    static uint64_t s_pace_next_ns = 0;
+    if (g_settings.target_fps > 0) {
+        uint64_t period_ns = 1000000000ull / (uint64_t)g_settings.target_fps;
+        uint64_t now_ns = plat_now_ns();
+        if (!s_pace_next_ns || now_ns > s_pace_next_ns + period_ns) {
+            s_pace_next_ns = now_ns + period_ns;
+        } else {
+            s_pace_next_ns += period_ns;
+        }
+        if (now_ns < s_pace_next_ns) {
+            extern void kernel_blocking_begin(void);
+            extern void kernel_blocking_end(void);
+            struct timespec ts = {
+                .tv_sec = (time_t)(s_pace_next_ns / 1000000000ull),
+                .tv_nsec = (long)(s_pace_next_ns % 1000000000ull)
+            };
+            kernel_blocking_begin();
+            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {}
+            kernel_blocking_end();
+        }
+    } else {
+        s_pace_next_ns = 0;
+    }
     extern void input_frame(uint64_t frame);
     input_frame(renderer_present_count());
     static long slow_ms = -1;
@@ -1667,6 +1694,8 @@ void backend_present(NvnTexture *t) {
     } else {
         renderer_submit();
     }
+    extern void vk_debug_groups_reset(void);
+    vk_debug_groups_reset();
     uint64_t present_t1 = plat_now_ns();
     extern void vk_ring_begin_frame(uint64_t frame_index);
     vk_ring_begin_frame(total_frames + 1);
@@ -2004,6 +2033,11 @@ static int vk_adreno_gen_num(const char *name) {
     return atoi(a);
 }
 
+bool vk_adreno_61x(const char *name) {
+    int n = vk_adreno_gen_num(name);
+    return n >= 610 && n < 620;
+}
+
 bool vk_adreno_6xx(const char *name) {
     int n = vk_adreno_gen_num(name);
     return n >= 600 && n < 700;
@@ -2024,6 +2058,7 @@ bool vk_turnip_path_on(int setting) {
 // likely cause of the terrain striped on an Adreno 750 (issue #129: BOTW's terrain decals read the targets they write).
 bool vk_turnip_heap_on(int setting) {
     if (setting >= 0 || vk_adreno_8xx(g_vk.props.deviceName)) return vk_turnip_path_on(setting);
+    if (vk_adreno_61x(g_vk.props.deviceName)) return false;
     return (g_vk.map_placed || g_vk.mem_fd) && vk_driver_is_turnip();
 }
 static bool g_lrz_at_start = true;

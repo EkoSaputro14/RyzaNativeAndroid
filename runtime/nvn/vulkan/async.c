@@ -83,6 +83,8 @@ void kernel_blocking_end(void);
 void vk_execute_now(uint64_t handle);    // exec.c: translate and submit a command list
 void vk_execute_list_batch(uint64_t handle, bool force_submit);
 void vk_flush_pending_work(void);
+uint64_t vk_submitted_seq(void);
+bool vk_batch_threshold_reached(void);
 bool vk_has_pending_commands(void);
 uint64_t vk_submitted_seq(void);
 void vk_present_now(NvnTexture *t, uint64_t asked);  // device.c: the window's half of backend_present
@@ -238,7 +240,7 @@ static void *render_main(void *arg) {
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
                 int nt = q[scan % QN].type;
                 if (nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE) continue;
-                next_needs_submit = (nt == REQ_PRESENT || nt == REQ_FLUSH);
+                next_needs_submit = (nt == REQ_PRESENT) || (nt == REQ_FLUSH && q[scan % QN].a == 0);
                 break;
             }
         }
@@ -260,7 +262,11 @@ static void *render_main(void *arg) {
             vk_present_now((NvnTexture *)r.p, r.a);
             stall_note_active_work(NULL);
         } else if (r.type == REQ_FLUSH) {
-            vk_flush_pending_work();
+            uint64_t sub = vk_submitted_seq();
+            bool urgent = (r.a == 0) || (r.a > sub);
+            if (vk_has_pending_commands() && (urgent || vk_batch_threshold_reached())) {
+                vk_flush_pending_work();
+            }
         } else if (r.type == REQ_FENCE) {
             extern bool vk_gmem_placed(void);
             if (vk_gmem_placed() || getenv("LARECOMP_FENCE_SUBMIT")) vk_flush_pending_work();
@@ -386,12 +392,26 @@ bool vk_async_queue_idle(void) {
 // Flush only if target_seq lives inside the currently-open (unsubmitted) command buffer.
 void vk_async_flush_if_needed(uint64_t target_seq) {
     if (!target_seq || target_seq <= vk_submitted_seq()) return;
+    if (!vk_has_pending_commands() && vk_async_queue_idle()) return;
     if (!vk_async_on() || vk_async_is_render_thread()) {
         if (vk_has_pending_commands()) vk_flush_pending_work();
         return;
     }
     pthread_mutex_lock(&p_lock);
-    uint64_t fid = push(REQ_FLUSH, 0, NULL);
+    pthread_mutex_lock(&q_lock);
+    if (q_tail > q_head) {
+        Req *last = &q[(q_tail - 1) % QN];
+        if (last->type == REQ_FLUSH) {
+            if (last->a != 0 && target_seq > last->a) last->a = target_seq;
+            uint64_t existing_id = last->id;
+            pthread_mutex_unlock(&q_lock);
+            pthread_mutex_unlock(&p_lock);
+            vk_async_wait_id(existing_id);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&q_lock);
+    uint64_t fid = push(REQ_FLUSH, target_seq, NULL);
     pthread_mutex_unlock(&p_lock);
     vk_async_wait_id(fid);
 }

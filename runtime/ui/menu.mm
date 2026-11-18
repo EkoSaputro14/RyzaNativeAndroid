@@ -756,6 +756,27 @@ static void tab_display(void) {
             settings_save();
         }
     }
+    {
+        static const char *tf_names[] = {"Uncapped (0)", "20 fps", "30 fps", "45 fps", "60 fps"};
+        static const int tf_vals[] = {0, 20, 30, 45, 60};
+        int tfi = 2;
+        for (int i = 0; i < 5; i++) if (tf_vals[i] == g_settings.target_fps) tfi = i;
+        if (opt_choice("Target FPS (pacer)", &tfi, tf_names, 5, 2,
+                       "Monotonic frame-time pacer and SurfaceFlinger refresh rate hint (target_fps). 30 fps keeps frame pacing smooth "
+                       "and reduces thermal throttling on Snapdragon 732G / 855. Applies at once.")) {
+            g_settings.target_fps = tf_vals[tfi];
+            settings_save();
+        }
+    }
+    {
+        bool spfx_on = g_settings.skip_postfx != 0;
+        if (opt_toggle("Skip heavy post-FX (KTGL)", &spfx_on, false,
+                       "Culls expensive post-processing passes (RLR, MRLR, GaussianBlurX/Y, RenderTerrainShadowMap) to reduce GPU fragment "
+                       "bottlenecks on mid-range mobile GPUs. Applies at once.")) {
+            g_settings.skip_postfx = spfx_on ? 1 : 0;
+            settings_save();
+        }
+    }
     opt_toggle("Native game code (experimental)", &g_settings.native_code, false,
                "Runs the game's own code directly on the phone's CPU instead of the game code built at setup: no build "
                "needed. An experiment - report what goes wrong. Applies the next time the game starts.");

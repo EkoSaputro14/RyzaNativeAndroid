@@ -13,6 +13,8 @@
 #include <unistd.h>
 #ifdef __ANDROID__
 #include <android/hardware_buffer.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <sys/mman.h>
 #endif
 
@@ -985,6 +987,13 @@ bool vk_has_pending_commands(void) {
     return atomic_load_explicit(&g_batch_pending, memory_order_acquire);
 }
 
+bool vk_batch_threshold_reached(void) {
+    uint64_t batch_up_bytes = stat_upload_bytes - batch_start_upload_bytes;
+    return (stat_draws - batch_start_draws >= 2048) ||
+           (batch_lists >= 128) ||
+           (batch_up_bytes >= (24ull << 20));
+}
+
 void vk_flush_pending_work(void) {
     if (!vk_has_pending_commands()) return;
 #ifdef __ANDROID__
@@ -1717,6 +1726,7 @@ const char *renderer_stats(void) {
         for (int i = 0; i < CMD_COUNT; i++) if (op_counts[i]) LOG(" %d:%llu", i, (unsigned long long)op_counts[i]);
         LOG("\n");
     }
+    if (stat_postfx_culled && dumps <= 3) LOG("[vk] KTGL post-FX culled draws: %llu\n", (unsigned long long)stat_postfx_culled);
     snprintf(stats_text, sizeof stats_text,
              "%llu draws, %llu skipped, %llu passes, %llu dispatches (%llu chained), %llu flushes, wait %.0fms, compile %d (waited %.0fms), fbcopy %llu (read %llu, breaks %llu), upload %.1fMB, binds %llu pipe %llu sets",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
@@ -5012,6 +5022,32 @@ bool vk_heap_file_asked(void) {
     return g_vk.mem_fd && (e ? atoi(e) != 0 : g_settings.heap_file);
 }
 
+static sigjmp_buf g_atomic64_probe_jmp;
+static volatile sig_atomic_t g_atomic64_probe_active;
+static void atomic64_probe_sigbus(int sig) {
+    (void)sig;
+    if (g_atomic64_probe_active) siglongjmp(g_atomic64_probe_jmp, 1);
+    _exit(128 + sig);
+}
+static bool vk_probe_atomic64(void *page_ptr) {
+    if (!page_ptr || page_ptr == MAP_FAILED) return false;
+    struct sigaction sa = {0}, old_sa = {0};
+    sa.sa_handler = atomic64_probe_sigbus;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, &old_sa);
+    g_atomic64_probe_active = 1;
+    bool ok = false;
+    if (sigsetjmp(g_atomic64_probe_jmp, 1) == 0) {
+        volatile uint64_t *p64 = (volatile uint64_t *)page_ptr;
+        uint64_t expected = *p64;
+        (void)__atomic_compare_exchange_n(p64, &expected, expected, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        ok = true;
+    }
+    g_atomic64_probe_active = 0;
+    sigaction(SIGBUS, &old_sa, NULL);
+    return ok;
+}
+
 bool vk_heap_place(uint64_t size) {
 #ifdef __ANDROID__
     extern void vk_async_drain(void);
@@ -5028,8 +5064,15 @@ bool vk_heap_place(uint64_t size) {
     extern bool vk_heap_file_asked(void);
     extern bool vk_turnip_heap_on(int setting);
     extern bool vk_driver_is_turnip(void);
+    extern bool vk_adreno_61x(const char *name);
+    extern const char *vk_gpu_name(void);
     bool turnip = vk_driver_is_turnip();
+    bool adreno_61x = vk_adreno_61x(vk_gpu_name());
     bool memfd = vk_heap_file_asked() || (!g_vk.map_placed && g_vk.mem_fd && (g_settings.gpu_heap > 0 || (g_settings.gpu_heap < 0 && turnip)));
+    if (memfd && g_settings.gpu_heap < 0 && adreno_61x && !vk_heap_file_asked() && !getenv("LARECOMP_VK_MEMFD")) {
+        LOG("[vk] skipping automatic memfd GPU heap on Adreno 61x (%s) to avoid SIGBUS on 64-bit atomics\n", vk_gpu_name());
+        memfd = false;
+    }
     if (g_settings.heap_file && !g_vk.mem_fd)
         LOG("[vk] game memory through a shared file: on in the settings, but this driver can't export its memory (no "
             "VK_KHR_external_memory_fd) - using persistent device-local host-visible coherent arena\n");
@@ -5135,8 +5178,17 @@ bool vk_heap_place(uint64_t size) {
             VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = mem, .handleType = ht};
             r = vkGetMemoryFdKHR(g_vk.dev, &gi, &fd);
             if (r == VK_SUCCESS && fd >= 0) {
-                p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
-                if (p == MAP_FAILED) p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
+                void *probe_p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                bool probe_ok = vk_probe_atomic64(probe_p);
+                if (probe_p != MAP_FAILED) munmap(probe_p, 4096);
+                if (!probe_ok) {
+                    LOG("[vk] heap atomic64 probe failed (SIGBUS): skipping memfd MAP_FIXED at %llx\n",
+                        (unsigned long long)HEAP_BASE);
+                    r = VK_ERROR_FEATURE_NOT_PRESENT;
+                } else {
+                    p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+                    if (p == MAP_FAILED) p = NULL, r = VK_ERROR_MEMORY_MAP_FAILED;
+                }
                 close(fd);
             } else if (fd >= 0) {
                 close(fd);
@@ -9577,6 +9629,31 @@ static void split_long_pass(void) {
 #endif
 }
 
+enum { DBG_STACK_MAX = 32 };
+static char dbg_stack[DBG_STACK_MAX][64];
+static uint8_t dbg_cull_stack[DBG_STACK_MAX];
+static int dbg_depth = 0;
+static int dbg_cull_active = 0;
+static uint64_t stat_postfx_culled = 0;
+static inline bool vk_skip_postfx_enabled(void) {
+#ifdef __ANDROID__
+    return g_settings.skip_postfx != 0;
+#else
+    return false;
+#endif
+}
+void vk_debug_groups_reset(void) {
+    dbg_depth = 0;
+    dbg_cull_active = 0;
+    memset(dbg_cull_stack, 0, sizeof dbg_cull_stack);
+}
+static bool is_culled_postfx_group(const char *name) {
+    if (!name || !*name) return false;
+    return !strcmp(name, "RLR") || !strcmp(name, "MRLR") ||
+           !strcmp(name, "GaussianBlurX") || !strcmp(name, "GaussianBlurY") ||
+           !strcmp(name, "RenderTerrainShadowMap");
+}
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
@@ -9789,9 +9866,33 @@ static void exec_list(uint64_t handle, int depth) {
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }
             break;
+        case CMD_PUSH_DEBUG_GROUP: {
+            const char *gname = (const char *)x;
+            uint8_t culled = is_culled_postfx_group(gname) ? 1 : 0;
+            if (dbg_depth < DBG_STACK_MAX) {
+                snprintf(dbg_stack[dbg_depth], sizeof(dbg_stack[dbg_depth]), "%s", gname ? gname : "");
+                dbg_cull_stack[dbg_depth] = culled;
+            }
+            dbg_depth++;
+            dbg_cull_active += culled;
+            break;
+        }
+        case CMD_POP_DEBUG_GROUP:
+            if (dbg_depth > 0) {
+                dbg_depth--;
+                if (dbg_depth < DBG_STACK_MAX && dbg_cull_stack[dbg_depth]) {
+                    if (dbg_cull_active > 0) dbg_cull_active--;
+                    dbg_cull_stack[dbg_depth] = 0;
+                }
+            }
+            break;
         case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
-        case CMD_DRAW_ARRAYS: draw(r, false); split_long_pass(); break;
-        case CMD_DRAW_ELEMENTS: draw(r, true); split_long_pass(); break;
+        case CMD_DRAW_ARRAYS:
+            if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
+            draw(r, false); split_long_pass(); break;
+        case CMD_DRAW_ELEMENTS:
+            if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
+            draw(r, true); split_long_pass(); break;
         case CMD_UPDATE_UNIFORM_BUFFER: {
             uint64_t dst = r->x[0] + r->x[2], sz = r->x[3];
             if (ct_on()) LOG("[ct] ubo-update %llx + %llx size %llx%s\n", (unsigned long long)r->x[0], (unsigned long long)r->x[2],
@@ -9961,7 +10062,7 @@ void vk_execute_list_batch(uint64_t handle, bool force_submit) {
     uint64_t batch_up_bytes = stat_upload_bytes - batch_start_upload_bytes;
     bool should_submit = no_batch || sync_submit || force_submit ||
                          (list_had_fence && gmem_placed) ||
-                         (stat_draws - batch_start_draws >= 4096) ||
+                         (stat_draws - batch_start_draws >= 2048) ||
                          (batch_lists >= 128) ||
                          (batch_up_bytes >= (24ull << 20));
     if (should_submit) {

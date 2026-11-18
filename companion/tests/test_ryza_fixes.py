@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 48" in gradle_kts and "0.3.2-forensic-p16" in gradle_kts
+    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 48" in gradle_kts and "0.3.2-forensic-p16" in gradle_kts
+    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -808,7 +808,7 @@ def _verify_p13_sprint2_sync_tex_and_wait_telemetry():
     assert "vk_async_has_more_exec" not in exec_c and "vk_async_has_more_exec" not in async_c
     assert "fence_forces_submit" not in exec_c
     assert "(list_had_fence && gmem_placed)" in exec_c
-    assert "guest_copy_flush();" in exec_c and "(batch_lists >= 128)" in exec_c and "(stat_draws - batch_start_draws >= 4096)" in exec_c
+    assert "guest_copy_flush();" in exec_c and "(batch_lists >= 128)" in exec_c and "(stat_draws - batch_start_draws >= 2048)" in exec_c
     fence_arm = async_c.split("} else if (r.type == REQ_FENCE) {", 1)[1].split("} else if (r.type == REQ_TEX_REG) {", 1)[0]
     assert "vk_gmem_placed()" in fence_arm and "vk_flush_pending_work()" in fence_arm
     assert "vk_async_flush_if_needed(" in objects_c
@@ -858,13 +858,13 @@ def _verify_p13_sprint3_batch_ring_pushdesc_adpf():
     overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
 
     # Patch 1: Command buffer batching & on-demand sync flush (preserving guest_copy_flush skinning safety)
-    assert "(stat_draws - batch_start_draws >= 4096)" in exec_c
+    assert "(stat_draws - batch_start_draws >= 2048)" in exec_c
     assert "(batch_lists >= 128)" in exec_c
     assert "(batch_up_bytes >= (24ull << 20))" in exec_c
     assert "(list_had_fence && gmem_placed)" in exec_c
     assert "if (!pending && !game_pending && work_seq && !fence_present) q = work_seq;" in exec_c
     assert "if (!g_vk.timeline) return 0;" in exec_c
-    assert "next_needs_submit = (nt == REQ_PRESENT || nt == REQ_FLUSH);" in async_c
+    assert "next_needs_submit = (nt == REQ_PRESENT) || (nt == REQ_FLUSH && q[scan % QN].a == 0);" in async_c
     assert "pthread_cond_timedwait" not in async_c
     assert "vk_async_queue_idle(" in async_c and "vk_async_flush_if_needed(" in async_c
     assert "vk_async_queue_idle()" in objects_c and "vk_async_flush_if_needed(" in objects_c
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 48" in gradle_kts and "0.3.2-forensic-p16" in gradle_kts
+    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1138,3 +1138,63 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     print("  -> PASS: p16 (Thermal-aware Gold/Prime affinity, Turnip auto memfd/dma-buf/AHB zero-copy, and vk-render fast paths) verified.")
 
 _verify_p16_thermal_affinity_memfd_ahb_dedup()
+
+
+def _verify_p17_sigbus_pacer_thermal_batch_postfx():
+    from pathlib import Path
+    print("[TEST] Verifying p17 SIGBUS Fix, 30 FPS Pacer, Little-Cluster Affinity Fallback, REQ_FLUSH Coalescing & KTGL Post-FX Culling...")
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    nvn_h = (repo_root / "runtime" / "nvn" / "nvn.h").read_text(encoding="utf-8")
+    cmdbuf_c = (repo_root / "runtime" / "nvn" / "cmdbuf.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+
+    # Version bump
+    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
+
+    # Settings & UI wiring
+    assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
+    assert ".target_fps = 30" in settings_c and ".skip_postfx = 0" in settings_c
+    assert "g_settings.target_fps" in menu_mm and "g_settings.skip_postfx" in menu_mm
+    assert "g_settings.target_fps" in overlay_mm and "g_settings.skip_postfx" in overlay_mm
+
+    # Task 1: SIGBUS Adreno 61x auto-skip & 64-bit atomic CAS probe before MAP_FIXED
+    assert "bool vk_adreno_61x(const char *name)" in device_c
+    assert "if (vk_adreno_61x(g_vk.props.deviceName)) return false;" in device_c
+    assert "vk_probe_atomic64(" in exec_c and "__atomic_compare_exchange_n" in exec_c
+    assert exec_c.index("vk_probe_atomic64(probe_p)") < exec_c.index("MAP_SHARED | MAP_FIXED")
+
+    # Task 2: 30 FPS Frame Pacing & SurfaceFlinger Refresh Rate Hint
+    assert "g_settings.target_fps > 0" in device_c
+    assert "ANativeWindow_setFrameRate" in device_c
+    assert "clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME" in device_c
+
+    # Task 3: Thermal Frequency Fallback to All Cores (fast_cur_max < little_cur_max -> 0xff/online_all)
+    assert "little_cur_max" in android_c and "fast_cur_max" in android_c
+    assert "fast_cur_max < little_cur_max" in android_c
+    assert "0xffull" in android_c and "online_all" in android_c
+
+    # Task 4: Coalesce REQ_FLUSH & 2048 Batch Submit Throttling (preserving guest_copy_flush)
+    assert "(stat_draws - batch_start_draws >= 2048)" in exec_c
+    assert "bool vk_batch_threshold_reached(void)" in exec_c
+    assert "guest_copy_flush();" in exec_c
+    assert "if (last->type == REQ_FLUSH)" in async_c
+    assert "vk_batch_threshold_reached()" in async_c
+
+    # Task 5: KTGL Pass Culling (skip_postfx)
+    assert "CMD_PUSH_DEBUG_GROUP" in nvn_h and "CMD_POP_DEBUG_GROUP" in nvn_h
+    assert "record_push_debug_group" in cmdbuf_c
+    for grp in ("RLR", "MRLR", "GaussianBlurX", "GaussianBlurY", "RenderTerrainShadowMap"):
+        assert f'"{grp}"' in exec_c
+    assert "g_settings.skip_postfx" in exec_c and "vk_skip_postfx_enabled() && dbg_cull_active > 0" in exec_c
+
+    print("  -> PASS: p17 (SIGBUS Adreno 61x/atomic64 probe, 30 FPS pacer, thermal all-core fallback, REQ_FLUSH coalescing/2048 batch, KTGL post-FX culling) verified.")
+
+_verify_p17_sigbus_pacer_thermal_batch_postfx()

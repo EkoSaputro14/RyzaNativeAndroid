@@ -64,6 +64,8 @@ typedef struct {
     int present_mode;     // Vulkan present mode (0 = Immediate, 1 = Mailbox [default], 2 = FIFO / VSync)
     int fp16_shaders;     // SPIR-V fragment shader FP16 RelaxedPrecision (0 = Off / FP32, 1 = On / FP16 [default])
     int async_spin_us;    // vk-render / async wait spin-wait window in microseconds before sleeping (default 250; 0 = off)
+    int target_fps;       // Monotonic frame pacer / SurfaceFlinger hint target (0 = uncapped, 20, 30, 45, 60; default 30)
+    int skip_postfx;      // KTGL heavy post-FX pass culling (0 = off, 1 = skip RLR/MRLR/GaussianBlur/TerrainShadow)
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
     char driver_env[256]; // the driver's own switches, NAME=value separated by spaces (Turnip's FD_DEV_FEATURES, TU_DEBUG;

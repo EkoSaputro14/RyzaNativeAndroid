@@ -1660,6 +1660,19 @@ static void prelaunch_tab(float sc) {
                 g_settings.fp16_shaders = fp16_b ? 1 : 0;
                 changed = true;
             }
+            bool spfx_b = g_settings.skip_postfx != 0;
+            if (ImGui::Checkbox(tr("Skip heavy KTGL post-FX (RLR, Blur, TerrainShadow)"), &spfx_b)) {
+                g_settings.skip_postfx = spfx_b ? 1 : 0;
+                changed = true;
+            }
+            ImGui::PushID("targetfps_pre");
+            ImGui::Text("%s", tr("Target FPS pacer (target_fps)"));
+            changed |= ImGui::RadioButton(tr("Uncapped (0)"), &g_settings.target_fps, 0);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("30 fps"), &g_settings.target_fps, 30);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("60 fps"), &g_settings.target_fps, 60);
+            ImGui::PopID();
         }
         ImGui::Spacing();
         ImGui::Text("%s", tr("Driver variables"));  // (#227: g_settings.driver_env, vulkan/device.c)
