@@ -1726,7 +1726,7 @@ const char *renderer_stats(void) {
         for (int i = 0; i < CMD_COUNT; i++) if (op_counts[i]) LOG(" %d:%llu", i, (unsigned long long)op_counts[i]);
         LOG("\n");
     }
-    if (stat_postfx_culled && dumps <= 3) LOG("[vk] KTGL post-FX culled draws: %llu\n", (unsigned long long)stat_postfx_culled);
+    if (stat_postfx_culled) LOG("[vk] KTGL post-FX culled draws: %llu\n", (unsigned long long)stat_postfx_culled);
     snprintf(stats_text, sizeof stats_text,
              "%llu draws, %llu skipped, %llu passes, %llu dispatches (%llu chained), %llu flushes, wait %.0fms, compile %d (waited %.0fms), fbcopy %llu (read %llu, breaks %llu), upload %.1fMB, binds %llu pipe %llu sets",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
@@ -9641,6 +9641,25 @@ static inline bool vk_skip_postfx_enabled(void) {
     return false;
 #endif
 }
+static inline bool vk_should_cull_postfx_draw(void) {
+    if (!vk_skip_postfx_enabled()) return false;
+    if (dbg_cull_active > 0) return true;
+    NvnProgram *vnp = st_program(0);
+    NvnProgram *fnp = st_program(1);
+    if ((vnp && vnp->is_heavy_postfx) || (fnp && fnp->is_heavy_postfx)) return true;
+    NvnShaderStage *fss = fnp ? &fnp->stages[1] : NULL;
+    if (fss && fss->code_addr && nvn_is_heavy_postfx_code(fss->code_addr)) return true;
+    return false;
+}
+static inline bool vk_should_cull_postfx_compute(void) {
+    if (!vk_skip_postfx_enabled()) return false;
+    if (dbg_cull_active > 0) return true;
+    NvnProgram *cnp = st_program(5);
+    if (cnp && cnp->is_heavy_postfx) return true;
+    NvnShaderStage *css = cnp ? &cnp->stages[5] : NULL;
+    if (css && css->code_addr && nvn_is_heavy_postfx_code(css->code_addr)) return true;
+    return false;
+}
 void vk_debug_groups_reset(void) {
     dbg_depth = 0;
     dbg_cull_active = 0;
@@ -9885,12 +9904,14 @@ static void exec_list(uint64_t handle, int depth) {
                 }
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DISPATCH:
+            if (vk_should_cull_postfx_compute()) { stat_postfx_culled++; stat_skipped++; break; }
+            dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
         case CMD_DRAW_ARRAYS:
-            if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
+            if (vk_should_cull_postfx_draw()) { stat_postfx_culled++; stat_skipped++; break; }
             draw(r, false); split_long_pass(); break;
         case CMD_DRAW_ELEMENTS:
-            if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
+            if (vk_should_cull_postfx_draw()) { stat_postfx_culled++; stat_skipped++; break; }
             draw(r, true); split_long_pass(); break;
         case CMD_UPDATE_UNIFORM_BUFFER: {
             uint64_t dst = r->x[0] + r->x[2], sz = r->x[3];

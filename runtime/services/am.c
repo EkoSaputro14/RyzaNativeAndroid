@@ -232,6 +232,17 @@ SERVICE("apm", apm) {
 }
 
 // ------------------------------------------------------------------ lm (guest log output)
+extern void nvn_set_pending_heavy_postfx(int active);
+static bool is_heavy_ktgl_shader_res(const char *line) {
+    const char *sh = strstr(line, "RES:Shader/");
+    if (!sh) return false;
+    return strstr(sh, "/RLR.g1s") || strstr(sh, "/MRLR.g1s") ||
+           strstr(sh, "/GaussianBlurX.g1s") || strstr(sh, "/GaussianBlurY.g1s") ||
+           strstr(sh, "/RenderTerrainShadowMap.g1s") ||
+           strstr(sh, "/RLR.") || strstr(sh, "/MRLR.") ||
+           strstr(sh, "/GaussianBlurX.") || strstr(sh, "/GaussianBlurY.") ||
+           strstr(sh, "/RenderTerrainShadowMap.");
+}
 static void lm_logger(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s; (void)resp;
     if (req->cmd != 0) return;
@@ -254,7 +265,19 @@ static void lm_logger(Service *s, IpcReq *req, IpcResp *resp) {
         }
         p += len;
     }
-    if (n) LOG("[lm] %s\n", line);
+    if (n) {
+        if (strstr(line, "RES:Shader/")) {
+            int heavy = is_heavy_ktgl_shader_res(line) ? 1 : 0;
+            nvn_set_pending_heavy_postfx(heavy);
+            if (heavy) {
+                static int logged_heavy = 0;
+                if (logged_heavy++ < 32) LOG("[lm] tagged heavy KTGL post-FX shader: %s\n", line);
+            }
+        } else if (strstr(line, "requestNewResource=")) {
+            nvn_set_pending_heavy_postfx(0);
+        }
+        LOG("[lm] %s\n", line);
+    }
 }
 
 SERVICE("lm", lm) {

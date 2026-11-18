@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
+    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
+    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
+    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 49" in gradle_kts and "0.3.2-forensic-p17" in gradle_kts
+    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1193,8 +1193,54 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     assert "record_push_debug_group" in cmdbuf_c
     for grp in ("RLR", "MRLR", "GaussianBlurX", "GaussianBlurY", "RenderTerrainShadowMap"):
         assert f'"{grp}"' in exec_c
-    assert "g_settings.skip_postfx" in exec_c and "vk_skip_postfx_enabled() && dbg_cull_active > 0" in exec_c
+    assert "g_settings.skip_postfx" in exec_c and "vk_should_cull_postfx_draw()" in exec_c
 
     print("  -> PASS: p17 (SIGBUS Adreno 61x/atomic64 probe, 30 FPS pacer, thermal all-core fallback, REQ_FLUSH coalescing/2048 batch, KTGL post-FX culling) verified.")
 
 _verify_p17_sigbus_pacer_thermal_batch_postfx()
+
+def _verify_p18_ktgl_shader_postfx_async_sync_halfrate():
+    from pathlib import Path
+    print("[TEST] Verifying p18 KTGL Release Shader Culling, Mid-Frame Sync Overlap & Half-Rate VSync Tick...")
+    repo_root = Path(__file__).resolve().parents[2]
+    am_c = (repo_root / "runtime" / "services" / "am.c").read_text(encoding="utf-8")
+    nvn_h = (repo_root / "runtime" / "nvn" / "nvn.h").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    vi_c = (repo_root / "runtime" / "hle" / "vi.c").read_text(encoding="utf-8")
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+
+    # Version bump
+    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
+
+    # 1. Release KTGL shader tracking via lm:ILogger -> NvnProgram + code_addr -> exec.c draw/dispatch culling
+    assert "RES:Shader/" in am_c and "nvn_set_pending_heavy_postfx" in am_c
+    for grp in ("RLR", "MRLR", "GaussianBlurX", "GaussianBlurY", "RenderTerrainShadowMap"):
+        assert grp in am_c
+    assert "uint8_t is_heavy_postfx;" in nvn_h
+    assert "nvn_register_heavy_postfx_code" in objects_c and "nvn_is_heavy_postfx_code" in objects_c
+    assert "p->is_heavy_postfx" in objects_c
+    assert "vk_should_cull_postfx_draw()" in exec_c and "vk_should_cull_postfx_compute()" in exec_c
+
+    # 2. Mid-frame nvnSyncWait / nvnQueueFinish async overlap & timeout_ns==0 non-blocking poll
+    assert "uint64_t vk_async_done_id(void)" in async_c
+    assert "g_last_present_fence_lseq" in objects_c and "g_lag_prev_newest_seq" in objects_c
+    assert "if (A(1) == 0 && !flush && !whole)" in objects_c
+    assert "is_midframe_sync" in objects_c and "skip_async_stall" in objects_c
+    assert "vk_last_writeback_seq()" in objects_c
+
+    # 3. half_rate_tick (30 Hz vsync tick) across settings, UI & vi.c
+    assert "int half_rate_tick;" in settings_h
+    assert ".half_rate_tick = 0" in settings_c and '"half_rate_tick"' in settings_c
+    assert "g_settings.half_rate_tick" in menu_mm and "g_settings.half_rate_tick" in overlay_mm
+    assert "g_settings.half_rate_tick" in vi_c and "33333333ull" in vi_c
+
+    print("  -> PASS: p18 (KTGL shader culling via lm:ILogger, mid-frame sync overlap, and half_rate_tick 30 Hz vsync) verified.")
+
+
+_verify_p18_ktgl_shader_postfx_async_sync_halfrate()

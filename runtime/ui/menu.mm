@@ -777,6 +777,15 @@ static void tab_display(void) {
             settings_save();
         }
     }
+    {
+        bool hrt_on = g_settings.half_rate_tick != 0;
+        if (opt_toggle("Half-rate tick (30 Hz vsync)", &hrt_on, false,
+                       "Signals display vsync events at 30 Hz (every second vsync) instead of 60 Hz, reducing main-thread update "
+                       "CPU load on mid-range SoCs when target_fps is 30. Applies at once.")) {
+            g_settings.half_rate_tick = hrt_on ? 1 : 0;
+            settings_save();
+        }
+    }
     opt_toggle("Native game code (experimental)", &g_settings.native_code, false,
                "Runs the game's own code directly on the phone's CPU instead of the game code built at setup: no build "
                "needed. An experiment - report what goes wrong. Applies the next time the game starts.");

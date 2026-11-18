@@ -389,6 +389,10 @@ bool vk_async_queue_idle(void) {
     return idle;
 }
 
+uint64_t vk_async_done_id(void) {
+    return __atomic_load_n(&q_done, __ATOMIC_ACQUIRE);
+}
+
 // Flush only if target_seq lives inside the currently-open (unsubmitted) command buffer.
 void vk_async_flush_if_needed(uint64_t target_seq) {
     if (!target_seq || target_seq <= vk_submitted_seq()) return;

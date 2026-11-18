@@ -1665,6 +1665,11 @@ static void prelaunch_tab(float sc) {
                 g_settings.skip_postfx = spfx_b ? 1 : 0;
                 changed = true;
             }
+            bool hrt_b = g_settings.half_rate_tick != 0;
+            if (ImGui::Checkbox(tr("Half-rate update tick (30 Hz vsync)"), &hrt_b)) {
+                g_settings.half_rate_tick = hrt_b ? 1 : 0;
+                changed = true;
+            }
             ImGui::PushID("targetfps_pre");
             ImGui::Text("%s", tr("Target FPS pacer (target_fps)"));
             changed |= ImGui::RadioButton(tr("Uncapped (0)"), &g_settings.target_fps, 0);

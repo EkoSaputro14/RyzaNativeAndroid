@@ -4,6 +4,7 @@
 
 #include "../hle.h"
 #include "../kernel.h"
+#include "../settings.h"
 
 static uint32_t vsync_r, vsync_w;
 static KEvent *vsync_event;
@@ -21,15 +22,20 @@ static void *vsync_thread(void *arg) {
     plat_thread_realtime(period);
     uint64_t next = plat_now_ns();
     for (;;) {
-        next += period;
+        bool half_rate = false;
+#ifdef __ANDROID__
+        half_rate = (g_settings.half_rate_tick != 0);
+#endif
+        uint64_t step_period = half_rate ? 33333333ull : period;
+        next += step_period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();
-        if (now > next + period * 3) {
+        if (now > next + step_period * 3) {
             static int warned;
             if (warned++ < 20) LOG("[vi] vsync timer late by %llums (host throttling?)\n", (unsigned long long)((now - next) / 1000000));
             next = now;  // don't burst-signal to catch up
         }
-        __atomic_add_fetch(&g_vsync_count, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_vsync_count, half_rate ? 2ull : 1ull, __ATOMIC_RELAXED);
         pthread_mutex_lock(&g_klock);
         kernel_signal(vsync_event);
         pthread_mutex_unlock(&g_klock);

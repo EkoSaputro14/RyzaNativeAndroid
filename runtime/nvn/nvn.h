@@ -89,6 +89,7 @@ typedef struct NvnProgram {
     NvnShaderStage stages[6];
     uint32_t stage_mask;
     void *backend;
+    uint8_t is_heavy_postfx;
 } NvnProgram;
 
 typedef struct NvnWindow {
@@ -162,3 +163,8 @@ void backend_present(NvnTexture *tex);            // show a texture in the windo
 bool backend_vsync_offset(uint64_t t, uint64_t grid, int64_t *off, uint64_t *period);
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
+
+void nvn_set_pending_heavy_postfx(int active);
+int nvn_get_pending_heavy_postfx(void);
+void nvn_register_heavy_postfx_code(uint64_t code_addr);
+bool nvn_is_heavy_postfx_code(uint64_t code_addr);

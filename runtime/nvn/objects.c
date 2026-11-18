@@ -299,6 +299,9 @@ void vk_async_drain(void);
 bool vk_has_pending_commands(void);
 bool vk_async_queue_idle(void);
 void vk_async_flush_if_needed(uint64_t target_seq);
+uint64_t vk_async_done_id(void);
+uint64_t vk_last_writeback_seq(void);
+bool vk_gmem_placed(void);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
 int vk_async_render_tid(void);
@@ -312,6 +315,9 @@ void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
 void vk_sync_wait_enter(void);
 void vk_sync_wait_leave(void);
+static _Atomic uint64_t g_last_present_fence_lseq;
+static _Atomic uint64_t g_lag_prev_newest_seq;
+
 NVN(nvnQueueFinish) {
     if (!vk_has_pending_commands() && (!vk_async_on() || vk_async_queue_idle())) {
         uint64_t sub_seq = vk_submitted_seq();
@@ -321,6 +327,32 @@ NVN(nvnQueueFinish) {
     vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
+    static int qf_whole = -1;
+    if (qf_whole < 0) qf_whole = (getenv("LARECOMP_SYNC_ALL") || getenv("LARECOMP_SYNC_FLUSH")) ? 1 : 0;
+    uint64_t wb_seq = vk_last_writeback_seq();
+    uint64_t done_seq = vk_completed_seq();
+    bool need_wb = (wb_seq > done_seq);
+    if (vk_async_on() && g_settings.sync_lag >= 1 && !qf_whole && frame_id > 60 && !need_wb && (!vk_gmem_placed() || g_is_ryza)) {
+        uint64_t prev_seq = __atomic_load_n(&g_lag_prev_newest_seq, __ATOMIC_RELAXED);
+        uint64_t t1 = plat_now_ns();
+        if (prev_seq > done_seq) {
+            kernel_blocking_begin();
+            renderer_wait_seq(prev_seq);
+            kernel_blocking_end();
+        }
+        uint64_t t_end = plat_now_ns();
+        vk_sync_wait_leave();
+        extern void vk_record_nvn_sync_wait(uint64_t ns);
+        uint64_t dt = t_end - t0;
+        vk_record_nvn_sync_wait(dt);
+        stall_record_nvn_sync_call("nvnQueueFinish", frame_id, t0, t1, t_end,
+                                   c ? c->x[30] : 0, -1, 0, prev_seq, vk_submitted_seq(), vk_completed_seq());
+        if (dt >= 5000000ull) {
+            stall_record_wait_event(frame_id, t0, t_end, "nvn", "nvnQueueFinish_lag",
+                                    vk_async_render_tid(), "vk-render", NULL);
+        }
+        return;
+    }
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
     if (vk_async_on()) vk_async_drain();  // (the render thread's translation first: vulkan/async.c)
     uint64_t t1 = plat_now_ns();
@@ -382,7 +414,8 @@ NVN(nvnSyncFinalize) { free(HOST(NvnSync, A(0))); SET_HOST(A(0), 0); }
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
-    if (!sync_of(A(0))) { RET(0); return; }
+    NvnSync *so_init = sync_of(A(0));
+    if (!so_init) { RET(0); return; }
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("LARECOMP_SYNC_FLUSH") ? 1 : 0;
@@ -390,45 +423,20 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
 #ifdef __ANDROID__
+    if (A(1) == 0 && !flush && !whole) {
+        bool ready = true;
+        if (vk_async_on() && so_init->lseq > vk_async_done_id()) ready = false;
+        if (ready && so_init->seq && vk_completed_seq() < so_init->seq) ready = false;
+        RET(ready ? 0 : 2);
+        return;
+    }
     uint64_t t0 = plat_now_ns();
     vk_sync_wait_enter();
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (vulkan/exec.c: LARECOMP_FRAME_TIMELINE)
-    vk_tl("game: SyncWait begin (fence id, submission)", sync_of(A(0))->lseq, sync_of(A(0))->seq);
-    kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
-    if (vk_async_on()) {  // the render thread's translation of the fence first (vulkan/async.c)
-        if (flush || whole) vk_async_drain();
-        else vk_async_wait_id(sync_of(A(0))->lseq);
-    }
-    uint64_t t1 = plat_now_ns();
-#endif
-#ifdef __ANDROID__
-    // Sync lag (MacNativeGames PR #680, for TOTK): every frame the game waits for the fence it placed with the frame it
-    // has just sent, so its next frame never overlaps the GPU's work on this one (~2.7 ms a frame of an idle GPU while
-    // it records, LARECOMP_FRAME_TIMELINE). For that newest fence the wait goes to the GPU's end of the previous frame's
-    // newest fence instead - one frame of lag at most. Its translation is waited for above (vk_async_wait_id): every copy
-    // of the frame's constants and textures is made before the game writes them again, and the lists were copied when
-    // sent (vulkan/async.c snap_list). What the GPU reads in place (vertices in the heap) or writes for the CPU
-    // (readbacks, queries) may be a frame apart - and in play they were: the water turned white and the cliffs showed
-    // stretched "curtains" (2026-10-26, POCO F7 Ultra; BOTW reads GPU results back right after this wait - the water's
-    // colour from a tiny render target, MacNativeGames PR #239). The water came from write-backs dropped when their slots
-    // were full (the curtains show without the lag too, README); since they wait for the GPU instead (vulkan wb_queue)
-    // the water is right with the lag (Turnip V38, 2026-10-26: in-run A/B 46.6 -> 53.6 fps on 1.8.2's Great Plateau).
-    // But the CPU reads GPU results right after this wait, and with the lag they are a frame old: Link's legs sank into
-    // the ground standing still (2026-10-27, 1.9.0; not with the lag off). Every write-back the CPU reads - the terrain
-    // heights, the 1x1 linear targets, the depth bounds, the exposure - is copied in the frame's last one or two of ~10
-    // submissions (LARECOMP_LOG_WB_FRAME), so waiting for them leaves nothing to overlap: 38.1 -> 37.8 fps with that
-    // guard, 42.3 -> 44.4 without (same run each, POCO, 1.9.0's Plateau). So the lag is the player's choice: Video >
-    // Sync lag (settings.sync_lag, on by default: a few more fps, the legs may sink).
-    // LARECOMP_SYNC_LAG=<n> (measurements, over the setting): 0 off, 1 on, 2 the wait also covers the newest frame's last
-    // store to global memory (vk_last_gmem_store_seq), 3 the wait covers its write-backs (vk_last_writeback_seq);
-    // LARECOMP_AB=<frames>:synclag alternates.
+    vk_tl("game: SyncWait begin (fence id, submission)", so_init->lseq, so_init->seq);
     static int env_lag = -2;
     if (env_lag == -2) env_lag = getenv("LARECOMP_SYNC_LAG") ? atoi(getenv("LARECOMP_SYNC_LAG")) : -1;
     int lag = env_lag >= 0 ? env_lag : g_settings.sync_lag;
-    // Only once the world has been on screen for a while (LAG_SETTLE frames, the pause menu and map counting): with the
-    // lag on from the start, some ponds stayed white for the whole session, and turned on later in play they were right
-    // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
-    // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
     if (lag > 0 && env_lag < 0 && g_game_version >= 182) {
         enum { LAG_SETTLE = 300 };
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
@@ -442,39 +450,49 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     extern int vk_ab(const char *what);
     int ab = vk_ab("synclag");
     bool lag_now = vk_async_on() && !flush && !whole && (ab >= 0 ? ab == 1 : lag > 0);
+    extern uint64_t renderer_present_count(void);
+    uint64_t cur_pf = renderer_present_count();
+    uint64_t wb = vk_last_writeback_seq();
+    bool need_wb = (wb > vk_completed_seq());
+    uint64_t pres_lseq = __atomic_load_n(&g_last_present_fence_lseq, __ATOMIC_RELAXED);
+    bool is_midframe_sync = (so_init->frame >= cur_pf) ||
+                            (so_init->lseq && so_init->lseq != pres_lseq && so_init->frame + 1 >= cur_pf);
+    bool skip_async_stall = lag_now && is_midframe_sync && !need_wb && cur_pf > 60;
+    kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
+    if (vk_async_on() && !skip_async_stall) {  // the render thread's translation of the fence first (vulkan/async.c)
+        if (flush || whole) vk_async_drain();
+        else vk_async_wait_id(so_init->lseq);
+    }
+    uint64_t t1 = plat_now_ns();
     static uint64_t prev_newest_seq;  // (kept with the lag off too: turned on, it waits one frame back, not more)
     static uint64_t prev2_newest_seq;
     static uint64_t lag_cur_frame = ~0ull, lag_frame_max_seq;
-    extern uint64_t renderer_present_count(void);
-    uint64_t cur_pf = renderer_present_count();
-    uint64_t cur_fseq = sync_of(A(0))->seq;
+    uint64_t cur_fseq = so_init->seq;
     if (cur_pf != lag_cur_frame) {
         if (lag_cur_frame != ~0ull && lag_frame_max_seq > prev_newest_seq) {
             prev2_newest_seq = prev_newest_seq;
             prev_newest_seq = lag_frame_max_seq;
+            __atomic_store_n(&g_lag_prev_newest_seq, prev_newest_seq, __ATOMIC_RELAXED);
         }
         lag_cur_frame = cur_pf;
         lag_frame_max_seq = cur_fseq;
     } else if (cur_fseq > lag_frame_max_seq) {
         lag_frame_max_seq = cur_fseq;
     }
-    uint64_t newest_prev = (lag >= 2 && prev2_newest_seq) ? prev2_newest_seq : prev_newest_seq;
-    bool can_lag = vk_async_on() && (cur_fseq >= newest_prev || sync_of(A(0))->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED));
+    uint64_t newest_prev = ((lag >= 2 || (so_init->frame < cur_pf && cur_pf > 60)) && prev2_newest_seq) ? prev2_newest_seq : prev_newest_seq;
+    bool can_lag = vk_async_on() && (skip_async_stall || cur_fseq >= newest_prev || so_init->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED));
     if (lag_now && can_lag) {
-        uint64_t seq = cur_fseq, target = newest_prev < seq ? newest_prev : seq;
-        // (3: the newest frame's write-backs waited for - they land once their submission is done, vulkan/exec.c wb_apply)
-        extern uint64_t vk_last_writeback_seq(void);
-        static uint64_t n, wb_n, wb_pos, st_n, st_pos;  // (LARECOMP_LOG_SYNC_LAG: how often, how far into the frame)
+        uint64_t seq = cur_fseq ? cur_fseq : newest_prev;
+        uint64_t target = newest_prev < seq ? newest_prev : seq;
+        static uint64_t n_lag, wb_n, wb_pos, st_n, st_pos;  // (LARECOMP_LOG_SYNC_LAG: how often, how far into the frame)
         static int log = -1;
         if (log < 0) log = getenv("LARECOMP_LOG_SYNC_LAG") != NULL;
-        n++;
-        uint64_t wb = vk_last_writeback_seq();
-        {   // (LARECOMP_LOG_WB_FRAME=<n>: the newest frame's submissions, beside vulkan/exec.c's [wb-frame] lines)
+        n_lag++;
+        {
             static int every = -1;
             if (every < 0) every = getenv("LARECOMP_LOG_WB_FRAME") ? atoi(getenv("LARECOMP_LOG_WB_FRAME")) : 0;
-            extern uint64_t renderer_present_count(void);
-            if (every > 0 && renderer_present_count() % (uint64_t)every == 0)
-                LOG("[synclag-frame] %llu: submissions %llu..%llu\n", (unsigned long long)renderer_present_count(),
+            if (every > 0 && cur_pf % (uint64_t)every == 0)
+                LOG("[synclag-frame] %llu: submissions %llu..%llu\n", (unsigned long long)cur_pf,
                     (unsigned long long)newest_prev, (unsigned long long)seq);
         }
         if (wb > target && lag == 3) {
@@ -491,14 +509,16 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
                 target = st < seq ? st : seq;
             }
         }
-        if (log && n % 120 == 0) {
+        if (log && n_lag % 120 == 0) {
             LOG("[synclag] of 120 frames: %llu waited for a write-back (at %llu%% of the newest frame's submissions), %llu for "
                 "a store (at %llu%%)\n", (unsigned long long)wb_n, (unsigned long long)(wb_n ? wb_pos / wb_n : 0),
                 (unsigned long long)st_n, (unsigned long long)(st_n ? st_pos / st_n : 0));
             wb_n = wb_pos = st_n = st_pos = 0;
         }
-        vk_async_flush_if_needed(target);
-        renderer_wait_seq(target);
+        if (target > vk_completed_seq()) {
+            vk_async_flush_if_needed(target);
+            renderer_wait_seq(target);
+        }
     } else
 #endif
     if (flush) renderer_flush();
@@ -506,9 +526,13 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     else {
         uint64_t sseq = sync_of(A(0))->seq;
 #ifdef __ANDROID__
-        vk_async_flush_if_needed(sseq);
-#endif
+        if (sseq > vk_completed_seq()) {
+            vk_async_flush_if_needed(sseq);
+            renderer_wait_seq(sseq);
+        }
+#else
         renderer_wait_seq(sseq);  // only the submission that holds this fence
+#endif
     }
 #ifdef __ANDROID__
     kernel_blocking_end();
@@ -1580,6 +1604,41 @@ NvnDescPool *nvn_find_pool(NvnDescPool **reg, uint64_t guest_pool) {
 }
 
 // ================================================================== programs
+static __thread int tls_pending_heavy_postfx = 0;
+enum { HEAVY_POSTFX_CODE_CAP = 512 };
+static uint64_t g_heavy_postfx_codes[HEAVY_POSTFX_CODE_CAP];
+static int g_heavy_postfx_code_count = 0;
+static pthread_mutex_t g_heavy_postfx_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void nvn_set_pending_heavy_postfx(int active) {
+    tls_pending_heavy_postfx = active ? 1 : 0;
+}
+int nvn_get_pending_heavy_postfx(void) {
+    return tls_pending_heavy_postfx;
+}
+void nvn_register_heavy_postfx_code(uint64_t code_addr) {
+    if (!code_addr) return;
+    pthread_mutex_lock(&g_heavy_postfx_lock);
+    for (int i = 0; i < g_heavy_postfx_code_count; i++) {
+        if (g_heavy_postfx_codes[i] == code_addr) {
+            pthread_mutex_unlock(&g_heavy_postfx_lock);
+            return;
+        }
+    }
+    if (g_heavy_postfx_code_count < HEAVY_POSTFX_CODE_CAP) {
+        g_heavy_postfx_codes[g_heavy_postfx_code_count++] = code_addr;
+    }
+    pthread_mutex_unlock(&g_heavy_postfx_lock);
+}
+bool nvn_is_heavy_postfx_code(uint64_t code_addr) {
+    if (!code_addr) return false;
+    int cnt = __atomic_load_n(&g_heavy_postfx_code_count, __ATOMIC_RELAXED);
+    for (int i = 0; i < cnt && i < HEAVY_POSTFX_CODE_CAP; i++) {
+        if (g_heavy_postfx_codes[i] == code_addr) return true;
+    }
+    return false;
+}
+
 NVN(nvnProgramInitialize) { SET_HOST(A(0), calloc(1, sizeof(NvnProgram))); RET(1); }
 NVN(nvnProgramFinalize) { free(HOST(NvnProgram, A(0))); SET_HOST(A(0), 0); }
 NVN(nvnProgramSetDebugLabel) { (void)c; }
@@ -1593,6 +1652,7 @@ static void set_shaders(Cpu *c, int stride) {
     memset(p->stages, 0, sizeof p->stages);
     p->stage_mask = 0;
     p->backend = NULL;
+    p->is_heavy_postfx = (uint8_t)(nvn_get_pending_heavy_postfx() ? 1 : 0);
     if (!data || n <= 0 || n > 6) { RET(1); return; }
     uintptr_t data_addr = (uintptr_t)data;
     if (data_addr < GUEST_LO || data_addr + (size_t)n * (size_t)stride > GUEST_HI) { RET(1); return; }
@@ -1628,6 +1688,18 @@ static void set_shaders(Cpu *c, int stride) {
         p->stages[stage].const_offset = ctrl_ok ? *(const uint32_t *)(control + 0x700) : 0;
         p->stages[stage].const_size = ctrl_ok ? *(const uint32_t *)(control + 0x6FC) : 0;
         p->stage_mask |= 1u << stage;
+        if (p->is_heavy_postfx && (stage == 1 || stage == 5)) {
+            nvn_register_heavy_postfx_code(code);
+        } else if ((stage == 1 || stage == 5) && nvn_is_heavy_postfx_code(code)) {
+            p->is_heavy_postfx = 1;
+        }
+        if (p->is_heavy_postfx) {
+            static int logged_tag = 0;
+            if (logged_tag++ < 32) {
+                LOG("[nvn] heavy post-FX shader tagged: prog=%p stage=%u code=%llx\n",
+                    (void *)p, stage, (unsigned long long)code);
+            }
+        }
         LOG("[nvn] set_shaders[%d/%d]: prog=%p stage=%u code=%llx h0=%08x sph0=%08x mask=%#x\n",
             i, n, (void *)p, stage, (unsigned long long)code, h0, sph0, p->stage_mask);
     }
@@ -1750,6 +1822,9 @@ NVN(nvnQueueAcquireTexture) {
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     if (!w) return;
+#ifdef __ANDROID__
+    __atomic_store_n(&g_last_present_fence_lseq, __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+#endif
     int i = (int)A(2);
     static uint64_t s_frame_cnt = 0;
     static uint64_t s_last_frame_cnt = 0;

@@ -75,6 +75,7 @@ Settings g_settings = {
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
     .target_fps = 30,          // (30 fps pacer + SurfaceFlinger refresh hint default on Android)
     .skip_postfx = 0,          // (0 = all post-FX active, 1 = cull heavy KTGL post-FX passes)
+    .half_rate_tick = 0,       // (0 = 60 Hz vsync default, 1 = 30 Hz every second vsync)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -239,6 +240,7 @@ void settings_reset_defaults(void) {
     g_settings.async_spin_us = d->async_spin_us;
     g_settings.target_fps = d->target_fps;
     g_settings.skip_postfx = d->skip_postfx;
+    g_settings.half_rate_tick = d->half_rate_tick;
     g_settings.native_code = d->native_code;
     g_settings.files_in_place = d->files_in_place;
 #endif
@@ -332,6 +334,9 @@ void settings_load(void) {
         else if (!strcmp(key, "skip_postfx")) {
             g_settings.skip_postfx = (!strcmp(val, "1") || !strcmp(val, "on") || !strcmp(val, "true")) ? 1 : 0;
         }
+        else if (!strcmp(key, "half_rate_tick")) {
+            g_settings.half_rate_tick = (!strcmp(val, "1") || !strcmp(val, "on") || !strcmp(val, "true")) ? 1 : 0;
+        }
         else if (!strcmp(key, "touch_scale")) g_settings.touch_scale = (float)atof(val);
         else if (!strcmp(key, "touch_opacity")) g_settings.touch_opacity = (float)atof(val);
         else if (!strcmp(key, "touch_drag_camera")) g_settings.touch_drag_camera = atoi(val) != 0;
@@ -424,10 +429,10 @@ void settings_load(void) {
     if (g_settings.shadow_scale <= 0.0f) g_settings.shadow_scale = 1.0f;
 #endif
     extern int g_exec_mode;
-    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, exec_mode=%d)\n",
+    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, half_rate_tick=%d, exec_mode=%d)\n",
         SETTINGS_FILE, g_settings.sync_lag, g_settings.heap_mb, g_settings.swapchain_images,
         g_settings.present_mode, g_settings.upscaler, g_settings.render_scale,
-        g_settings.shadow_scale, g_settings.fp16_shaders, g_settings.target_fps, g_settings.skip_postfx, g_exec_mode);
+        g_settings.shadow_scale, g_settings.fp16_shaders, g_settings.target_fps, g_settings.skip_postfx, g_settings.half_rate_tick, g_exec_mode);
 }
 
 void settings_save(void) {
@@ -467,8 +472,8 @@ void settings_save(void) {
     fprintf(f, "heap_mb = %d\nswapchain_images = %d\npresent_mode = %d\nfp16_shaders = %d\nasync_spin_us = %d\n",
             g_settings.heap_mb, g_settings.swapchain_images, g_settings.present_mode,
             g_settings.fp16_shaders, g_settings.async_spin_us);
-    fprintf(f, "# Pacer & post-FX culling: target_fps (0=uncapped, 20, 30, 45, 60; default 30), skip_postfx (0=off, 1=skip heavy KTGL post-FX)\n");
-    fprintf(f, "target_fps = %d\nskip_postfx = %d\n", g_settings.target_fps, g_settings.skip_postfx);
+    fprintf(f, "# Pacer, half-rate tick & post-FX culling: target_fps (0=uncapped, 20, 30, 45, 60; default 30), skip_postfx (0=off, 1=skip heavy KTGL post-FX), half_rate_tick (0=60Hz, 1=30Hz)\n");
+    fprintf(f, "target_fps = %d\nskip_postfx = %d\nhalf_rate_tick = %d\n", g_settings.target_fps, g_settings.skip_postfx, g_settings.half_rate_tick);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,
