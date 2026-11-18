@@ -49,7 +49,7 @@ int vk_ab(const char *what);
 #define AB(what) (ab_n == 0 ? -1 : vk_ab(what))
 static uint64_t hash_words(uint64_t h, const void *p, size_t n);
 
-static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_draws, stat_skipped, stat_postfx_culled, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_dchained;  // (dispatches with no barrier before them: dchain)
 static uint64_t stat_feedback_reads;  // (attachments sampled as they are: only read, resolve_feedback)
 static uint64_t stat_inplace_breaks;  // (passes ended so a draw reads a target the pass wrote: resolve_feedback)
@@ -1843,7 +1843,7 @@ const char *renderer_stats(void) {
         s_iv_frames = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
     }
-    stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_dchained = stat_flushes = stat_wait_ns = 0;
+    stat_draws = stat_skipped = stat_postfx_culled = stat_passes = stat_dispatches = stat_dchained = stat_flushes = stat_wait_ns = 0;
     return stats_text;
 }
 
@@ -9634,7 +9634,6 @@ static char dbg_stack[DBG_STACK_MAX][64];
 static uint8_t dbg_cull_stack[DBG_STACK_MAX];
 static int dbg_depth = 0;
 static int dbg_cull_active = 0;
-static uint64_t stat_postfx_culled = 0;
 static inline bool vk_skip_postfx_enabled(void) {
 #ifdef __ANDROID__
     return g_settings.skip_postfx != 0;
