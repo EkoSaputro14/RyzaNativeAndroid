@@ -1665,6 +1665,11 @@ static void prelaunch_tab(float sc) {
                 g_settings.skip_postfx = spfx_b ? 1 : 0;
                 changed = true;
             }
+            bool unsw_b = g_settings.gpu_unswizzle != 0;
+            if (ImGui::Checkbox(tr("GPU texture unswizzle (Vulkan compute deswizzle)"), &unsw_b)) {
+                g_settings.gpu_unswizzle = unsw_b ? 1 : 0;
+                changed = true;
+            }
             ImGui::PushID("targetfps_pre");
             ImGui::Text("%s", tr("Target FPS pacer (target_fps)"));
             changed |= ImGui::RadioButton(tr("Uncapped (0)"), &g_settings.target_fps, 0);

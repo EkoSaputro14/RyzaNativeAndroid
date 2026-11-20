@@ -713,15 +713,19 @@ static void create_device(void) {
     g_vk.dyn_render = h13.dynamicRendering && !no_dr;
     if (!g_vk.dyn_render)
         LOG("[vk] no dynamic rendering (%s): classic render passes\n", no_dr ? "switched off" : "the driver lacks it");
-    VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceSubgroupProperties subgroup = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+                                               .pNext = &subgroup};
     VkPhysicalDeviceProperties2 properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-                                              .pNext = driver_props ? &driver : NULL};
+                                              .pNext = driver_props ? (void *)&driver : (void *)&subgroup};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &properties);
     if (!driver_props) snprintf(driver.driverName, sizeof driver.driverName, "unknown");
-    LOG("[vk-cap] gpu %s vendor %#x device %#x api %u.%u.%u driver-id %u name %s info %s\n",
+    g_vk.driver_id = driver_props ? (uint32_t)driver.driverID : 0u;
+    g_vk.subgroup_quad = (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) != 0;
+    LOG("[vk-cap] gpu %s vendor %#x device %#x api %u.%u.%u driver-id %u subgroup-quad %u name %s info %s\n",
         g_vk.props.deviceName, g_vk.props.vendorID, g_vk.props.deviceID, VK_API_VERSION_MAJOR(g_vk.props.apiVersion),
         VK_API_VERSION_MINOR(g_vk.props.apiVersion), VK_API_VERSION_PATCH(g_vk.props.apiVersion),
-        (unsigned)driver.driverID, driver.driverName, driver.driverInfo);
+        (unsigned)driver.driverID, (unsigned)g_vk.subgroup_quad, driver.driverName, driver.driverInfo);
     LOG("[vk-cap] storage16 %u timeline %u mirror-clamp %u scalar %u dynamic-rendering %u sync2 %u demote %u terminate %u maintenance4 %u int64 %u int8 %u storage8 %u uniform-storage8 %u BC %u ASTC %u timestamps %u\n",
         h11.storageBuffer16BitAccess, h12.timelineSemaphore, h12.samplerMirrorClampToEdge, h12.scalarBlockLayout,
         h13.dynamicRendering, h13.synchronization2, h13.shaderDemoteToHelperInvocation, h13.shaderTerminateInvocation,
@@ -2185,14 +2189,41 @@ void ui_window_init(void) {
 SDL_Window *ui_window(void) { return window; }
 
 #ifdef __ANDROID__
+// Standard Khronos VkDriverId numeric values (immune to renamed Turnip/custom driverName strings).
+enum {
+    RYZA_DRIVER_ID_QUALCOMM_PROPRIETARY = 8,
+    RYZA_DRIVER_ID_ARM_PROPRIETARY      = 9,
+    RYZA_DRIVER_ID_MESA_TURNIP          = 18,
+    RYZA_DRIVER_ID_SAMSUNG_PROPRIETARY  = 21,
+    RYZA_DRIVER_ID_MESA_PANVK           = 27,
+};
+
+uint32_t vk_driver_id(void) {
+    if (g_vk.driver_id) return g_vk.driver_id;
+    if (!g_vk.phys) return 0u;
+    VkPhysicalDeviceDriverProperties d = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &d};
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &p);
+    g_vk.driver_id = (uint32_t)d.driverID;
+    return g_vk.driver_id;
+}
+
 // For the performance overlay (ui/perf_overlay.mm): the GPU and its driver, short ("Adreno (TM) 830 - Turnip").
+// Prefers canonical VkDriverId over fragile driverName substring matching.
 const char *vk_gpu_desc(void) {
     static char s[160];
     if (s[0] || !g_vk.phys) return s;
     VkPhysicalDeviceDriverProperties d = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &d};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &p);
-    const char *drv = strstr(d.driverName, "turnip") ? "Turnip" : strstr(d.driverName, "Qualcomm") ? "Qualcomm" : d.driverName;
+    uint32_t id = g_vk.driver_id ? g_vk.driver_id : (uint32_t)d.driverID;
+    const char *drv = NULL;
+    if (id == RYZA_DRIVER_ID_MESA_TURNIP) drv = "Turnip";
+    else if (id == RYZA_DRIVER_ID_QUALCOMM_PROPRIETARY) drv = "Qualcomm";
+    else if (id == RYZA_DRIVER_ID_ARM_PROPRIETARY) drv = "Mali";
+    else if (id == RYZA_DRIVER_ID_MESA_PANVK) drv = "PanVK";
+    else if (id == RYZA_DRIVER_ID_SAMSUNG_PROPRIETARY) drv = "Xclipse";
+    else drv = strstr(d.driverName, "turnip") ? "Turnip" : strstr(d.driverName, "Qualcomm") ? "Qualcomm" : d.driverName;
     snprintf(s, sizeof s, "%s - %s", p.properties.deviceName, drv);
     return s;
 }
@@ -2212,28 +2243,19 @@ const char *vk_driver_desc(void) {
 }
 
 // Qualcomm's own driver (not Turnip): its shader compiler crashed on the structured control flow (vulkan/exec.c)
-bool vk_driver_is_qualcomm(void) {
-    static int q = -1;
-    if (q < 0 && g_vk.phys) {
-        VkPhysicalDeviceDriverProperties d = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-        VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &d};
-        vkGetPhysicalDeviceProperties2(g_vk.phys, &p);
-        q = d.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
-    }
-    return q > 0;
-}
+bool vk_driver_is_qualcomm(void) { return vk_driver_id() == RYZA_DRIVER_ID_QUALCOMM_PROPRIETARY; }
 
 // Mesa's Turnip (Adreno): where reads of a target a pass also writes were tested (exec.c resolve_feedback)
-bool vk_driver_is_turnip(void) {
-    static int t = -1;
-    if (t < 0 && g_vk.phys) {
-        VkPhysicalDeviceDriverProperties d = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-        VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &d};
-        vkGetPhysicalDeviceProperties2(g_vk.phys, &p);
-        t = d.driverID == VK_DRIVER_ID_MESA_TURNIP;
-    }
-    return t > 0;
-}
+bool vk_driver_is_turnip(void) { return vk_driver_id() == RYZA_DRIVER_ID_MESA_TURNIP; }
+
+// ARM Mali proprietary Vulkan driver
+bool vk_driver_is_mali(void) { return vk_driver_id() == RYZA_DRIVER_ID_ARM_PROPRIETARY; }
+
+// Mesa PanVK open-source Mali driver
+bool vk_driver_is_panvk(void) { return vk_driver_id() == RYZA_DRIVER_ID_MESA_PANVK; }
+
+// Samsung Xclipse (RDNA mobile)
+bool vk_driver_is_xclipse(void) { return vk_driver_id() == RYZA_DRIVER_ID_SAMSUNG_PROPRIETARY; }
 #endif
 
 void backend_init(void) {

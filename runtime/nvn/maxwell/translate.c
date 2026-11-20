@@ -36,6 +36,7 @@ bool maxwell_no_switch;
 bool maxwell_no_local_struct;
 bool maxwell_native_half;
 bool maxwell_fast_minmax;
+bool maxwell_quad_butterfly;
 bool maxwell_cb_window;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
@@ -2128,9 +2129,17 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int pd = (int)bits(w, 48, 3);
         if (c->stage == STAGE_VERTEX) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
-        } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
-            static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
-            sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
+        } else if (c->glsl) {  // fragment butterfly masks 0..3 use subgroupQuadSwap* so edge helper lanes stay valid
+            if (maxwell_quad_butterfly && c->stage == STAGE_FRAGMENT && mode == 3 && bits(w, 28, 1) && bits(w, 20, 5) < 4) {
+                unsigned mask = (unsigned)bits(w, 20, 5);
+                if (mask == 0) sprintf(t, "%s", R(a));
+                else if (mask == 1) sprintf(t, "subgroupQuadSwapHorizontal(%s)", R(a));
+                else if (mask == 2) sprintf(t, "subgroupQuadSwapVertical(%s)", R(a));
+                else sprintf(t, "subgroupQuadSwapDiagonal(%s)", R(a));
+            } else {
+                static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
+                sprintf(t, "%s(%s, uint(%s))", fn[mode], R(a), bv);
+            }
             set_reg(c, d, t);
         } else if (mode == 3) {
             bool quad = bits(w, 28, 1) && bits(w, 20, 5) < 4;
@@ -2390,6 +2399,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
     "#extension GL_KHR_shader_subgroup_ballot : enable\n"
     "#extension GL_KHR_shader_subgroup_vote : enable\n"
+    "#extension GL_KHR_shader_subgroup_quad : enable\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"

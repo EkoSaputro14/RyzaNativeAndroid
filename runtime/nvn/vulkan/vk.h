@@ -27,6 +27,12 @@ void vk_device_fault_report(void);
 #ifdef __ANDROID__
 void vk_android_load(void);  // android_driver.c: the Vulkan driver (adrenotools / system) into volk
 const char *vk_driver_rejected(void);  // (the chosen driver package the system's stood in for; "" none)
+uint32_t vk_driver_id(void);
+bool vk_driver_is_turnip(void);
+bool vk_driver_is_qualcomm(void);
+bool vk_driver_is_mali(void);
+bool vk_driver_is_panvk(void);
+bool vk_driver_is_xclipse(void);
 void vk_wait_ready(void);    // device.c: until the device exists (the window's thread makes it)
 #endif
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
@@ -63,6 +69,8 @@ typedef struct {
     uint64_t placed_align;
     bool exec_stats;              // (Android, LARECOMP_SHADER_STATS=1) the compiler's statistics of each pipeline, logged
     bool fp16_supported;          // SPIR-V RelaxedPrecision / shaderFloat16 support for fragment shaders
+    bool subgroup_quad;           // VK_SUBGROUP_FEATURE_QUAD_BIT: safe subgroupQuadSwap* for fragment SHFL.BFLY
+    uint32_t driver_id;           // VkPhysicalDeviceDriverProperties.driverID (cached in create_device)
     uint32_t api;                 // the device's Vulkan version as used: 1.3, or 1.1 / 1.2 with extensions (device.c)
 #endif
     // window

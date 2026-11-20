@@ -777,6 +777,15 @@ static void tab_display(void) {
             settings_save();
         }
     }
+    {
+        bool gpu_unsw_on = g_settings.gpu_unswizzle != 0;
+        if (opt_toggle("GPU texture unswizzle (compute)", &gpu_unsw_on, true,
+                       "Offloads Tegra block-linear texture deswizzling from the CPU render thread to a Vulkan compute shader, "
+                       "eliminating streaming hitches during camera pans and zone transitions. Applies at once.")) {
+            g_settings.gpu_unswizzle = gpu_unsw_on ? 1 : 0;
+            settings_save();
+        }
+    }
     opt_toggle("Native game code (experimental)", &g_settings.native_code, false,
                "Runs the game's own code directly on the phone's CPU instead of the game code built at setup: no build "
                "needed. An experiment - report what goes wrong. Applies the next time the game starts.");

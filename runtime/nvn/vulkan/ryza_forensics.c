@@ -72,7 +72,7 @@ RyzaTestResult g_ryza_test_result = {
 #define RYZA_VERSION_CODE "49"
 #endif
 #ifndef RYZA_VERSION_NAME
-#define RYZA_VERSION_NAME "0.3.2-forensic-p19"
+#define RYZA_VERSION_NAME "0.3.2-forensic-p20"
 #endif
 #ifndef RYZA_BUILD_VARIANT
 #define RYZA_BUILD_VARIANT "precomputed-render-pipeline"

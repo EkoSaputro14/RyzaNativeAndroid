@@ -3117,6 +3117,7 @@ static void translate_program(void *arg) {
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
+    maxwell_quad_butterfly = g_vk.subgroup_quad && !getenv("LARECOMP_NO_QUAD_BUTTERFLY");
     maxwell_cb_window = cbwin_wanted();
 #endif
     p->vi = maxwell_translate_bounded((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey);
@@ -3872,10 +3873,56 @@ static void build_pipeline(void *arg) {
     }
 #endif
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+#ifdef __ANDROID__
+    // Safe graphics pipeline fallback: if compilation fails while FP16 RelaxedPrecision is enabled,
+    // retry once with an FP32 fragment shader before giving up.
+    if (r != VK_SUCCESS && g_settings.fp16_shaders != 0 && k->prog->fi && k->prog->fi->msl) {
+        size_t nf_safe = 0;
+        uint32_t *sf_safe = vk_glsl_to_spirv_fp32(k->prog->fi->msl, STAGE_FRAGMENT, "fs_fp32", &nf_safe);
+        if (sf_safe) {
+            VkShaderModule fs_safe = vk_module(sf_safe, nf_safe);
+            free(sf_safe);
+            if (fs_safe) {
+                VkShaderModule orig_fs = stages[1].module;
+                stages[1].module = fs_safe;
+                VkResult r2 = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+                stages[1].module = orig_fs;
+                vkDestroyShaderModule(g_vk.dev, fs_safe, NULL);
+                if (r2 == VK_SUCCESS) {
+                    r = VK_SUCCESS;
+                    static _Atomic int n_rec;
+                    if (atomic_fetch_add(&n_rec, 1) < 20)
+                        LOG("[vk] pipeline recovered with FP32 safe fallback (driver_id=%u): vs %llx fs %llx\n",
+                            g_vk.driver_id, (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+                }
+            }
+        }
+    }
+    if (r != VK_SUCCESS) {
+        static _Atomic int n_dump;
+        if (atomic_fetch_add(&n_dump, 1) < 32 && k->prog->vi && k->prog->vi->msl && k->prog->fi && k->prog->fi->msl) {
+            char dir[512], pvs[600], pfs[600];
+            snprintf(dir, sizeof dir, "%s/pipelines_fallidas", rt_data_root());
+            mkdir(dir, 0755);
+            snprintf(pvs, sizeof pvs, "%s/%llx_%llx_vs.spv", dir,
+                     (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+            snprintf(pfs, sizeof pfs, "%s/%llx_%llx_fs.spv", dir,
+                     (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+            size_t nv_d = 0, nf_d = 0;
+            uint32_t *sv_d = vk_glsl_to_spirv(k->prog->vi->msl, STAGE_VERTEX, "vs", &nv_d);
+            uint32_t *sf_d = vk_glsl_to_spirv(k->prog->fi->msl, STAGE_FRAGMENT, "fs", &nf_d);
+            if (sv_d) { FILE *f = fopen(pvs, "wb"); if (f) { fwrite(sv_d, 4, nv_d, f); fclose(f); } free(sv_d); }
+            if (sf_d) { FILE *f = fopen(pfs, "wb"); if (f) { fwrite(sf_d, 4, nf_d, f); fclose(f); } free(sf_d); }
+            LOG("[vk] pipeline creation failed (%d, driver_id=%u): dumped rejected SPIR-V to %s\n",
+                (int)r, g_vk.driver_id, dir);
+        }
+    }
+#else
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
     }
+#endif
 #ifdef __ANDROID__
     if (r == VK_SUCCESS && g_vk.exec_stats) {  // (LARECOMP_SHADER_STATS) one line per compiled stage
         uint64_t fsh = hmix(1469598103934665603ull, (const void *)(uintptr_t)(k->prog->code[1] + 0x30), 0x200);

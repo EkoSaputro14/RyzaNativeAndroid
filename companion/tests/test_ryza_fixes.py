@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,9 +1216,9 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p19")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p19"' in forensics_c
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p20")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p20"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
     assert "bool usable_affinity = (fast_cnt >= 3);" in android_c
@@ -1242,3 +1242,131 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
 
 _verify_p19_mhrise_affinity_and_no_shadows()
 
+
+
+def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
+    from pathlib import Path
+    print("[Test] Verifying p20 (GPU compute texture unswizzle, driverID detection & SPIR-V hardening)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    shaders_h = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.h").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    vk_h = (repo_root / "runtime" / "nvn" / "vulkan" / "vk.h").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    shader_h = (repo_root / "runtime" / "nvn" / "maxwell" / "shader.h").read_text(encoding="utf-8")
+    translate_c = (repo_root / "runtime" / "nvn" / "maxwell" / "translate.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+
+    # 0. Version bump
+    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+
+    # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
+    assert "int gpu_unswizzle;" in settings_h
+    assert ".gpu_unswizzle = 1" in settings_c
+    assert 'strcmp(key, "gpu_unswizzle")' in settings_c
+    assert "gpu_unswizzle = %d" in settings_c
+    assert "GPU texture unswizzle (compute)" in menu_mm
+    assert "GPU texture unswizzle (Vulkan compute deswizzle)" in launcher_mm
+    assert "gpu_unsw:" in overlay_mm
+    assert 'if (!strcmp(name, "deswizzle.comp"))' in shaders_c
+    assert "vk_gpu_deswizzle_dispatch" in textures_c
+    assert "vk_builtin_shader(\"deswizzle.comp\")" in textures_c
+    assert "VK_ACCESS_SHADER_WRITE_BIT" in textures_c and "VK_ACCESS_TRANSFER_READ_BIT" in textures_c
+    assert "gpu_unswizzle_enabled() ? (16u << 20) : (4u << 20)" in textures_c
+
+    # Mathematical equivalence check: verify deswizzle.comp 16B-sector formula matches tegra.c gob_offset() bit-for-bit
+    def tegra_gob_offset(xb, y, z, width_gobs, bh_log2, bd_log2, blocks_rows):
+        gob_x = xb >> 6
+        gob_y = y >> 3
+        block_y = gob_y >> bh_log2
+        gob_in_block_y = gob_y & ((1 << bh_log2) - 1)
+        block_z = z >> bd_log2
+        z_in_block = z & ((1 << bd_log2) - 1)
+        block_size = 512 << (bh_log2 + bd_log2)
+        off = ((block_z * blocks_rows + block_y) * width_gobs + gob_x) * block_size
+        off += ((z_in_block << bh_log2) | gob_in_block_y) * 512
+        xi = xb & 63
+        yi = y & 7
+        off += ((xi >> 5) << 8) | ((yi >> 1) << 6) | (((xi >> 4) & 1) << 5) | ((yi & 1) << 4) | (xi & 0x0F)
+        return off
+
+    def comp_src_byte_offset(idx, row_sectors, hb, width_gobs, blocks_rows, bh_log2, bd_log2):
+        slice_sectors = row_sectors * hb
+        z = idx // slice_sectors
+        rem = idx - z * slice_sectors
+        y = rem // row_sectors
+        sx = rem - y * row_sectors
+        gob_x = sx >> 2
+        gob_y = y >> 3
+        bh_mask = (1 << bh_log2) - 1
+        bd_mask = (1 << bd_log2) - 1
+        block_y = gob_y >> bh_log2
+        gob_in_block_y = gob_y & bh_mask
+        block_z = z >> bd_log2
+        z_in_block = z & bd_mask
+        block_sectors = 32 << (bh_log2 + bd_log2)
+        sxi = sx & 3
+        yi = y & 7
+        gob_sector = ((sxi >> 1) << 4) | ((yi >> 1) << 2) | ((sxi & 1) << 1) | (yi & 1)
+        src_sec = ((block_z * blocks_rows + block_y) * width_gobs + gob_x) * block_sectors + (((z_in_block << bh_log2) | gob_in_block_y) << 5) + gob_sector
+        return src_sec * 16
+
+    for row_bytes, hb, d, bh, bd in [
+        (256, 64, 1, 3, 0),    # 64x64 RGBA8
+        (1024, 128, 1, 4, 0),  # 256x128 RGBA8 / 512x512 BC7
+        (80, 24, 1, 1, 0),     # non-power-of-two multiple of 16B
+        (128, 16, 8, 0, 3),    # 3D LUT texture
+    ]:
+        row_sectors = row_bytes // 16
+        width_gobs = (row_bytes + 63) // 64
+        gob_rows = 8 << bh
+        blocks_rows = (hb + gob_rows - 1) // gob_rows
+        total_sectors = row_sectors * hb * d
+        for idx in (0, 1, 2, 3, 7, row_sectors - 1, row_sectors, row_sectors * 7 + 3, total_sectors // 2, total_sectors - 1):
+            z = idx // (row_sectors * hb)
+            rem = idx % (row_sectors * hb)
+            y = rem // row_sectors
+            sx = rem % row_sectors
+            expected = tegra_gob_offset(sx * 16, y, z, width_gobs, bh, bd, blocks_rows)
+            actual = comp_src_byte_offset(idx, row_sectors, hb, width_gobs, blocks_rows, bh, bd)
+            assert actual == expected, f"GOB mismatch for ({row_bytes},{hb},{d},{bh},{bd}) idx={idx}: {actual} != {expected}"
+
+    # 2. Priority #2A: driverID-based Vulkan driver detection
+    assert "uint32_t driver_id;" in vk_h
+    assert "bool subgroup_quad;" in vk_h
+    assert "bool vk_driver_is_mali(void);" in vk_h
+    assert "bool vk_driver_is_panvk(void);" in vk_h
+    assert "bool vk_driver_is_xclipse(void);" in vk_h
+    assert "VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES" in device_c
+    assert "VK_SUBGROUP_FEATURE_QUAD_BIT" in device_c
+    assert "RYZA_DRIVER_ID_MESA_TURNIP          = 18" in device_c
+    assert "RYZA_DRIVER_ID_MESA_PANVK           = 27" in device_c
+    assert "uint32_t vk_driver_id(void)" in device_c
+    assert "if (id == RYZA_DRIVER_ID_MESA_TURNIP)" in device_c
+
+    # 3. Priority #2B: Fragment SHFL.BFLY -> subgroupQuadSwap*
+    assert "extern bool maxwell_quad_butterfly;" in shader_h
+    assert "GL_KHR_shader_subgroup_quad : enable" in translate_c
+    assert "subgroupQuadSwapHorizontal" in translate_c
+    assert "subgroupQuadSwapVertical" in translate_c
+    assert "subgroupQuadSwapDiagonal" in translate_c
+    assert "maxwell_quad_butterfly = g_vk.subgroup_quad && !getenv(\"LARECOMP_NO_QUAD_BUTTERFLY\");" in exec_c
+
+    # 4. Priority #2C & #2D: OpUnreachable -> OpReturn + safe FP32 fallback + rejected SPIR-V dump
+    assert "vk_glsl_to_spirv_fp32" in shaders_h
+    assert "static size_t fix_unreachable_to_return" in shaders_c
+    assert "0x000100FFu" in shaders_c and "0x000100FDu" in shaders_c
+    assert "0x9e3779b97f4a7c15ull" in shaders_c
+    assert "vk_glsl_to_spirv_fp32(k->prog->fi->msl" in exec_c
+    assert "pipeline recovered with FP32 safe fallback" in exec_c
+    assert "pipelines_fallidas" in exec_c
+    print("  -> PASS: p20 (GPU compute texture unswizzle, driverID detection & SPIR-V hardening) verified.")
+
+
+_verify_p20_gpu_unswizzle_driverid_spirv_hardening()

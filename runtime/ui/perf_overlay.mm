@@ -310,6 +310,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             g_settings.skip_postfx = g_settings.skip_postfx ? 0 : 1;
             ini_dirty = true;
         }
+        ImGui::SameLine();
+        ImGui::Text("| gpu_unsw:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.gpu_unswizzle ? "ON##gunsw" : "OFF##gunsw")) {
+            g_settings.gpu_unswizzle = g_settings.gpu_unswizzle ? 0 : 1;
+            ini_dirty = true;
+        }
 
         static const int tf_presets[] = {0, 20, 30, 45, 60};
         ImGui::Text("target_fps:");

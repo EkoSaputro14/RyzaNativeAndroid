@@ -230,16 +230,48 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
     *nwords = o;
 }
 
-uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+// SPIR-V hardening for mobile drivers (Qualcomm 512.xxx / Mali): replace OpUnreachable (0x000100FF) inside
+// void functions (main and void helpers) with OpReturn (0x000100FD) in-place so aggressive shader compilers
+// do not mis-optimize or abort on dead-branch terminators emitted from translated control flow.
+static size_t fix_unreachable_to_return(uint32_t *spv, size_t nwords) {
+    if (nwords < 5 || spv[0] != 0x07230203u) return 0;
+    enum { OP_TYPE_VOID = 19, OP_FUNCTION = 54, OP_FUNCTION_END = 56 };
+    uint32_t void_type_id = 0;
+    bool in_void_fn = false;
+    size_t patched = 0;
+    for (size_t i = 5; i < nwords;) {
+        uint32_t w0 = spv[i];
+        uint32_t wc = w0 >> 16, op = w0 & 0xFFFFu;
+        if (!wc || i + wc > nwords) break;
+        if (op == OP_TYPE_VOID && wc >= 2) {
+            void_type_id = spv[i + 1];
+        } else if (op == OP_FUNCTION && wc >= 5) {
+            in_void_fn = (void_type_id != 0 && spv[i + 1] == void_type_id);
+        } else if (op == OP_FUNCTION_END) {
+            in_void_fn = false;
+        } else if (in_void_fn && w0 == 0x000100FFu) {
+            spv[i] = 0x000100FDu;  // OpUnreachable -> OpReturn
+            patched++;
+        }
+        i += wc;
+    }
+    return patched;
+}
+
+static uint32_t *vk_glsl_to_spirv_ex(const char *src, int stage, const char *name, size_t *nwords, bool force_fp32) {
     bool optimized = getenv("LARECOMP_VK_OPT") != NULL;
+    bool unreachable_fix = getenv("LARECOMP_NO_UNREACHABLE_FIX") == NULL;
 #ifdef __ANDROID__
-    bool fp16_frag = (stage == STAGE_FRAGMENT && g_settings.fp16_shaders != 0);
+    bool fp16_frag = (!force_fp32 && stage == STAGE_FRAGMENT && g_settings.fp16_shaders != 0);
     uint64_t h = vk_shader_source_hash(src, stage, optimized);
     if (fp16_frag) h ^= 0x517cc1b727220a95ull;
+    if (unreachable_fix) h ^= 0x9e3779b97f4a7c15ull;
     uint32_t api = g_vk.api ? g_vk.api : VK_API_VERSION_1_3;  // (0: no device yet - as 1.3)
     if (api < VK_API_VERSION_1_3) h ^= (uint64_t)api << 32;  // (older SPIR-V for a device below 1.3, below)
 #else
+    (void)force_fp32;
     uint64_t h = src_hash(src, stage);
+    if (unreachable_fix) h ^= 0x9e3779b97f4a7c15ull;
 #endif
     bool nocache = getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -268,6 +300,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
         memcpy(out, shaderc_result_get_bytes(r), n);
         *nwords = n / 4;
         strip_names(out, nwords);
+        if (unreachable_fix) fix_unreachable_to_return(out, *nwords);
         if (stage == STAGE_VERTEX) out = no_contraction(out, nwords);
 #ifdef __ANDROID__
         if (fp16_frag) out = relaxed_precision_frag(out, nwords);
@@ -276,6 +309,14 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     }
     shaderc_result_release(r);
     return out;
+}
+
+uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+    return vk_glsl_to_spirv_ex(src, stage, name, nwords, false);
+}
+
+uint32_t *vk_glsl_to_spirv_fp32(const char *src, int stage, const char *name, size_t *nwords) {
+    return vk_glsl_to_spirv_ex(src, stage, name, nwords, true);
 }
 
 VkShaderModule vk_module(const uint32_t *spv, size_t nwords) {
@@ -723,6 +764,48 @@ static const char *builtin_src(const char *name, int *stage) {
     if (!strcmp(name, "clear.frag.none")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\nvoid main() {}\n";
+    }
+    if (!strcmp(name, "deswizzle.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;\n"
+               "layout(std430, set = 0, binding = 0) readonly buffer SrcBuf { uvec4 data[]; } src_buf;\n"
+               "layout(std430, set = 0, binding = 1) writeonly buffer DstBuf { uvec4 data[]; } dst_buf;\n"
+               "layout(push_constant) uniform PC {\n"
+               "  uint row_sectors;\n"
+               "  uint hb;\n"
+               "  uint slice_sectors;\n"
+               "  uint width_gobs;\n"
+               "  uint blocks_rows;\n"
+               "  uint bh_log2;\n"
+               "  uint bd_log2;\n"
+               "  uint groups_x;\n"
+               "  uint total_sectors;\n"
+               "} pc;\n"
+               "void main() {\n"
+               "  uint idx = (gl_WorkGroupID.y * pc.groups_x + gl_WorkGroupID.x) * 64u + gl_LocalInvocationID.x;\n"
+               "  if (idx >= pc.total_sectors) return;\n"
+               "  uint z = idx / pc.slice_sectors;\n"
+               "  uint rem = idx - z * pc.slice_sectors;\n"
+               "  uint y = rem / pc.row_sectors;\n"
+               "  uint sx = rem - y * pc.row_sectors;\n"
+               "  uint gob_x = sx >> 2u;\n"
+               "  uint gob_y = y >> 3u;\n"
+               "  uint bh_mask = (1u << pc.bh_log2) - 1u;\n"
+               "  uint bd_mask = (1u << pc.bd_log2) - 1u;\n"
+               "  uint block_y = gob_y >> pc.bh_log2;\n"
+               "  uint gob_in_block_y = gob_y & bh_mask;\n"
+               "  uint block_z = z >> pc.bd_log2;\n"
+               "  uint z_in_block = z & bd_mask;\n"
+               "  uint block_sectors = 32u << (pc.bh_log2 + pc.bd_log2);\n"
+               "  uint sxi = sx & 3u;\n"
+               "  uint yi = y & 7u;\n"
+               "  uint gob_sector = ((sxi >> 1u) << 4u) | ((yi >> 1u) << 2u) | ((sxi & 1u) << 1u) | (yi & 1u);\n"
+               "  uint src_sec = ((block_z * pc.blocks_rows + block_y) * pc.width_gobs + gob_x) * block_sectors\n"
+               "               + (((z_in_block << pc.bh_log2) | gob_in_block_y) << 5u)\n"
+               "               + gob_sector;\n"
+               "  dst_buf.data[idx] = src_buf.data[src_sec];\n"
+               "}\n";
     }
     return NULL;
 }

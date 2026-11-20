@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../settings.h"
 #include "vk.h"
 #include "stall_trace.h"
 #include "../astc.h"
@@ -756,6 +757,143 @@ void vk_textures_reset(void) {
     LOG("[vk] reboot: %d textures released\n", n);
 }
 
+// ================================================================== GPU compute Tegra block-linear deswizzle
+typedef struct {
+    uint32_t row_sectors;
+    uint32_t hb;
+    uint32_t slice_sectors;
+    uint32_t width_gobs;
+    uint32_t blocks_rows;
+    uint32_t bh_log2;
+    uint32_t bd_log2;
+    uint32_t groups_x;
+    uint32_t total_sectors;
+} DeswizzlePC;
+
+static VkDescriptorSetLayout g_desw_dsl;
+static VkPipelineLayout g_desw_pl;
+static VkPipeline g_desw_pipe;
+static int g_desw_init_state;  // 0 = uninit, 1 = ready, -1 = failed/disabled
+static uint64_t g_gpu_deswizzle_dispatches, g_gpu_deswizzle_bytes;
+
+static bool gpu_unswizzle_enabled(void) {
+    static int env_override = -2;
+    if (env_override == -2) {
+        const char *e = getenv("LARECOMP_GPU_UNSWIZZLE");
+        env_override = e ? (atoi(e) != 0 ? 1 : 0) : -1;
+    }
+    if (env_override >= 0) return env_override != 0;
+#ifdef __ANDROID__
+    return g_settings.gpu_unswizzle != 0;
+#else
+    return false;
+#endif
+}
+
+static bool vk_gpu_deswizzle_init(void) {
+    if (g_desw_init_state != 0) return g_desw_init_state > 0;
+    VkDescriptorSetLayoutBinding b[2] = {
+        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+    };
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .bindingCount = 2, .pBindings = b};
+    if (vkCreateDescriptorSetLayout(g_vk.dev, &dci, NULL, &g_desw_dsl) != VK_SUCCESS) {
+        g_desw_init_state = -1;
+        return false;
+    }
+    VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = sizeof(DeswizzlePC)};
+    VkPipelineLayoutCreateInfo lci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                      .setLayoutCount = 1, .pSetLayouts = &g_desw_dsl,
+                                      .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+    if (vkCreatePipelineLayout(g_vk.dev, &lci, NULL, &g_desw_pl) != VK_SUCCESS) {
+        g_desw_init_state = -1;
+        return false;
+    }
+    VkShaderModule cs = vk_builtin_shader("deswizzle.comp");
+    VkComputePipelineCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs, .pName = "main"},
+        .layout = g_desw_pl,
+    };
+    VkResult res = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &pci, NULL, &g_desw_pipe);
+    if (res != VK_SUCCESS) {
+        LOG("[tex] GPU deswizzle compute pipeline failed (%d), falling back to CPU tegra_deswizzle\n", (int)res);
+        g_desw_init_state = -1;
+        return false;
+    }
+    g_desw_init_state = 1;
+    LOG("[tex] GPU compute Tegra block-linear deswizzle pipeline active (local_size_x=64, 16B uvec4 sectors)\n");
+    return true;
+}
+
+static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer cb, const uint8_t *src, uint64_t tiled_bytes, VkSpan *dst_out,
+                                      uint32_t row, uint32_t hb, uint32_t d, uint32_t bh_log2, uint32_t bd_log2) {
+    uint64_t sz = (uint64_t)row * hb * d;
+    if (sz < 4096 || (row & 15u) != 0 || !tiled_bytes || (tiled_bytes & 15u) != 0) return false;
+    uint64_t max_range = g_vk.props.limits.maxStorageBufferRange;
+    if (max_range && (tiled_bytes > max_range || sz > max_range)) return false;
+    if (!vk_gpu_deswizzle_init()) return false;
+    uint64_t ssbo_align = g_vk.props.limits.minStorageBufferOffsetAlignment;
+    if (ssbo_align < 16) ssbo_align = 16;
+    VkSpan s_src = vk_transient_copy(src, tiled_bytes, ssbo_align);
+    VkSpan s_dst = vk_transient(sz, ssbo_align);
+    VkDescriptorSet ds = vk_alloc_set(g_desw_dsl);
+    VkDescriptorBufferInfo bi[2] = {
+        {.buffer = s_src.buf, .offset = s_src.off, .range = tiled_bytes},
+        {.buffer = s_dst.buf, .offset = s_dst.off, .range = sz},
+    };
+    VkWriteDescriptorSet wd[2] = {
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0,
+         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1,
+         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[1]},
+    };
+    vkUpdateDescriptorSets(g_vk.dev, 2, wd, 0, NULL);
+    uint32_t row_sectors = row >> 4;
+    uint32_t total_sectors = (uint32_t)(sz >> 4);
+    uint32_t total_groups = (total_sectors + 63u) >> 6;
+    uint32_t groups_x = total_groups > 1024u ? 1024u : total_groups;
+    uint32_t groups_y = (total_groups + groups_x - 1u) / groups_x;
+    uint32_t width_gobs = (row + 63u) / 64u;
+    uint32_t gob_rows = 8u << bh_log2;
+    uint32_t blocks_rows = (hb + gob_rows - 1u) / gob_rows;
+    DeswizzlePC pc = {
+        .row_sectors = row_sectors,
+        .hb = hb,
+        .slice_sectors = row_sectors * hb,
+        .width_gobs = width_gobs,
+        .blocks_rows = blocks_rows,
+        .bh_log2 = bh_log2,
+        .bd_log2 = bd_log2,
+        .groups_x = groups_x,
+        .total_sectors = total_sectors,
+    };
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_desw_pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_desw_pl, 0, 1, &ds, 0, NULL);
+    vkCmdPushConstants(cb, g_desw_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cb, groups_x, groups_y, 1);
+    VkBufferMemoryBarrier bar = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = s_dst.buf,
+        .offset = s_dst.off,
+        .size = sz,
+    };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 1, &bar, 0, NULL);
+    *dst_out = s_dst;
+    g_gpu_deswizzle_dispatches++;
+    g_gpu_deswizzle_bytes += sz;
+    return true;
+}
+
 // ================================================================== uploads (same change detection as metal.m)
 static uint64_t full_hash_budget, full_hash_budget_frame;
 
@@ -967,10 +1105,11 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             }
         }
     }
-    // If this is a non-urgent re-upload and the per-frame 4 MB re-upload budget is already exhausted,
-    // defer hashing & deswizzling to the next frame while preserving prev_wgen so dirty state is not lost.
+    // Per-frame dynamic re-upload budget: 16 MB when GPU compute deswizzle is active (CPU only memcpy's),
+    // 4 MB when falling back to CPU tegra_deswizzle.
+    uint64_t dyn_deswizzle_budget = gpu_unswizzle_enabled() ? (16u << 20) : (4u << 20);
     if (b->uploaded && !restyle && !(t->flags & 0x40) && dyn_deswizzle_ops_frame > 0 &&
-        dyn_deswizzle_bytes_frame >= (4u << 20)) {
+        dyn_deswizzle_bytes_frame >= dyn_deswizzle_budget) {
         b->wgen = prev_wgen;
         return;
     }
@@ -998,7 +1137,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
     if (b->uploaded && old_hash_valid && h == b->data_hash && !restyle) return;
     if (b->uploaded && !restyle && !(t->flags & 0x40)) {
-        if (dyn_deswizzle_ops_frame > 0 && dyn_deswizzle_bytes_frame + total > (4u << 20)) {
+        if (dyn_deswizzle_ops_frame > 0 && dyn_deswizzle_bytes_frame + total > dyn_deswizzle_budget) {
             b->wgen = prev_wgen;
             b->full_frame = last_full;
             b->sample_hash = old_sample;
@@ -1135,28 +1274,45 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             uint64_t sz = (uint64_t)row * l.hb * l.d;
             bool expand = mf.expand_rgb && fi->bpb == 3;
             uint32_t out_row = expand ? l.wb * 4 : row;
-            uint64_t t_s0 = plat_now_ns();
-            VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
-            uint8_t *lin = expand ? texture_scratch(sz) : s.ptr;
-            staging_ns += plat_now_ns() - t_s0;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
-            if (linear) {
-                uint64_t t_l0 = plat_now_ns();
-                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * LIN_STRIDE(row), row);
-                staging_ns += plat_now_ns() - t_l0;
-            } else {
-                uint64_t t_d0 = plat_now_ns();
-                tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
-                deswizzle_ns += plat_now_ns() - t_d0;
+            static int dw = -1, dh, dd, ndump;
+            static char dpre[256];
+            if (dw < 0) {
+                dw = 0;
+                const char *e = getenv("LARECOMP_DUMP_TEX");
+                if (e && sscanf(e, "%dx%dx%d,%255s", &dw, &dh, &dd, dpre) != 4) dw = 0;
             }
-            {   // LARECOMP_DUMP_TEX=<w>x<h>x<d>,<path prefix>: level 0 of each upload of that shape, guest bytes (.raw)
-                // and deswizzled (.lin), the first 8 (diagnosis)
-                static int dw = -1, dh, dd, ndump;
-                static char dpre[256];
-                if (dw < 0) {
-                    dw = 0;
-                    const char *e = getenv("LARECOMP_DUMP_TEX");
-                    if (e && sscanf(e, "%dx%dx%d,%255s", &dw, &dh, &dd, dpre) != 4) dw = 0;
+            VkSpan s = {0};
+            bool gpu_deswizzled = false;
+            if (gpu_unswizzle_enabled() && !linear && !expand && !(b->tp > 0 && layer == 0) && !dw &&
+                !(row & 15u) && sz >= 4096 && b->aspect != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+                uint32_t wg = (row + 63u) / 64u;
+                uint32_t gr = 8u << l.block_height_log2;
+                uint32_t br = (l.hb + gr - 1u) / gr;
+                uint32_t gd = 1u << l.block_depth_log2;
+                uint32_t bd = (l.d + gd - 1u) / gd;
+                uint64_t bsz = 512ull << (l.block_height_log2 + l.block_depth_log2);
+                uint64_t tiled_bytes = (uint64_t)wg * bsz * br * bd;
+                if (l.offset + tiled_bytes <= layer_size) {
+                    uint64_t t_g0 = plat_now_ns();
+                    gpu_deswizzled = vk_gpu_deswizzle_dispatch(cb, src, tiled_bytes, &s, row, l.hb, l.d,
+                                                               l.block_height_log2, l.block_depth_log2);
+                    if (gpu_deswizzled) staging_ns += plat_now_ns() - t_g0;
+                }
+            }
+            if (!gpu_deswizzled) {
+                uint64_t t_s0 = plat_now_ns();
+                s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
+                uint8_t *lin = expand ? texture_scratch(sz) : s.ptr;
+                staging_ns += plat_now_ns() - t_s0;
+                if (linear) {
+                    uint64_t t_l0 = plat_now_ns();
+                    for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * LIN_STRIDE(row), row);
+                    staging_ns += plat_now_ns() - t_l0;
+                } else {
+                    uint64_t t_d0 = plat_now_ns();
+                    tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+                    deswizzle_ns += plat_now_ns() - t_d0;
                 }
                 if (dw && lv == 0 && layer == 0 && (int)t->width == dw && (int)t->height == dh && (int)t->depth == dd &&
                     ndump < 8) {
@@ -1171,15 +1327,15 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                         t->depth, t->format, l.block_height_log2, l.block_depth_log2, linear, (unsigned long long)t->addr, p);
                     ndump++;
                 }
+                uint64_t t_s1 = plat_now_ns();
+                if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
+                if (expand) {  // RGB8 -> RGBA8
+                    uint8_t *o = s.ptr;
+                    uint64_t n = (uint64_t)l.wb * l.hb * l.d;
+                    for (uint64_t i = 0; i < n; i++) { o[i * 4] = lin[i * 3]; o[i * 4 + 1] = lin[i * 3 + 1]; o[i * 4 + 2] = lin[i * 3 + 2]; o[i * 4 + 3] = 255; }
+                }
+                staging_ns += plat_now_ns() - t_s1;
             }
-            uint64_t t_s1 = plat_now_ns();
-            if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
-            if (expand) {  // RGB8 -> RGBA8
-                uint8_t *o = s.ptr;
-                uint64_t n = (uint64_t)l.wb * l.hb * l.d;
-                for (uint64_t i = 0; i < n; i++) { o[i * 4] = lin[i * 3]; o[i * 4 + 1] = lin[i * 3 + 1]; o[i * 4 + 2] = lin[i * 3 + 2]; o[i * 4 + 3] = 255; }
-            }
-            staging_ns += plat_now_ns() - t_s1;
             uint32_t w = l.w, hh = l.h, d = l.d;
             // the copy stays inside the image's level: a texture allocated at the internal resolution (16:9, render
             // target sized) can still be filled from the CPU - the save slots' screenshots on the title screen. Its
