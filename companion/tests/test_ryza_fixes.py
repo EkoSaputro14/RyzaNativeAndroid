@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
+    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
+    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
+    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 50" in gradle_kts and "0.3.2-forensic-p18" in gradle_kts
+    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1198,3 +1198,47 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     print("  -> PASS: p17 (SIGBUS Adreno 61x/atomic64 probe, 30 FPS pacer, thermal all-core fallback, REQ_FLUSH coalescing/2048 batch, KTGL post-FX culling) verified.")
 
 _verify_p17_sigbus_pacer_thermal_batch_postfx()
+
+
+def _verify_p19_mhrise_affinity_and_no_shadows():
+    from pathlib import Path
+    print("[TEST] Verifying p19 MHRise <3 Big Cores Unpinning Rule, Depth-Only Shadow Culling & Always-Lit Comparison...")
+    repo_root = Path(__file__).resolve().parents[2]
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+    forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
+
+    # Version bump
+    assert "versionCode = 51" in gradle_kts and "0.3.2-forensic-p19" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p19")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p19"' in forensics_c
+
+    # 1. MHRise os.cpp rule: < 3 big cores unpinning
+    assert "bool usable_affinity = (fast_cnt >= 3);" in android_c
+    assert "g_has_clusters = (fast_cnt > 0 && little_cnt > 0 && usable_affinity);" in android_c
+    assert "< 3 big cores unpinned to prevent 652MHz throttle" in android_c
+
+    # 2. MHRise executor.cpp rule: depth-only shadow pass culling when shadow_scale <= 0.05f
+    assert "st.rt.ncolor == 0 && st.rt.depth && (g_settings.shadow_scale <= 0.05f || getenv(\"LARECOMP_NO_SHADOW\")" in exec_c
+
+    # 3. MHRise compareOp ALWAYS lit when shadow_scale <= 0.05f
+    assert "bool no_shadow = (g_settings.shadow_scale <= 0.05f)" in textures_c
+    assert "si.compareOp = no_shadow ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);" in textures_c
+
+    # 4. Settings and UI allow 0.00f (Off)
+    assert "ss >= 0.0f && ss <= 1.0f" in settings_c
+    assert "g_settings.shadow_scale >= 0.0f" in device_c
+    assert "Off##sh" in overlay_mm and "0.00f" in overlay_mm
+    assert "Off (0.00x)" in menu_mm and "0.00f" in menu_mm
+
+    print("  -> PASS: p19 (MHRise <3 big cores unpinning, depth-only shadow culling, always-lit comparison & 0.00x UI) verified.")
+
+_verify_p19_mhrise_affinity_and_no_shadows()
+

@@ -7302,6 +7302,11 @@ static void draw_(CmdRec *r, bool indexed) {
         stat_skipped++;
         return;
     }
+    // mhrise-recomp Executor::draw / shadow_pass: Skip depth-only shadow map draw calls when shadows are off
+    if (st.rt.ncolor == 0 && st.rt.depth && (g_settings.shadow_scale <= 0.05f || getenv("LARECOMP_NO_SHADOW") || getenv("LARECOMP_NO_SHADOWS"))) {
+        stat_skipped++;
+        return;
+    }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;

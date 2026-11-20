@@ -283,17 +283,18 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             if (i < 4) ImGui::SameLine();
         }
 
-        static const float sh_presets[] = {0.25f, 0.50f, 1.00f};
+        static const float sh_presets[] = {0.00f, 0.25f, 0.50f, 1.00f};
         ImGui::Text("shadow_scale:");
         ImGui::SameLine();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             char lbl[20];
-            snprintf(lbl, sizeof lbl, "%.2fx##sh", sh_presets[i]);
+            if (sh_presets[i] == 0.00f) snprintf(lbl, sizeof lbl, "Off##sh");
+            else snprintf(lbl, sizeof lbl, "%.2fx##sh", sh_presets[i]);
             bool sel = fabsf(g_settings.shadow_scale - sh_presets[i]) < 0.02f;
             if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
             if (ImGui::SmallButton(lbl)) { g_settings.shadow_scale = sh_presets[i]; ini_dirty = true; }
             if (sel) ImGui::PopStyleColor();
-            if (i < 2) ImGui::SameLine();
+            if (i < 3) ImGui::SameLine();
         }
         ImGui::SameLine();
         ImGui::Text("| fp16:");

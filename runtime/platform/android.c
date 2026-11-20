@@ -1245,12 +1245,17 @@ static void init_cpu_topology(void) {
     g_prime_core_mask = prime_mask;
     g_active_fast_cores = g_fast_cores;
     g_active_fast_mask = fast_mask;
-    g_has_clusters = (fast_cnt > 0 && little_cnt > 0);
-    LOG("[android] CPU topology (%d cores): fast=0x%llx (%d cores, gold=0x%llx prime=0x%llx, >%ld MHz), little=0x%llx (%d cores, %ld MHz), pin=%s\n",
+    // mhrise-recomp os.cpp rule: On 2+6 SoCs (e.g. Snapdragon 730G, Helio G99) with fast_cnt < 3,
+    // pinning 3 critical threads (main, render, presenter) onto only 2 big cores creates severe CPU contention
+    // and thermal throttling down to 652 MHz. Better to let the Linux CFS scheduler distribute all threads across all cores.
+    bool usable_affinity = (fast_cnt >= 3);
+    g_has_clusters = (fast_cnt > 0 && little_cnt > 0 && usable_affinity);
+    LOG("[android] CPU topology (%d cores): fast=0x%llx (%d cores, gold=0x%llx prime=0x%llx, >%ld MHz), little=0x%llx (%d cores, %ld MHz), pin=%s%s\n",
         n, (unsigned long long)fast_mask, fast_cnt,
         (unsigned long long)gold_mask, (unsigned long long)prime_mask, min_mhz / 1000,
         (unsigned long long)little_mask, little_cnt, min_mhz / 1000,
-        (g_pin_enabled && g_has_clusters) ? "on" : "off");
+        (g_pin_enabled && g_has_clusters) ? "on" : "off",
+        (!usable_affinity && fast_cnt > 0) ? " (mhrise-recomp: < 3 big cores unpinned to prevent 652MHz throttle)" : "");
 }
 
 static void register_fast_tid(int32_t tid) {

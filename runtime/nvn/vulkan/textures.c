@@ -1887,7 +1887,8 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }
     if (d->compare_mode && compare) {
         si.compareEnable = VK_TRUE;
-        si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
+        bool no_shadow = (g_settings.shadow_scale <= 0.05f) || getenv("LARECOMP_NO_SHADOW") || getenv("LARECOMP_NO_SHADOWS");
+        si.compareOp = no_shadow ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
     }
     VkSamplerCustomBorderColorCreateInfoEXT cb = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (border) {

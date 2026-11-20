@@ -1671,7 +1671,7 @@ void backend_present(NvnTexture *t) {
         widescreen_set_factor((float)shape);
         renderer_set_scale((float)sx, (float)sy);
         renderer_set_scene_scale((float)os.scene_sx, (float)os.scene_sy);
-        float sh_scale = (g_settings.shadow_scale >= 0.25f && g_settings.shadow_scale <= 1.0f) ? g_settings.shadow_scale : 1.0f;
+        float sh_scale = (g_settings.shadow_scale >= 0.0f && g_settings.shadow_scale <= 1.0f) ? g_settings.shadow_scale : 1.0f;
         renderer_set_shadow_scale(sh_scale, sh_scale);
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};

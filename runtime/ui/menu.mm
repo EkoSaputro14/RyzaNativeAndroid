@@ -684,17 +684,17 @@ static void tab_display(void) {
         }
     }
     {
-        static const char *sh_names[] = {"25% (0.25x)", "50% (0.50x)", "100% (1.00x)"};
-        static const float sh_vals[] = {0.25f, 0.50f, 1.00f};
-        int shi = 2;
+        static const char *sh_names[] = {"Off (0.00x)", "25% (0.25x)", "50% (0.50x)", "100% (1.00x)"};
+        static const float sh_vals[] = {0.00f, 0.25f, 0.50f, 1.00f};
+        int shi = 3;
         float best_d = 999.0f;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             float d = fabsf(g_settings.shadow_scale - sh_vals[i]);
             if (d < best_d) { best_d = d; shi = i; }
         }
-        if (opt_choice("Shadow scale", &shi, sh_names, 3, 2,
-                       "Scales depth-only shadow map render targets (>= 512x512) to reduce shadow pass rasterization and depth bandwidth "
-                       "on mid-range mobile GPUs. Applies at once.", false)) {
+        if (opt_choice("Shadow scale", &shi, sh_names, 4, 3,
+                       "Scales or disables depth-only shadow map render targets (>= 512x512) to reduce shadow pass rasterization and depth bandwidth "
+                       "on mid-range mobile GPUs. Off (0.00x) completely culls shadow passes and forces always-lit comparison. Applies at once.", false)) {
             g_settings.shadow_scale = sh_vals[shi];
             settings_save();
         }

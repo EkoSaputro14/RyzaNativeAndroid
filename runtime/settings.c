@@ -381,7 +381,7 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "shadow_scale")) {
             float ss = (float)atof(val);
-            if (ss >= 0.25f && ss <= 1.0f) g_settings.shadow_scale = ss;
+            if (ss >= 0.0f && ss <= 1.0f) g_settings.shadow_scale = ss;
         }
         else if (!strcmp(key, "upscaler"))  // (0/off/bilinear, 1/sharp/fsr1/cas/metalfx, 2/sgsr1)
             g_settings.upscaler = (!strcmp(val, "bilinear") || !strcmp(val, "off") || !strcmp(val, "0")) ? UPSCALE_BILINEAR
@@ -421,7 +421,7 @@ void settings_load(void) {
     if (g_settings.volume > 2) g_settings.volume = 2;
 #ifdef __ANDROID__
     if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.68f;
-    if (g_settings.shadow_scale <= 0.0f) g_settings.shadow_scale = 1.0f;
+    if (g_settings.shadow_scale < 0.0f) g_settings.shadow_scale = 0.5f;
 #endif
     extern int g_exec_mode;
     LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, exec_mode=%d)\n",
