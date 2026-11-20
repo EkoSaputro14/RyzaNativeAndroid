@@ -381,6 +381,12 @@ void vk_async_wait_id(uint64_t id) {
     }
 }
 
+// Non-blocking query whether render thread has processed request `id`
+bool vk_async_is_done(uint64_t id) {
+    if (!id || !g_vk_render_started || vk_async_is_render_thread()) return true;
+    return __atomic_load_n(&q_done, __ATOMIC_ACQUIRE) >= id;
+}
+
 bool vk_async_queue_idle(void) {
     if (!g_vk_render_started) return true;
     pthread_mutex_lock(&q_lock);

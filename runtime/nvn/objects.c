@@ -301,6 +301,7 @@ bool vk_async_queue_idle(void);
 void vk_async_flush_if_needed(uint64_t target_seq);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
+bool vk_async_is_done(uint64_t id);
 int vk_async_render_tid(void);
 uint64_t vk_submitted_seq(void);
 uint64_t vk_completed_seq(void);
@@ -382,13 +383,45 @@ NVN(nvnSyncFinalize) { free(HOST(NvnSync, A(0))); SET_HOST(A(0), 0); }
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
-    if (!sync_of(A(0))) { RET(0); return; }
+    NvnSync *s = sync_of(A(0));
+    if (!s) { RET(0); return; }
+    uint64_t timeout_ns = (uint64_t)A(1);
     static int flush = -1;
     static uint64_t n;
     if (flush < 0) flush = getenv("LARECOMP_SYNC_FLUSH") ? 1 : 0;
-    if (getenv("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
+    if (getenv("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx timeout %llu)\n", (unsigned long long)n, c->x[30], (unsigned long long)timeout_ns);
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
+
+    // Fast non-blocking check (adopted from mhrise-recomp queue.cpp:108):
+    // If not forced to flush/drain and the fence is already signaled, or if timeout_ns == 0,
+    // avoid stalling the guest CPU thread.
+    if (!flush && !whole) {
+        bool signaled = false;
+#ifdef __ANDROID__
+        if (vk_async_on()) {
+            if (vk_async_is_done(s->lseq)) {
+                uint64_t sseq = s->seq;
+                if (!sseq || vk_completed_seq() >= sseq) signaled = true;
+            }
+        } else
+#endif
+        {
+            uint64_t sseq = s->seq;
+            if (!sseq || vk_completed_seq() >= sseq) signaled = true;
+        }
+
+        if (signaled) {
+            RET(0);  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
+            return;
+        }
+        if (timeout_ns == 0) {
+            // Non-blocking poll (timeout == 0): fence not reached yet, return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED
+            // immediately without blocking guest CPU or starving vk-render pipeline.
+            RET(2);  // NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED
+            return;
+        }
+    }
 #ifdef __ANDROID__
     uint64_t t0 = plat_now_ns();
     vk_sync_wait_enter();
