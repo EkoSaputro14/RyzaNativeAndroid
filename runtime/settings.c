@@ -75,7 +75,7 @@ Settings g_settings = {
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
     .target_fps = 30,          // (30 fps pacer + SurfaceFlinger refresh hint default on Android)
     .skip_postfx = 0,          // (0 = all post-FX active, 1 = cull heavy KTGL post-FX passes)
-    .gpu_unswizzle = 1,        // (1 = GPU compute Tegra block-linear deswizzle [default], 0 = CPU deswizzle)
+    .gpu_unswizzle = 0,        // (0 = CPU tegra_deswizzle [safe default], 1 = GPU compute deswizzle)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif

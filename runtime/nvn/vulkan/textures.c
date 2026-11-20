@@ -830,7 +830,7 @@ static bool vk_gpu_deswizzle_init(void) {
     return true;
 }
 
-static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer cb, const uint8_t *src, uint64_t tiled_bytes, VkSpan *dst_out,
+static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer *cb_io, const uint8_t *src, uint64_t tiled_bytes, VkSpan *dst_out,
                                       uint32_t row, uint32_t hb, uint32_t d, uint32_t bh_log2, uint32_t bd_log2) {
     uint64_t sz = (uint64_t)row * hb * d;
     if (sz < 4096 || (row & 15u) != 0 || !tiled_bytes || (tiled_bytes & 15u) != 0) return false;
@@ -839,8 +839,16 @@ static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer cb, const uint8_t *src, ui
     if (!vk_gpu_deswizzle_init()) return false;
     uint64_t ssbo_align = g_vk.props.limits.minStorageBufferOffsetAlignment;
     if (ssbo_align < 16) ssbo_align = 16;
-    VkSpan s_src = vk_transient_copy(src, tiled_bytes, ssbo_align);
-    VkSpan s_dst = vk_transient(sz, ssbo_align);
+    uint64_t src_padded = (tiled_bytes + ssbo_align - 1u) & ~(ssbo_align - 1u);
+    // Single combined transient allocation for both tiled src and linear dst: prevents a second
+    // vk_transient() call from triggering RING_OVF_MAX, submitting/closing cb, and freeing s_src.buf.
+    VkSpan combo = vk_transient(src_padded + sz, ssbo_align);
+    memcpy(combo.ptr, src, tiled_bytes);
+    VkSpan s_src = {.buf = combo.buf, .off = combo.off, .ptr = combo.ptr};
+    VkSpan s_dst = {.buf = combo.buf, .off = combo.off + src_padded, .ptr = combo.ptr + src_padded};
+    // Always re-fetch active upload command buffer after vk_transient() in case ring overflow submitted it.
+    VkCommandBuffer cb = vk_upload_cmd();
+    *cb_io = cb;
     VkDescriptorSet ds = vk_alloc_set(g_desw_dsl);
     VkDescriptorBufferInfo bi[2] = {
         {.buffer = s_src.buf, .offset = s_src.off, .range = tiled_bytes},
@@ -872,6 +880,15 @@ static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer cb, const uint8_t *src, ui
         .groups_x = groups_x,
         .total_sectors = total_sectors,
     };
+    VkMemoryBarrier2 pre_mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+        .srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
+    };
+    VkDependencyInfo pre_di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &pre_mb};
+    vkCmdPipelineBarrier2(cb, &pre_di);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_desw_pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_desw_pl, 0, 1, &ds, 0, NULL);
     vkCmdPushConstants(cb, g_desw_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
@@ -888,6 +905,7 @@ static bool vk_gpu_deswizzle_dispatch(VkCommandBuffer cb, const uint8_t *src, ui
     };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, NULL, 1, &bar, 0, NULL);
+    vk_full_barrier(cb);
     *dst_out = s_dst;
     g_gpu_deswizzle_dispatches++;
     g_gpu_deswizzle_bytes += sz;
@@ -1223,6 +1241,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 uint64_t t_s1 = plat_now_ns();
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
+                cb = vk_upload_cmd();
                 staging_ns += plat_now_ns() - t_s1;
                 uint64_t decode_start = plat_now_ns();
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
@@ -1295,7 +1314,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 uint64_t tiled_bytes = (uint64_t)wg * bsz * br * bd;
                 if (l.offset + tiled_bytes <= layer_size) {
                     uint64_t t_g0 = plat_now_ns();
-                    gpu_deswizzled = vk_gpu_deswizzle_dispatch(cb, src, tiled_bytes, &s, row, l.hb, l.d,
+                    gpu_deswizzled = vk_gpu_deswizzle_dispatch(&cb, src, tiled_bytes, &s, row, l.hb, l.d,
                                                                l.block_height_log2, l.block_depth_log2);
                     if (gpu_deswizzled) staging_ns += plat_now_ns() - t_g0;
                 }
@@ -1303,6 +1322,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (!gpu_deswizzled) {
                 uint64_t t_s0 = plat_now_ns();
                 s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
+                cb = vk_upload_cmd();
                 uint8_t *lin = expand ? texture_scratch(sz) : s.ptr;
                 staging_ns += plat_now_ns() - t_s0;
                 if (linear) {

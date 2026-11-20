@@ -426,6 +426,41 @@ void vk_async_flush_if_needed(uint64_t target_seq) {
     vk_async_wait_id(fid);
 }
 
+// Non-blocking flush kick for timeout_ns == 0 fence polls: ensures an open batched command buffer
+// holding target_seq is queued for vkQueueSubmit without stalling the calling guest thread.
+void vk_async_kick_flush(uint64_t target_seq) {
+    if (!target_seq || target_seq <= vk_submitted_seq()) return;
+    if (!vk_has_pending_commands()) return;
+    if (!vk_async_on() || vk_async_is_render_thread()) {
+        vk_flush_pending_work();
+        return;
+    }
+    if (pthread_mutex_trylock(&p_lock) != 0) return;
+    pthread_mutex_lock(&q_lock);
+    if (!g_vk_render_started) {
+        g_vk_render_started = true;
+        pthread_create(&g_vk_render_thread, NULL, render_main, NULL);
+    }
+    if (q_tail > q_head) {
+        Req *last = &q[(q_tail - 1) % QN];
+        if (last->type == REQ_FLUSH) {
+            if (last->a != 0 && target_seq > last->a) last->a = target_seq;
+            pthread_cond_signal(&q_more);
+            pthread_mutex_unlock(&q_lock);
+            pthread_mutex_unlock(&p_lock);
+            return;
+        }
+    }
+    if (q_tail - q_head < QN) {
+        uint64_t id = q_tail + 1;
+        q[(id - 1) % QN] = (Req){REQ_FLUSH, target_seq, NULL, id};
+        __atomic_store_n(&q_tail, id, __ATOMIC_RELEASE);
+        pthread_cond_signal(&q_more);
+    }
+    pthread_mutex_unlock(&q_lock);
+    pthread_mutex_unlock(&p_lock);
+}
+
 // Until every request queued so far has run (the render thread is idle after it).
 void vk_async_drain(void) {
     if (!g_vk_render_started || vk_async_is_render_thread()) {

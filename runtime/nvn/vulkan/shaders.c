@@ -260,7 +260,14 @@ static size_t fix_unreachable_to_return(uint32_t *spv, size_t nwords) {
 
 static uint32_t *vk_glsl_to_spirv_ex(const char *src, int stage, const char *name, size_t *nwords, bool force_fp32) {
     bool optimized = getenv("LARECOMP_VK_OPT") != NULL;
-    bool unreachable_fix = getenv("LARECOMP_NO_UNREACHABLE_FIX") == NULL;
+#ifdef __ANDROID__
+    bool unreachable_fix = getenv("LARECOMP_NO_UNREACHABLE_FIX") == NULL &&
+                           (getenv("LARECOMP_UNREACHABLE_FIX") != NULL ||
+                            vk_driver_is_qualcomm() || vk_driver_is_mali());
+#else
+    bool unreachable_fix = getenv("LARECOMP_NO_UNREACHABLE_FIX") == NULL &&
+                           getenv("LARECOMP_UNREACHABLE_FIX") != NULL;
+#endif
 #ifdef __ANDROID__
     bool fp16_frag = (!force_fp32 && stage == STAGE_FRAGMENT && g_settings.fp16_shaders != 0);
     uint64_t h = vk_shader_source_hash(src, stage, optimized);

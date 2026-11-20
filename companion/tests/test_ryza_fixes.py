@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,9 +1216,9 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p20")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p20"' in forensics_c
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p21")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p21"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
     assert "bool usable_affinity = (fast_cnt >= 3);" in android_c
@@ -1264,11 +1264,11 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 52" in gradle_kts and "0.3.2-forensic-p20" in gradle_kts
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
-    assert ".gpu_unswizzle = 1" in settings_c
+    assert ".gpu_unswizzle = 0" in settings_c
     assert 'strcmp(key, "gpu_unswizzle")' in settings_c
     assert "gpu_unswizzle = %d" in settings_c
     assert "GPU texture unswizzle (compute)" in menu_mm
@@ -1370,3 +1370,54 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
 
 
 _verify_p20_gpu_unswizzle_driverid_spirv_hardening()
+
+
+def _verify_p21_blackscreen_and_unswizzle_fix():
+    from pathlib import Path
+    print("[Test] Verifying p21 (nvnSyncWait timeout=0 livelock fix, nvnQueueFinish drain fix, Turnip SPIR-V gate, GPU unswizzle single-span & cb refresh)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    objects_c = (repo_root / "runtime" / "nvn" / "objects.c").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+    forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
+
+    # 0. Version bump
+    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p21")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p21"' in forensics_c
+
+    # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
+    assert "void vk_async_kick_flush(uint64_t target_seq)" in async_c
+    assert "pthread_mutex_trylock(&p_lock)" in async_c
+    assert "vk_async_kick_flush(sseq);" in objects_c
+
+    # 2. nvnQueueFinish() fixed: no tautological early return while async queue non-idle, drains async queue before GPU wait
+    qf_body = objects_c.split("NVN(nvnQueueFinish) {", 1)[1].split("#else", 1)[0]
+    assert "vk_async_queue_idle() || done_seq_init >= sub_seq_init" not in qf_body
+    assert "(!vk_async_on() || vk_async_queue_idle())" in qf_body
+    assert "vk_async_drain();" in qf_body
+
+    # 3. fix_unreachable_to_return() gated to Qualcomm proprietary / Mali drivers (Turnip untouched)
+    assert "vk_driver_is_qualcomm() || vk_driver_is_mali()" in shaders_c
+
+    # 4. GPU compute unswizzle kotak-kotak fixes:
+    #    - HOST_COHERENT required on transient ring
+    #    - single combined vk_transient(src_padded + sz, ssbo_align)
+    #    - cb = vk_upload_cmd() refreshed after vk_transient()
+    #    - HOST_WRITE -> SHADER_READ pre-barrier + vk_full_barrier(cb) post-barrier
+    #    - safe default .gpu_unswizzle = 0
+    assert ".requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT" in exec_c
+    assert "VkSpan combo = vk_transient(src_padded + sz, ssbo_align);" in textures_c
+    assert "*cb_io = cb;" in textures_c
+    assert "VK_ACCESS_2_HOST_WRITE_BIT" in textures_c and "VK_ACCESS_2_SHADER_READ_BIT" in textures_c
+    assert "vk_full_barrier(cb);" in textures_c
+    assert ".gpu_unswizzle = 0" in settings_c
+    print("  -> PASS: p21 (black screen livelock/drain fixes, Turnip SPIR-V gate, GPU unswizzle single-span/barrier fix) verified.")
+
+
+_verify_p21_blackscreen_and_unswizzle_fix()

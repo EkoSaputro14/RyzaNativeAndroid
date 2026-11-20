@@ -299,6 +299,8 @@ void vk_async_drain(void);
 bool vk_has_pending_commands(void);
 bool vk_async_queue_idle(void);
 void vk_async_flush_if_needed(uint64_t target_seq);
+void vk_async_kick_flush(uint64_t target_seq);
+void vk_flush_pending_work(void);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
 bool vk_async_is_done(uint64_t id);
@@ -318,24 +320,32 @@ void vk_sync_wait_leave(void);
 NVN(nvnQueueFinish) {
     uint64_t sub_seq_init = vk_submitted_seq();
     uint64_t done_seq_init = vk_completed_seq();
-    // Fast path (mhrise-recomp SubmitQueue::wait ticket logic):
-    // If all submitted work is already completed by the GPU and no pending unsubmitted commands,
-    // return immediately (0 ms) without stalling worker threads.
-    if (!vk_has_pending_commands() && (!sub_seq_init || done_seq_init >= sub_seq_init)) {
-        if (!vk_async_on() || vk_async_queue_idle() || done_seq_init >= sub_seq_init) return;
+    // Fast path: only return immediately (0 ms) when there are NO unsubmitted commands,
+    // NO queued async render requests, AND all submitted GPU work is already complete.
+    if (!vk_has_pending_commands() &&
+        (!vk_async_on() || vk_async_queue_idle()) &&
+        (!sub_seq_init || done_seq_init >= sub_seq_init)) {
+        return;
     }
     uint64_t t0 = plat_now_ns();
     vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
-    kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
+    // Drain queued async commands and flush any open batched command buffer before waiting on GPU.
+    // Note: vk_async_drain() handles its own kernel_blocking_begin/end internally.
+    if (vk_async_on()) {
+        vk_async_drain();
+    } else if (vk_has_pending_commands()) {
+        vk_flush_pending_work();
+    }
     uint64_t t1 = plat_now_ns();
     uint64_t sub_seq = vk_submitted_seq();
     if (sub_seq && vk_completed_seq() < sub_seq) {
+        kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
         renderer_wait_seq(sub_seq);
+        kernel_blocking_end();
     }
     uint64_t t_end = plat_now_ns();
-    kernel_blocking_end();
     vk_sync_wait_leave();
     extern void vk_record_nvn_sync_wait(uint64_t ns);
     uint64_t dt = t_end - t0;
@@ -423,8 +433,24 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             return;
         }
         if (timeout_ns == 0) {
-            // Non-blocking poll (timeout == 0): fence not reached yet, return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED
-            // immediately without blocking guest CPU or starving vk-render pipeline.
+            // Non-blocking poll (timeout == 0): if the fence sits inside an open/unsubmitted batched
+            // command buffer (submit_seq + 1), kick an async non-blocking flush so polling loops
+            // never livelock waiting for a submission that never happens.
+#ifdef __ANDROID__
+            if (vk_async_on()) {
+                if (vk_async_is_done(s->lseq)) {
+                    uint64_t sseq = s->seq;
+                    if (sseq > vk_submitted_seq() && vk_has_pending_commands()) {
+                        vk_async_kick_flush(sseq);
+                    }
+                }
+            } else {
+                uint64_t sseq = s->seq;
+                if (sseq > vk_submitted_seq() && vk_has_pending_commands()) {
+                    vk_flush_pending_work();
+                }
+            }
+#endif
             RET(2);  // NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED
             return;
         }
