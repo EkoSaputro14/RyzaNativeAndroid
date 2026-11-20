@@ -322,21 +322,13 @@ NVN(nvnQueueFinish) {
     // If all submitted work is already completed by the GPU and no pending unsubmitted commands,
     // return immediately (0 ms) without stalling worker threads.
     if (!vk_has_pending_commands() && (!sub_seq_init || done_seq_init >= sub_seq_init)) {
-        if (!vk_async_on()) return;
-        uint64_t qid = vk_async_last_queued_id();
-        if (vk_async_queue_idle() || vk_async_is_done(qid)) return;
+        if (!vk_async_on() || vk_async_queue_idle() || done_seq_init >= sub_seq_init) return;
     }
     uint64_t t0 = plat_now_ns();
     vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
-    if (vk_async_on()) {
-        uint64_t target_id = vk_async_last_queued_id();
-        if (target_id && !vk_async_is_done(target_id)) {
-            vk_async_wait_id(target_id);
-        }
-    }
     uint64_t t1 = plat_now_ns();
     uint64_t sub_seq = vk_submitted_seq();
     if (sub_seq && vk_completed_seq() < sub_seq) {
