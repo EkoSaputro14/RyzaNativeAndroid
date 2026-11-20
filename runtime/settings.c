@@ -57,7 +57,7 @@ Settings g_settings = {
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
     .res_mode = 1,
     .render_scale = 0.68f,  // (0.68x internal 3D resolution default on Android: ~870x490, cuts Adreno 618 fragment load by 54%)
-    .shadow_scale = 1.0f,   // (1.0x shadow map resolution default; configurable 0.25, 0.5, 1.0)
+    .shadow_scale = 0.5f,   // (0.5x shadow map resolution default on Android; reduces shadow fillrate by 75%)
 #else
     .show_fps = false,
     .render_scale = 1.0f,

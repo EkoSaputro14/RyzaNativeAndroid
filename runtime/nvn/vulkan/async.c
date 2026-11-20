@@ -387,6 +387,10 @@ bool vk_async_is_done(uint64_t id) {
     return __atomic_load_n(&q_done, __ATOMIC_ACQUIRE) >= id;
 }
 
+uint64_t vk_async_last_queued_id(void) {
+    return __atomic_load_n(&q_tail, __ATOMIC_ACQUIRE);
+}
+
 bool vk_async_queue_idle(void) {
     if (!g_vk_render_started) return true;
     pthread_mutex_lock(&q_lock);

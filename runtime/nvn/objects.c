@@ -302,6 +302,7 @@ void vk_async_flush_if_needed(uint64_t target_seq);
 uint64_t vk_async_fence(uint64_t guest_sync);
 void vk_async_wait_id(uint64_t id);
 bool vk_async_is_done(uint64_t id);
+uint64_t vk_async_last_queued_id(void);
 int vk_async_render_tid(void);
 uint64_t vk_submitted_seq(void);
 uint64_t vk_completed_seq(void);
@@ -314,19 +315,32 @@ void kernel_blocking_end(void);
 void vk_sync_wait_enter(void);
 void vk_sync_wait_leave(void);
 NVN(nvnQueueFinish) {
-    if (!vk_has_pending_commands() && (!vk_async_on() || vk_async_queue_idle())) {
-        uint64_t sub_seq = vk_submitted_seq();
-        if (!sub_seq || vk_completed_seq() >= sub_seq) return;
+    uint64_t sub_seq_init = vk_submitted_seq();
+    uint64_t done_seq_init = vk_completed_seq();
+    // Fast path (mhrise-recomp SubmitQueue::wait ticket logic):
+    // If all submitted work is already completed by the GPU and no pending unsubmitted commands,
+    // return immediately (0 ms) without stalling worker threads.
+    if (!vk_has_pending_commands() && (!sub_seq_init || done_seq_init >= sub_seq_init)) {
+        if (!vk_async_on()) return;
+        uint64_t qid = vk_async_last_queued_id();
+        if (vk_async_queue_idle() || vk_async_is_done(qid)) return;
     }
     uint64_t t0 = plat_now_ns();
     vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
-    if (vk_async_on()) vk_async_drain();  // (the render thread's translation first: vulkan/async.c)
+    if (vk_async_on()) {
+        uint64_t target_id = vk_async_last_queued_id();
+        if (target_id && !vk_async_is_done(target_id)) {
+            vk_async_wait_id(target_id);
+        }
+    }
     uint64_t t1 = plat_now_ns();
     uint64_t sub_seq = vk_submitted_seq();
-    renderer_sync();
+    if (sub_seq && vk_completed_seq() < sub_seq) {
+        renderer_wait_seq(sub_seq);
+    }
     uint64_t t_end = plat_now_ns();
     kernel_blocking_end();
     vk_sync_wait_leave();
