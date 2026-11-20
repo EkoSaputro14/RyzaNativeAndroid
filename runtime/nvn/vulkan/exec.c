@@ -30,6 +30,7 @@ uint64_t renderer_present_count(void);
 #include "../../paths.h"
 #include "ryza_forensics.h"
 #include "precompute.h"
+#include "watch.h"
 
 
 static inline bool ryza_guest_readable(uint64_t addr, uint64_t size) {
@@ -1909,6 +1910,7 @@ void vk_exec_init(void) {
     }
     st_defaults();
     ryza_forensics_init();
+    ryza_watch_init_heap(HEAP_BASE, HEAP_MAX);
     precompute_init();
 }
 

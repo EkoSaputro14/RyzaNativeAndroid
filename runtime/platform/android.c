@@ -31,6 +31,7 @@
 #include "../platform.h"
 #include "../rt.h"
 #include "../../android/common/guest_window.h"
+#include "../watch.h"
 
 uint64_t g_guest_lo;  // the window's start (rt.h GUEST_LO), set by plat_reserve_guest before main()
 
@@ -386,6 +387,7 @@ static void wt_lock(void) {
 static void wt_unlock(void) { atomic_flag_clear_explicit(&wt_spin, memory_order_release); }
 
 void plat_write_tracking_reset_range(uint64_t lo, uint64_t hi) {
+    ryza_watch_reset_range(lo, hi);
     if (!wt_state || hi <= lo || hi <= wt_lo || lo >= wt_hi) return;
     uint64_t a = lo < wt_lo ? wt_lo : (lo & ~0xFFFull);
     uint64_t e = hi > wt_hi ? wt_hi : ((hi + 0xFFFull) & ~0xFFFull);
@@ -396,14 +398,16 @@ void plat_write_tracking_reset_range(uint64_t lo, uint64_t hi) {
 }
 
 void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
-    if (wt_state || getenv("LARECOMP_NO_WRITE_TRACKING")) return;
+    if (getenv("LARECOMP_NO_WRITE_TRACKING")) return;
+    ryza_watch_init_heap((uintptr_t)lo, (size_t)(hi - lo));
+    if (wt_state) return;
     lo &= ~0xFFFull;
     hi = (hi + 0xFFF) & ~0xFFFull;
     uint8_t *s = calloc((size_t)((hi - lo) >> 12), 1);
     if (!s) return;
     wt_lo = lo; wt_hi = hi;
     wt_state = s;
-    fprintf(stderr, "[android] page write tracking on %#llx-%#llx\n", (unsigned long long)lo, (unsigned long long)hi);
+    fprintf(stderr, "[android] page write tracking (batched runs) on %#llx-%#llx\n", (unsigned long long)lo, (unsigned long long)hi);
 }
 
 // (signal handler) a write to a page made read-only here: true when handled
@@ -480,6 +484,7 @@ static int plat_write_tracking_state(uint64_t a, uint64_t *odd) {
 }
 
 void plat_write_prepare(uint64_t addr, uint64_t size) {
+    ryza_watch_before_kernel_write((void *)(uintptr_t)addr, (size_t)size);
     if (!wt_state || !size || addr + size <= wt_lo || addr >= wt_hi) return;
     uint64_t qt0 = plat_now_ns();
     uint64_t a = addr < wt_lo ? wt_lo : addr, e = addr + size > wt_hi ? wt_hi : addr + size;
@@ -497,6 +502,10 @@ void plat_write_prepare(uint64_t addr, uint64_t size) {
 }
 
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    if (ryza_watch_is_watchable((uintptr_t)addr, (size_t)size)) {
+        int r = ryza_watch_get_written_pages(addr, size, pages, max, page);
+        if (r >= 0) return r;
+    }
     if (!wt_state || addr < wt_lo || addr + size > wt_hi) return -1;
     *page = 4096;
     {   // (the process's mappings, every 5 minutes - how near the limit the tracked pages bring it; and wt_reopen_all)
@@ -850,7 +859,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx) {
         extern int g_fault_wnr;
         if (sig == SIGSEGV && g_fault_wnr != 1 && null_read(uc, fa, pc)) return;
     }
-    if (sig == SIGSEGV && wt_fault(fa)) return;  // (write tracking - whatever the code: mprotect decides, #70)
+    if (sig == SIGSEGV && (ryza_watch_on_fault(fa) || wt_fault(fa))) return;  // (write tracking - whatever the code: mprotect decides, #70)
     if (sig == SIGSEGV) {  // (what the next report needs: the kernel's code, and the page's tracking state)
         extern int g_fault_wnr;
         uint64_t odd;
