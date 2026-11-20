@@ -306,6 +306,7 @@ uint64_t vk_async_last_queued_id(void);
 int vk_async_render_tid(void);
 uint64_t vk_submitted_seq(void);
 uint64_t vk_completed_seq(void);
+void renderer_wait_seq(uint64_t seq);
 void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view);
 void vk_async_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc);
 void vk_async_tex_pool_fin(NvnDescPool *d);
