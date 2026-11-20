@@ -536,7 +536,11 @@ static void *thread_main(void *arg) {
     t_cur = t;
 #ifdef __ANDROID__
     t->host_tid = (int)gettid();
-    plat_thread_pin_fast();  // pin main (t80) & guest worker threads together onto Big/Prime cores
+    if (t->id == 0x50) {
+        plat_thread_pin_fast();  // pin main (t80) & guest worker threads together onto Big/Prime cores
+    } else {
+        plat_thread_allow_all();  // guest worker threads run across all available cores (preventing Big-core starvation)
+    }
     stall_set_thread_name(t->id == 0x50 ? "guest-main" : "guest-worker", t->id);
     stall_note_active_work(t->id == 0x50 ? "guest_main_exec" : "guest_worker_exec");
 #endif
@@ -746,7 +750,7 @@ static uint32_t block_current(int64_t timeout_ns) {
         // FXAA (GPU-bound near 20 ms): 50 us +4%, +1.4%, +0.4% in three runs, 150 us nothing. Off by default: with the
         // default settings the frame sits at the 60 fps cap with the GPU as the limit, where a spin is only CPU heat.
         static long spin_ns = -1;
-        if (spin_ns < 0) { const char *e = getenv("LARECOMP_KWAIT_SPIN_US"); spin_ns = (e ? atol(e) : 0) * 1000; }
+        if (spin_ns < 0) { const char *e = getenv("LARECOMP_KWAIT_SPIN_US"); spin_ns = (e ? atol(e) : 100) * 1000; }
         extern int vk_ab(const char *what);
         if (spin_ns > 0 && (timeout_ns < 0 || timeout_ns > spin_ns) && vk_ab("kspin") != 0) {
             pthread_mutex_unlock(&g_klock);
@@ -853,9 +857,25 @@ static uint32_t block_current(int64_t timeout_ns) {
 }
 
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
+    uint32_t *p = u32p(addr);
+    uint32_t expected = owner | WAITERS_BIT;
+
+    // Fast-path 1 (mhrise-recomp style): immediate userspace check without acquiring g_klock
+    if (__atomic_load_n(p, __ATOMIC_ACQUIRE) != expected) {
+        return R_OK;
+    }
+
+    // Fast-path 2 (mhrise-recomp style): adaptive spin with CPU yield for micro-burst locks
+    for (int spin = 0; spin < 256; spin++) {
+        if (__atomic_load_n(p, __ATOMIC_ACQUIRE) != expected) {
+            return R_OK;
+        }
+        __asm__ volatile("yield");
+    }
+
     klock_acquire();
-    uint32_t v = __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
-    if (v != (owner | WAITERS_BIT)) {
+    uint32_t v = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+    if (v != expected) {
         pthread_mutex_unlock(&g_klock);
         return R_OK;
     }

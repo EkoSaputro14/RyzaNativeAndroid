@@ -120,6 +120,7 @@ void plat_thread_pin_background(void);
 void plat_uclamp_min_tid(int32_t tid);
 void plat_boost_thread_tid(int32_t tid);
 void plat_thread_unpin(void);
+void plat_thread_allow_all(void);
 void plat_flush_logs(void);
 void plat_crash_write_raw(const char *s);
 #endif

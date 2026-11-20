@@ -1531,6 +1531,11 @@ void plat_thread_unpin(void) {
     plat_thread_pin_background();
 }
 
+void plat_thread_allow_all(void) {
+    pthread_once(&g_topo_once, init_cpu_topology);
+    if (g_pin_enabled && g_has_clusters) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
+}
+
 // One session for both threads by default (the presenting thread and the render thread; LARECOMP_ADPF_SPLIT=1 for
 // two separate sessions). The presenting thread reports the frame's critical path (max of both threads' busy times).
 typedef struct AWorkDuration AWorkDuration;
