@@ -2426,9 +2426,8 @@ static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
         case CMD_BIND_DEPTH_STENCIL:
             ds0 = qx[0]; ds1 = qx[1]; ds3 = qx[3];
             break;
-        case CMD_SET_STENCIL_MASK:
-            if (q->x[0] & 1) smask |= (uint32_t)(q->x[1] & 0xFFu);
-            if (q->x[0] & 2) smask |= (uint32_t)(q->x[1] & 0xFFu);
+        case CMD_SET_STENCIL:
+            if (q->x[6] == 1 && (q->x[0] & 3)) smask |= (uint32_t)(q->x[1] & 0xFFu);
             break;
         case CMD_CLEAR_COLOR:
             ps.any_clear = true;
