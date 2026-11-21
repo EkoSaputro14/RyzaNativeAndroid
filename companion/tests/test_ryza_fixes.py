@@ -1479,7 +1479,7 @@ def _verify_exp_mhrise_arch():
 
     # 5. Pillar 4: Native AThermal_getThermalHeadroom + UI controls + extern "C" linkage
     assert "AThermal_getThermalHeadroom" in android_c
-    assert 'extern "C" bool vk_framegen_active(void);' in overlay_mm
+    assert "vk_framegen_active(void);" in overlay_mm and 'extern "C"' in overlay_mm
     for ui in [menu_mm, launcher_mm, overlay_mm]:
         for key in ["fast_depth", "tight_barriers", "tiler_store_none", "frame_gen"]:
             assert key in ui, f"Missing {key} in UI"

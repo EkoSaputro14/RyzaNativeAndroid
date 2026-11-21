@@ -13,6 +13,7 @@
 #include "imgui.h"
 
 extern "C" {
+bool vk_framegen_active(void);
 extern int g_exec_mode;
 extern uint64_t g_bench_native_calls, g_bench_recomp_calls;
 extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
@@ -111,7 +112,6 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         ImGui::Begin("##perf", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::SetWindowFontScale(0.62f);
-        extern "C" bool vk_framegen_active(void);
         bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
         if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "FPS %.0f (%.0fx2 FG)", fps * 2.0f, fps);
         else ImGui::TextColored(grade(fps, 55, 28), "FPS %.0f", fps);
@@ -138,7 +138,6 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::SetWindowFontScale(0.62f);
 
-    extern "C" bool vk_framegen_active(void);
     bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
     if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "%.0f FPS (%.0f real + FG 2x)", fps * 2.0f, fps);
     else ImGui::TextColored(grade(fps, 55, 28), "%.0f FPS", fps);
