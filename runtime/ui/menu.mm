@@ -787,9 +787,9 @@ static void tab_display(void) {
         }
     }
     {
-        static const char *const fg_opts[] = {"Off", "2x Light (DIS)", "2x Balanced (DIS)"};
+        static const char *fg_opts[] = {"Off", "2x Light (DIS)", "2x Balanced (DIS)"};
         int fgi = (g_settings.frame_gen >= 0 && g_settings.frame_gen <= 2) ? g_settings.frame_gen : 1;
-        if (opt_cycle("Optical-flow frame gen (mhrise-arch)", &fgi, fg_opts, 3, 1,
+        if (opt_choice("Optical-flow frame gen (mhrise-arch)", &fgi, fg_opts, 3, 1,
                       "Built-in pure-Vulkan-compute 2x DIS bidirectional optical-flow frame generation (ported from mhrise-recomp). "
                       "Doubles display smoothness (e.g. 30->60 FPS or 45->90 FPS) with ~2ms compute cost. Applies at once.")) {
             g_settings.frame_gen = fgi;
