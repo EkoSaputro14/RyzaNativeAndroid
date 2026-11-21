@@ -20,6 +20,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "framegen.h"
 #include "stall_trace.h"
 #include "timing_trace.h"
 #include "precompute.h"
@@ -630,6 +631,20 @@ static void create_device(void) {
     const char *pv = getenv("LARECOMP_PACE_VSYNC");
     display_timing = has_ext(ep, ne, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) && (!pv || atoi(pv));
     if (display_timing) ext[n_ext++] = VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME;
+    // mhrise-arch: enable STORE_OP_NONE extension so Adreno GMEM skips writing back read-only attachments
+    g_vk.store_op_none = (g_vk.props.apiVersion >= VK_MAKE_API_VERSION(0, 1, 4, 0));
+    if (!g_vk.store_op_none) {
+        if (has_ext(ep, ne, "VK_KHR_load_store_op_none")) {
+            ext[n_ext++] = "VK_KHR_load_store_op_none";
+            g_vk.store_op_none = true;
+        } else if (has_ext(ep, ne, "VK_EXT_load_store_op_none")) {
+            ext[n_ext++] = "VK_EXT_load_store_op_none";
+            g_vk.store_op_none = true;
+        } else if (has_ext(ep, ne, "VK_QCOM_render_pass_store_ops")) {
+            ext[n_ext++] = "VK_QCOM_render_pass_store_ops";
+            g_vk.store_op_none = true;
+        }
+    }
 #endif
     free(ep);
 
@@ -862,7 +877,24 @@ static void create_device(void) {
     b->sampleRateShading = h->sampleRateShading;
     b->fragmentStoresAndAtomics = h->fragmentStoresAndAtomics;
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
+#ifdef __ANDROID__
+    // mhrise-arch (vk.cpp:208-228): robustBufferAccess forces per-load bounds checks in every shader (~15-25% GPU cost on Adreno).
+    // Keep enabled only on ARM Mali (vendor 0x13B5) or when LARECOMP_VK_ROBUST=1; disable on Adreno (vendor 0x5143) unless requested.
+    {
+        const char *er = getenv("LARECOMP_VK_ROBUST");
+        const char *en = getenv("LARECOMP_VK_NO_ROBUST");
+        bool want_robust = (g_vk.props.vendorID == 0x13B5u);
+        if (er && atoi(er) != 0) want_robust = true;
+        if (en && atoi(en) != 0) want_robust = false;
+        b->robustBufferAccess = (want_robust && h->robustBufferAccess) ? VK_TRUE : VK_FALSE;
+        g_vk.robust_buffer_access = (b->robustBufferAccess == VK_TRUE);
+        LOG("[vk-cap] mhrise-arch: robustBufferAccess=%u store_op_none=%u (vendor %#x)\n",
+            (unsigned)g_vk.robust_buffer_access, (unsigned)g_vk.store_op_none, g_vk.props.vendorID);
+    }
+#else
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
+    g_vk.robust_buffer_access = (b->robustBufferAccess == VK_TRUE);
+#endif
     b->shaderClipDistance = h->shaderClipDistance;
 #ifdef __ANDROID__
     if (!h->shaderInt64) LOG("[vk] no shaderInt64: translating shader address/carry math to 32-bit words\n");
@@ -1157,6 +1189,7 @@ static void create_swapchain(void) {
 
 static void recreate_swapchain(void) {
     vkDeviceWaitIdle(g_vk.dev);
+    vk_framegen_reset();
     create_swapchain();
 }
 
@@ -1203,6 +1236,10 @@ static void android_frame_rate(struct ANativeWindow *aw) {
     float want = g_settings.target_fps > 0
                      ? (float)g_settings.target_fps
                      : (g_settings.fps_mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f);
+    if (g_settings.frame_gen > 0 && want > 0.0f) {
+        want *= 2.0f;
+        if (want > 120.0f) want = 120.0f;
+    }
     if (aw == asked_aw && want == asked) return;
     // (libnativewindow's, looked up, not linked. Android 12+: with the change strategy ALWAYS - the plain call changes
     // the refresh only when it's seamless, and 120 -> 90 Hz isn't on the POCO F7 Ultra: it stayed at 120)
@@ -1513,6 +1550,7 @@ void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) 
 // ================================================================== game presentation (metal.m backend_present)
 // Draws the game's image into the window with the widescreen crop, then the overlay menu.
 extern void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]);
+extern void vk_present_draw_view(VkCommandBuffer cb, VkImageView src, float vx, float vy, float vw, float vh, const float pv[8]);
 void renderer_submit(void);
 void renderer_set_scale(float sx, float sy);
 uint64_t renderer_present_count(void);
@@ -1617,8 +1655,17 @@ void backend_present(NvnTexture *t) {
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded, as before anything outside a pass)
 #endif
-    // Kick the 3D scene GPU submission before acquiring a swapchain image so Adreno renders the scene
-    // concurrently while vkAcquireNextImageKHR waits and present_ms measures only acquire/blit/present.
+    // mhrise-arch: generate intermediate 2x optical-flow frame in the same submission right after the 3D scene
+    VkImageView fg_view = VK_NULL_HANDLE;
+#ifdef __ANDROID__
+    if (g_settings.frame_gen > 0) {
+        fg_view = vk_framegen_prepare(vk_cmd(), b);
+    } else {
+        vk_framegen_reset();
+    }
+#endif
+    // Kick the 3D scene (+ optical-flow compute) GPU submission before acquiring a swapchain image so Adreno
+    // renders concurrently while vkAcquireNextImageKHR waits.
     extern bool vk_has_pending_commands(void);
     if (vk_has_pending_commands()) renderer_submit();
     static const float black[4] = {0, 0, 0, 1};
@@ -1677,24 +1724,34 @@ void backend_present(NvnTexture *t) {
         renderer_set_scene_scale((float)os.scene_sx, (float)os.scene_sy);
         float sh_scale = (g_settings.shadow_scale >= 0.0f && g_settings.shadow_scale <= 1.0f) ? g_settings.shadow_scale : 1.0f;
         renderer_set_shadow_scale(sh_scale, sh_scale);
-        VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
         extern void vk_gp_note(VkCommandBuffer cb, const char *what);  // (LARECOMP_GPUPROF_AT: the present's own rows)
-        vk_gp_note(cb, "present: the image into the window");
-        vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
-        vk_gp_note(cb, "present: menus and overlay");
-        static long menu_at = -1;
-        if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
-        if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
-        menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
-        static long win_shot = -1;
-        if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
-        bool shot = win_shot && (long)total_frames + 1 == win_shot;
-        stall_note_active_work("vk_present");
-        vk_frame_end(shot ? "build/window.png" : NULL);
+        if (fg_view != VK_NULL_HANDLE) {
+            // Present optical-flow interpolated intermediate frame (t = 0.5) first, then acquire next image for real frame
+            VkCommandBuffer fg_cb = vk_cmd();
+            vk_present_draw_view(fg_cb, fg_view, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+            menu_render((void *)fg_cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+            vk_frame_end(NULL);
+            have = vk_frame_begin(black);
+        }
+        if (have) {
+            VkCommandBuffer cb = vk_cmd();
+            vk_gp_note(cb, "present: the image into the window");
+            vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+            vk_gp_note(cb, "present: menus and overlay");
+            static long menu_at = -1;
+            if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
+            if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
+            menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+            static long win_shot = -1;
+            if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
+            bool shot = win_shot && (long)total_frames + 1 == win_shot;
+            stall_note_active_work("vk_present");
+            vk_frame_end(shot ? "build/window.png" : NULL);
+            if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
+        }
         stall_note_active_work("vk_exec");
-        if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
     }

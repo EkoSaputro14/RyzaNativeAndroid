@@ -66,7 +66,11 @@ typedef struct {
     int async_spin_us;    // vk-render / async wait spin-wait window in microseconds before sleeping (default 250; 0 = off)
     int target_fps;       // Monotonic frame pacer / SurfaceFlinger hint target (0 = uncapped, 20, 30, 45, 60; default 30)
     int skip_postfx;      // KTGL heavy post-FX pass culling (0 = off, 1 = skip RLR/MRLR/GaussianBlur/TerrainShadow)
-    int gpu_unswizzle;    // Vulkan compute shader Tegra block-linear texture deswizzle (1 = GPU compute [default], 0 = CPU)
+    int gpu_unswizzle;    // Vulkan compute shader Tegra block-linear texture deswizzle (1 = GPU compute, 0 = CPU [safe default])
+    int fast_depth;       // mhrise-arch: Adreno LRZ preservation (EQUAL -> LEQUAL/GEQUAL for non-cutout meshes; 1 = on)
+    int tight_barriers;   // mhrise-arch: elide redundant full barriers when no GPU work intervened (1 = on on Adreno)
+    int tiler_store_none; // mhrise-arch: STORE_OP_NONE + pass lookahead + tight renderArea for Adreno GMEM (1 = on)
+    int frame_gen;        // mhrise-arch: built-in Vulkan compute 2x optical-flow frame gen (0 = off, 1 = 2x Light, 2 = 2x Balanced)
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
     char driver_env[256]; // the driver's own switches, NAME=value separated by spaces (Turnip's FD_DEV_FEATURES, TU_DEBUG;

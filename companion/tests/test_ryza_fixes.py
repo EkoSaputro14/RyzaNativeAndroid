@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -534,7 +534,7 @@ def _verify_p13_perf_optimizations():
 
     # 3. Internal resolution scaling (0.68x default on Android / Adreno 618) & scene render target promotion
     assert "float render_scale;" in settings_h
-    assert ".render_scale = 0.68f" in settings_c
+    assert ".render_scale = 0.60f" in settings_c or ".render_scale = 0.68f" in settings_c
     assert "g_settings.render_scale" in output_scale_c
     assert "vk_promote_scene_rt(" in textures_c and "vk_promote_scene_rt(" in exec_c
 
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,11 +1157,11 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
-    assert ".target_fps = 30" in settings_c and ".skip_postfx = 0" in settings_c
+    assert ".target_fps = 60" in settings_c and ".skip_postfx = 1" in settings_c
     assert "g_settings.target_fps" in menu_mm and "g_settings.skip_postfx" in menu_mm
     assert "g_settings.target_fps" in overlay_mm and "g_settings.skip_postfx" in overlay_mm
 
@@ -1216,9 +1216,9 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p21")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p21"' in forensics_c
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-1")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-1"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
     assert "bool usable_affinity = (fast_cnt >= 3);" in android_c
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,9 +1387,9 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 53" in gradle_kts and "0.3.2-forensic-p21" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-forensic-p21")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-forensic-p21"' in forensics_c
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-1")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-1"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
     assert "void vk_async_kick_flush(uint64_t target_seq)" in async_c
@@ -1421,3 +1421,70 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
 
 
 _verify_p21_blackscreen_and_unswizzle_fix()
+
+
+def _verify_exp_mhrise_arch():
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch (Adreno robustBufferAccess=false, STORE_OP_NONE lookahead, fast_depth LRZ, tight_barriers, 2x DIS optical-flow framegen, -O3, AThermal headroom)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    vk_h = (repo_root / "runtime" / "nvn" / "vulkan" / "vk.h").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    fg_h = (repo_root / "runtime" / "nvn" / "vulkan" / "framegen.h").read_text(encoding="utf-8")
+    fg_c = (repo_root / "runtime" / "nvn" / "vulkan" / "framegen.c").read_text(encoding="utf-8")
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    android_c = (repo_root / "runtime" / "platform" / "android.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+    cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
+
+    # 0. Version & CI branch trigger
+    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "- 'exp/*'" in workflow
+    assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
+
+    # 1. Settings & high-FPS experimental defaults
+    for field in ["int fast_depth;", "int tight_barriers;", "int tiler_store_none;", "int frame_gen;"]:
+        assert field in settings_h, f"Missing {field} in settings.h"
+    for d in [".fps_mode = 2", ".render_scale = 0.60f", ".shadow_scale = 0.25f", ".target_fps = 60",
+              ".skip_postfx = 1", ".fast_depth = 1", ".tight_barriers = 1", ".tiler_store_none = 1", ".frame_gen = 1"]:
+        assert d in settings_c, f"Missing default {d} in settings.c"
+
+    # 2. Pillar 1: Adreno robustBufferAccess=false + STORE_OP_NONE extension
+    assert "bool store_op_none;" in vk_h and "bool robust_buffer_access;" in vk_h
+    assert "VK_KHR_load_store_op_none" in device_c
+    assert "VK_QCOM_render_pass_store_ops" in device_c
+    assert "bool want_robust = (g_vk.props.vendorID == 0x13B5u);" in device_c
+
+    # 3. Pillar 2: GMEM STORE_OP_NONE lookahead + fast_depth LRZ + tight_barriers
+    assert "static PassWriteScan scan_pass_writes(" in exec_c
+    assert "(VkAttachmentStoreOp)1000301000" in exec_c
+    assert "VK_ATTACHMENT_STORE_OP_DONT_CARE" in exec_c
+    assert "cutout_meshes[CUTOUT_TAB]" in exec_c
+    assert "VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL" in exec_c
+    assert "g_settings.tight_barriers && !vk_driver_is_mali()" in exec_c
+    assert "void vk_present_draw_view(" in exec_c
+
+    # 4. Pillar 3: Built-in 5 DIS optical-flow compute shaders + framegen pipeline + double-present
+    for sh in ["fg_luma.comp", "fg_down.comp", "fg_patch.comp", "fg_densify.comp", "fg_warp.comp"]:
+        assert f'"{sh}"' in shaders_c, f"Missing embedded shader {sh}"
+    assert "VkImageView vk_framegen_prepare(" in fg_h and "VkImageView vk_framegen_prepare(" in fg_c
+    assert "vk_framegen_prepare(vk_cmd(), b)" in device_c
+    assert "vk_present_draw_view(fg_cb, fg_view" in device_c
+
+    # 5. Pillar 4: Native AThermal_getThermalHeadroom + UI controls + extern "C" linkage
+    assert "AThermal_getThermalHeadroom" in android_c
+    assert 'extern "C" bool vk_framegen_active(void);' in overlay_mm
+    for ui in [menu_mm, launcher_mm, overlay_mm]:
+        for key in ["fast_depth", "tight_barriers", "tiler_store_none", "frame_gen"]:
+            assert key in ui, f"Missing {key} in UI"
+
+    print("  -> PASS: exp/mhrise-arch (full mhrise-recomp high-FPS architecture) verified.")
+
+
+_verify_exp_mhrise_arch()

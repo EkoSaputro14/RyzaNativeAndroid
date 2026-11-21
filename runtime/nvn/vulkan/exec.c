@@ -112,6 +112,7 @@ typedef struct {
     VkCommandBuffer main, upload;
     VkCommandPool cpool;  // (their own pool, reset whole when the slot is reused - begin_cb)
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
+    bool barrier_clean;                 // mhrise-arch tight_barriers: no GPU work recorded on main since last barrier
     uint64_t seq;
     VkDescriptorPool pools[16];
     int npools, cur_pool;
@@ -747,6 +748,7 @@ static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
     *begun = true;
+    if (cb == &s->main) s->barrier_clean = true;
     atomic_store_explicit(&g_batch_pending, true, memory_order_release);
 }
 
@@ -817,12 +819,31 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+static uint64_t stat_elided_barriers;
+static uint64_t stat_store_none_att;
+static uint64_t stat_fast_depth_rewrites;
+
+void vk_mark_cb_dirty(VkCommandBuffer cb) {
+    Sub *s = &subs[cur_sub];
+    if (s->main_begun && cb == s->main) s->barrier_clean = false;
+}
+
 void vk_full_barrier(VkCommandBuffer cb) {
+    Sub *s = &subs[cur_sub];
+#ifdef __ANDROID__
+    // mhrise-arch tight_barriers (executor.cpp): elide redundant back-to-back full barriers on Adreno when no
+    // GPU work intervened (kept off on ARM Mali where driver barrier merging differs).
+    if (g_settings.tight_barriers && !vk_driver_is_mali() && s->main_begun && cb == s->main && s->barrier_clean) {
+        stat_elided_barriers++;
+        return;
+    }
+#endif
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
+    if (s->main_begun && cb == s->main) s->barrier_clean = true;
 }
 
 static void ring_retire(void);
@@ -2355,6 +2376,95 @@ static volatile uint64_t g_scene_frame;
 uint64_t vk_scene_frame(void) { return g_scene_frame; }
 
 static VkRect2D scissor_rect(void);
+// mhrise-arch: track last depth clear value (0.0 reverse-Z vs 1.0 standard-Z) for Adreno fast_depth LRZ preservation
+static float g_last_depth_clear = 1.0f;
+
+typedef struct {
+    uint8_t colors_written;
+    uint8_t colors_discarded;
+    bool depth_written;
+    bool depth_discarded;
+    bool stencil_written;
+    bool has_draw;
+    bool any_clear;
+    bool closed_cleanly;
+} PassWriteScan;
+
+// mhrise-arch (executor.cpp scan_pass): scan forward in the current command list to identify untouched or
+// discarded render targets before the pass closes, enabling VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE on Adreno GMEM.
+static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
+    PassWriteScan ps;
+    memset(&ps, 0, sizeof ps);
+    if (!start) return ps;
+    uint32_t cmask = st.channel_mask;
+    uint8_t ds0 = st.ds[0], ds1 = st.ds[1], ds3 = st.ds[3];
+    uint32_t smask = (st.stencil_mask[0] | st.stencil_mask[1]) & 0xFFu;
+    const CmdRec *q = start;
+    for (int step = 0; step < 256 && q && q->size; step++) {
+        const uint8_t *qx = (const uint8_t *)(q + 1);
+        switch (q->op) {
+        case CMD_END:
+        case CMD_CALL:
+            // End of command list or nested call: cannot prove pass ends here; stay conservative.
+            return ps;
+        case CMD_SET_RENDER_TARGETS:
+        case CMD_DISPATCH:
+        case CMD_DISPATCH_INDIRECT:
+        case CMD_COPY_BUFFER_TO_BUFFER:
+        case CMD_COPY_BUFFER_TO_TEXTURE:
+        case CMD_COPY_TEXTURE_TO_BUFFER:
+        case CMD_COPY_TEXTURE_TO_TEXTURE:
+        case CMD_DOWNSAMPLE:
+        case CMD_RESOLVE_DEPTH:
+        case CMD_CLEAR_TEXTURE:
+        case CMD_FENCE_SYNC:
+            ps.closed_cleanly = true;
+            return ps;
+        case CMD_BIND_CHANNEL_MASK:
+            memcpy(&cmask, qx, 4);
+            break;
+        case CMD_BIND_DEPTH_STENCIL:
+            ds0 = qx[0]; ds1 = qx[1]; ds3 = qx[3];
+            break;
+        case CMD_SET_STENCIL_MASK:
+            if (q->x[0] & 1) smask |= (uint32_t)(q->x[1] & 0xFFu);
+            if (q->x[0] & 2) smask |= (uint32_t)(q->x[1] & 0xFFu);
+            break;
+        case CMD_CLEAR_COLOR:
+            ps.any_clear = true;
+            if (q->x[0] < 8 && (q->x[2] & 0xFu)) ps.colors_written |= (uint8_t)(1u << q->x[0]);
+            break;
+        case CMD_CLEAR_DEPTH_STENCIL:
+            ps.any_clear = true;
+            if (q->x[0] != 0) ps.depth_written = true;
+            if (q->x[2] != 0) ps.stencil_written = true;
+            break;
+        case CMD_DISCARD_COLOR:
+            if (q->x[0] < 8) ps.colors_discarded |= (uint8_t)(1u << q->x[0]);
+            break;
+        case CMD_DISCARD_DEPTH_STENCIL:
+            ps.depth_discarded = true;
+            break;
+        case CMD_DRAW_ARRAYS:
+        case CMD_DRAW_ELEMENTS:
+        case CMD_DRAW_ARRAYS_INDIRECT:
+        case CMD_DRAW_ELEMENTS_INDIRECT:
+        case CMD_DRAW_TEXTURE:
+            ps.has_draw = true;
+            for (int i = 0; i < ncolor && i < 8; i++) {
+                if ((cmask >> (i * 4)) & 0xFu) ps.colors_written |= (uint8_t)(1u << i);
+            }
+            if (ds0 && ds1) ps.depth_written = true;
+            if (ds3 && smask) ps.stencil_written = true;
+            break;
+        default:
+            break;
+        }
+        q = (const CmdRec *)((const uint8_t *)q + q->size);
+    }
+    return ps;
+}
+
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     uint32_t prev_ncolor = pass_ncolor, prev_samples = pass_samples;
@@ -2566,7 +2676,7 @@ static void begin_pass(void) {
                     bool sz = has_s && st.rt.depth && renderer_format_has_stencil(st.rt.depth->format) && q->x[2] != 0 &&
                               (q->x[2] & 0xFF) == 0xFF && !(done >> 9 & 1);
                     if (q->x[0] != 0 && !dz) break;  // (a depth clear it can't take: left to vkCmdClearAttachments, and the rest)
-                    if (dz) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.clearValue.depthStencil.depth = q->f[0]; done |= 1u << 8; asp |= 1; }
+                    if (dz) { da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; da.clearValue.depthStencil.depth = q->f[0]; g_last_depth_clear = q->f[0]; done |= 1u << 8; asp |= 1; }
                     if (sz) { sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; sa.clearValue.depthStencil.stencil = (uint32_t)q->x[1]; done |= 1u << 9; asp |= 2; }
                     if (!asp) break;
                 } else break;
@@ -2575,6 +2685,44 @@ static void begin_pass(void) {
             }
         }
     }
+#ifdef __ANDROID__
+    // mhrise-arch: apply VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE to read-only or discarded attachments
+    // so Adreno GMEM avoids writing untouched tiles back to system RAM across KTGL's ~150 passes/frame.
+    if (g_settings.tiler_store_none && g_vk.store_op_none && g_cur_rec && !naliases) {
+        const VkAttachmentStoreOp kStoreNone = (VkAttachmentStoreOp)1000301000;
+        PassWriteScan ps = scan_pass_writes((const CmdRec *)g_cur_rec, (int)pass_ncolor);
+        if (ps.closed_cleanly) {
+            for (uint32_t i = 0; i < pass_ncolor; i++) {
+                if (!ca[i].imageView) continue;
+                if (ps.colors_discarded & (1u << i)) {
+                    ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    stat_store_none_att++;
+                } else if (!(ps.colors_written & (1u << i)) && ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    ca[i].storeOp = kStoreNone;
+                    stat_store_none_att++;
+                }
+            }
+            if (has_d) {
+                if (ps.depth_discarded) {
+                    da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    stat_store_none_att++;
+                } else if (!ps.depth_written && da.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    da.storeOp = kStoreNone;
+                    stat_store_none_att++;
+                }
+            }
+            if (has_s) {
+                if (ps.depth_discarded) {
+                    sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                    stat_store_none_att++;
+                } else if (!ps.stencil_written && sa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                    sa.storeOp = kStoreNone;
+                    stat_store_none_att++;
+                }
+            }
+        }
+    }
+#endif
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -2597,6 +2745,7 @@ static void begin_pass(void) {
     }
     vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
                        (VkSampleCountFlagBits)pass_samples);
+    vk_mark_cb_dirty(cb);
     if (g_debug_frame) pass_dump_b = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
     pass_dump_layer = ~0u;
     if (g_debug_frame && !pass_dump_b && st.rt.depth && st.rt.depth->backend) {  // depth only (shadow maps)
@@ -7183,6 +7332,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!cp->p.push_set0)
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
+    vk_mark_cb_dirty(cb);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
@@ -7730,6 +7880,25 @@ static void draw_(CmdRec *r, bool indexed) {
     if (tol < 0) tol = getenv("LARECOMP_VK_EQUAL_TOL") != NULL;
     bool equal_tol = dop == VK_COMPARE_OP_EQUAL && tol;
     if (equal_tol) dop = VK_COMPARE_OP_LESS_OR_EQUAL;
+#ifdef __ANDROID__
+    // mhrise-arch fast_depth (executor.cpp:7987-7997): Adreno disables hardware LRZ on VK_COMPARE_OP_EQUAL.
+    // Track cutout meshes written in depth-only passes with a fragment shader; for all other meshes in colour
+    // passes, rewrite EQUAL -> LESS_OR_EQUAL (or GREATER_OR_EQUAL for reverse-Z) so Adreno LRZ stays active.
+    if (g_settings.fast_depth && dt && !equal_tol) {
+        enum { CUTOUT_TAB = 4096 };
+        static uint64_t cutout_meshes[CUTOUT_TAB];
+        uint64_t ib_addr = indexed ? r->x[3] : 0ull;
+        uint64_t mesh = (st.vbuf[0].addr * 0x9E3779B97F4A7C15ull) ^ ib_addr;
+        if (!mesh) mesh = 1ull;
+        uint32_t slot_c = (uint32_t)((mesh ^ (mesh >> 32)) & (CUTOUT_TAB - 1));
+        if (pass_ncolor == 0 && dw && pr && pr->fi && pr->fi->msl && pr->fi->msl[0]) {
+            cutout_meshes[slot_c] = mesh;
+        } else if (pass_ncolor > 0 && dop == VK_COMPARE_OP_EQUAL && cutout_meshes[slot_c] != mesh) {
+            dop = (g_last_depth_clear < 0.5f) ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
+            stat_fast_depth_rewrites++;
+        }
+    }
+#endif
     bool sten = st.ds[3] && pass_stencil;
     uint32_t sface[2][7] = {{0}};  // per face: fail, pass, depth fail, compare, compare mask, write mask, reference
     if (sten) {
@@ -9552,6 +9721,32 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkCmdSetViewport(cb, 0, 1, &full);
     VkRect2D full_sc = {{0, 0}, g_vk.sc_extent};
     vkCmdSetScissor(cb, 0, 1, &full_sc);
+    vk_mark_cb_dirty(cb);
+}
+
+// mhrise-arch: direct present draw from an already-ready VkImageView (used by 2x optical-flow framegen)
+void vk_present_draw_view(VkCommandBuffer cb, VkImageView src, float vx, float vy, float vw, float vh, const float pv[8]) {
+    if (!src) return;
+    VkPipeline p = present_pipeline(g_vk.sc_format);
+    VkDescriptorSet ds = vk_alloc_set(present_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
+    VkViewport vp = {vx, vy, vw, vh, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    VkRect2D sc = {{(int32_t)vx, (int32_t)vy}, {(uint32_t)vw, (uint32_t)vh}};
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    ss_forget();
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &full);
+    VkRect2D full_sc = {{0, 0}, g_vk.sc_extent};
+    vkCmdSetScissor(cb, 0, 1, &full_sc);
+    vk_mark_cb_dirty(cb);
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
@@ -9916,6 +10111,7 @@ static void exec_list(uint64_t handle, int depth) {
                 alias_before_write(d, full, "clear");
             }
             if (st.rt.depth) {
+                if (r->x[0] != 0) g_last_depth_clear = r->f[0];
                 bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1], (uint32_t)r->x[2]);
             }

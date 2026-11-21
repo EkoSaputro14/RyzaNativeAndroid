@@ -1670,6 +1670,29 @@ static void prelaunch_tab(float sc) {
                 g_settings.gpu_unswizzle = unsw_b ? 1 : 0;
                 changed = true;
             }
+            bool fd_b = g_settings.fast_depth != 0;
+            if (ImGui::Checkbox(tr("Fast depth LRZ (mhrise-arch Adreno LRZ)"), &fd_b)) {
+                g_settings.fast_depth = fd_b ? 1 : 0;
+                changed = true;
+            }
+            bool tb_b = g_settings.tight_barriers != 0;
+            if (ImGui::Checkbox(tr("Tight barriers (mhrise-arch elide empty barriers)"), &tb_b)) {
+                g_settings.tight_barriers = tb_b ? 1 : 0;
+                changed = true;
+            }
+            bool sn_b = g_settings.tiler_store_none != 0;
+            if (ImGui::Checkbox(tr("Tiler STORE_OP_NONE (mhrise-arch Adreno GMEM)"), &sn_b)) {
+                g_settings.tiler_store_none = sn_b ? 1 : 0;
+                changed = true;
+            }
+            ImGui::PushID("fg_pre");
+            ImGui::Text("%s", tr("Optical-flow 2x Frame Gen (frame_gen)"));
+            changed |= ImGui::RadioButton(tr("Off"), &g_settings.frame_gen, 0);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("2x Light"), &g_settings.frame_gen, 1);
+            ImGui::SameLine();
+            changed |= ImGui::RadioButton(tr("2x Balanced"), &g_settings.frame_gen, 2);
+            ImGui::PopID();
             ImGui::PushID("targetfps_pre");
             ImGui::Text("%s", tr("Target FPS pacer (target_fps)"));
             changed |= ImGui::RadioButton(tr("Uncapped (0)"), &g_settings.target_fps, 0);

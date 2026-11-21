@@ -779,10 +779,40 @@ static void tab_display(void) {
     }
     {
         bool gpu_unsw_on = g_settings.gpu_unswizzle != 0;
-        if (opt_toggle("GPU texture unswizzle (compute)", &gpu_unsw_on, true,
+        if (opt_toggle("GPU texture unswizzle (compute)", &gpu_unsw_on, false,
                        "Offloads Tegra block-linear texture deswizzling from the CPU render thread to a Vulkan compute shader, "
                        "eliminating streaming hitches during camera pans and zone transitions. Applies at once.")) {
             g_settings.gpu_unswizzle = gpu_unsw_on ? 1 : 0;
+            settings_save();
+        }
+    }
+    {
+        static const char *const fg_opts[] = {"Off", "2x Light (DIS)", "2x Balanced (DIS)"};
+        int fgi = (g_settings.frame_gen >= 0 && g_settings.frame_gen <= 2) ? g_settings.frame_gen : 1;
+        if (opt_cycle("Optical-flow frame gen (mhrise-arch)", &fgi, fg_opts, 3, 1,
+                      "Built-in pure-Vulkan-compute 2x DIS bidirectional optical-flow frame generation (ported from mhrise-recomp). "
+                      "Doubles display smoothness (e.g. 30->60 FPS or 45->90 FPS) with ~2ms compute cost. Applies at once.")) {
+            g_settings.frame_gen = fgi;
+            settings_save();
+        }
+    }
+    {
+        bool fd_on = g_settings.fast_depth != 0;
+        if (opt_toggle("Fast depth LRZ (Adreno)", &fd_on, true,
+                       "Preserves Adreno hardware LRZ early-Z rejection by rewriting EQUAL depth tests to LEQUAL/GEQUAL on non-cutout meshes. Applies at once.")) {
+            g_settings.fast_depth = fd_on ? 1 : 0;
+            settings_save();
+        }
+        bool tb_on = g_settings.tight_barriers != 0;
+        if (opt_toggle("Tight barriers (Adreno)", &tb_on, true,
+                       "Elides redundant back-to-back full pipeline barriers when no GPU work intervened. Applies at once.")) {
+            g_settings.tight_barriers = tb_on ? 1 : 0;
+            settings_save();
+        }
+        bool sn_on = g_settings.tiler_store_none != 0;
+        if (opt_toggle("Tiler STORE_OP_NONE (GMEM)", &sn_on, true,
+                       "Uses VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE for read-only and discarded attachments so Adreno GMEM skips redundant tile writebacks. Applies at once.")) {
+            g_settings.tiler_store_none = sn_on ? 1 : 0;
             settings_save();
         }
     }

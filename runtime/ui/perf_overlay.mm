@@ -111,7 +111,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         ImGui::Begin("##perf", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::SetWindowFontScale(0.62f);
-        ImGui::TextColored(grade(fps, 55, 28), "FPS %.0f", fps);
+        extern "C" bool vk_framegen_active(void);
+        bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
+        if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "FPS %.0f (%.0fx2 FG)", fps * 2.0f, fps);
+        else ImGui::TextColored(grade(fps, 55, 28), "FPS %.0f", fps);
         {
             const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
             ImGui::SameLine();
@@ -135,7 +138,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::SetWindowFontScale(0.62f);
 
-    ImGui::TextColored(grade(fps, 55, 28), "%.0f FPS", fps);
+    extern "C" bool vk_framegen_active(void);
+    bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
+    if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "%.0f FPS (%.0f real + FG 2x)", fps * 2.0f, fps);
+    else ImGui::TextColored(grade(fps, 55, 28), "%.0f FPS", fps);
     {
         const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
         ImGui::SameLine();
@@ -316,6 +322,28 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         if (ImGui::SmallButton(g_settings.gpu_unswizzle ? "ON##gunsw" : "OFF##gunsw")) {
             g_settings.gpu_unswizzle = g_settings.gpu_unswizzle ? 0 : 1;
             ini_dirty = true;
+        }
+
+        ImGui::Text("mhrise-arch: fast_depth:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.fast_depth ? "ON##fd" : "OFF##fd")) { g_settings.fast_depth ^= 1; ini_dirty = true; }
+        ImGui::SameLine();
+        ImGui::Text("| tight_bar:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.tight_barriers ? "ON##tb" : "OFF##tb")) { g_settings.tight_barriers ^= 1; ini_dirty = true; }
+        ImGui::SameLine();
+        ImGui::Text("| store_none:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.tiler_store_none ? "ON##sn" : "OFF##sn")) { g_settings.tiler_store_none ^= 1; ini_dirty = true; }
+        ImGui::Text("frame_gen:");
+        ImGui::SameLine();
+        static const char *const fg_lbls[] = {"Off##fg", "2x Light##fg", "2x Bal##fg"};
+        for (int i = 0; i < 3; i++) {
+            bool sel = (g_settings.frame_gen == i);
+            if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::SmallButton(fg_lbls[i])) { g_settings.frame_gen = i; ini_dirty = true; }
+            if (sel) ImGui::PopStyleColor();
+            if (i < 2) ImGui::SameLine();
         }
 
         static const int tf_presets[] = {0, 20, 30, 45, 60};

@@ -1036,12 +1036,44 @@ static void find_sources(void) {
     fprintf(stderr, "[perf] %d CPU clusters, temperature from %s\n", g_npolicy, g_tzone[0] ? g_tzone : "(none readable)");
 }
 
+// mhrise-arch (perf_hint.cpp): native Android 12+ AThermal_getThermalHeadroom() background poller
+// (11s interval per NDK guidance) as fallback when JNI headroom is unavailable.
+static _Atomic float g_native_headroom = -1.0f;
+static void *native_thermal_thread(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "ThermalHeadroom");
+    void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    void *(*acq)(void) = lib ? (void *(*)(void))dlsym(lib, "AThermal_acquireManager") : NULL;
+    float (*get_h)(void *, int) = lib ? (float (*)(void *, int))dlsym(lib, "AThermal_getThermalHeadroom") : NULL;
+    void *mgr = (acq && get_h) ? acq() : NULL;
+    if (!mgr) return NULL;
+    for (;;) {
+        float h = get_h(mgr, 0);
+        if (h == h && h >= 0.0f) atomic_store_explicit(&g_native_headroom, h, memory_order_relaxed);
+        struct timespec ts = {11, 0};
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+static float native_thermal_headroom(void) {
+    static _Atomic int started = 0;
+    if (atomic_exchange_explicit(&started, 1, memory_order_relaxed) == 0) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, native_thermal_thread, NULL) == 0) pthread_detach(th);
+    }
+    return atomic_load_explicit(&g_native_headroom, memory_order_relaxed);
+}
+
 void plat_device_stats(PlatDeviceStats *out) {
     plat_refresh_fast_affinity();
     find_sources();
     pthread_mutex_lock(&g_ds_lock);
     *out = g_ds;
     pthread_mutex_unlock(&g_ds_lock);
+    if (out->headroom < 0.0f) {
+        float nh = native_thermal_headroom();
+        if (nh >= 0.0f) out->headroom = nh;
+    }
     out->ncluster = g_npolicy;
     for (int i = 0; i < g_npolicy; i++) out->cluster_mhz[i] = (uint32_t)(read_u64(g_policy[i]) / 1000);
     out->soc_temp_c = g_tzone[0] ? (float)read_u64(g_tzone) / 1000.0f : -1;

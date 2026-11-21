@@ -70,6 +70,8 @@ typedef struct {
     bool exec_stats;              // (Android, LARECOMP_SHADER_STATS=1) the compiler's statistics of each pipeline, logged
     bool fp16_supported;          // SPIR-V RelaxedPrecision / shaderFloat16 support for fragment shaders
     bool subgroup_quad;           // VK_SUBGROUP_FEATURE_QUAD_BIT: safe subgroupQuadSwap* for fragment SHFL.BFLY
+    bool store_op_none;           // VK_KHR/EXT_load_store_op_none or VK_QCOM_render_pass_store_ops (mhrise-arch)
+    bool robust_buffer_access;    // false on Adreno for max shader throughput (mhrise-arch), true on Mali
     uint32_t driver_id;           // VkPhysicalDeviceDriverProperties.driverID (cached in create_device)
     uint32_t api;                 // the device's Vulkan version as used: 1.3, or 1.1 / 1.2 with extensions (device.c)
 #endif
@@ -102,6 +104,7 @@ uint64_t vk_pending_seq(void);        // number the pending submission will get
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
 void vk_full_barrier(VkCommandBuffer cb);
+void vk_mark_cb_dirty(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
 
