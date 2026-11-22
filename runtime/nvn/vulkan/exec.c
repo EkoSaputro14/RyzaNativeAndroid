@@ -16,6 +16,7 @@
 #include <setjmp.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #endif
 
 #include "../../hle.h"
@@ -76,6 +77,7 @@ uint64_t prof_up_cum;  // (the same, never reset)
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
 static _Atomic int stat_compiles_pending;
+int vk_compiles_pending(void) { return atomic_load_explicit(&stat_compiles_pending, memory_order_relaxed); }
 static _Atomic uint64_t cum_compiles;
 static _Atomic uint64_t s_game_busy_ns_acc, s_game_busy_max_ns, s_game_busy_frames;
 static _Atomic uint64_t s_sync_wait_ns_acc, s_sync_wait_count, s_frame_sync_wait_ns;
@@ -1399,7 +1401,9 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 static void *worker(void *a) {
     (void)a;
 #ifdef __ANDROID__
-    plat_thread_pin_fast();
+    // mhrise-arch v2: keep multi-threaded pipeline compiler on background cores at nice +10 so guest-main/vk-render never slow-mo
+    plat_thread_pin_background();
+    setpriority(PRIO_PROCESS, 0, 10);
 #endif
     stall_set_thread_name("vk-worker", 0);
     crash_handler_install();
@@ -1417,9 +1421,14 @@ static void *worker(void *a) {
 }
 
 static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
-    return v;
+    static int env_sync = -1;
+    if (env_sync < 0) env_sync = getenv("LARECOMP_SYNC_SHADERS") != NULL;
+    if (env_sync) return true;
+#ifdef __ANDROID__
+    return g_settings.async_shaders == 0;
+#else
+    return false;
+#endif
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -1431,7 +1440,9 @@ static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
 #ifdef __ANDROID__
+    // mhrise-arch v2: fast core on 4+ big-core SoCs (no-op on 2-big-core SD732G) + nice +10 so guest-main/vk-render always preempt
     plat_thread_pin_fast();
+    setpriority(PRIO_PROCESS, 0, 10);
 #endif
     stall_set_thread_name("vk-translator", 0);
     crash_handler_install();
@@ -2041,9 +2052,16 @@ static _Atomic uint64_t g_wb_seq;
 uint64_t vk_last_writeback_seq(void) { return atomic_load(&g_wb_seq); }
 
 static bool wb_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("LARECOMP_NO_WRITEBACK") == NULL;
-    return on;
+    static int env_off = -1;
+    if (env_off < 0) env_off = getenv("LARECOMP_NO_WRITEBACK") != NULL;
+    if (env_off) return false;
+#ifdef __ANDROID__
+    // mhrise-arch v2 (use_return=false): skip automatic per-pass RT GPU->CPU write-back by default while
+    // preserving explicit CMD_COPY_TEXTURE_TO_BUFFER / CMD_COPY_BUFFER_TO_BUFFER readbacks.
+    return g_settings.gpu_writeback != 0;
+#else
+    return true;
+#endif
 }
 
 static bool wb_eligible(NvnTexture *t, TexBackend *b, uint32_t lv) {
@@ -2388,17 +2406,28 @@ typedef struct {
     bool has_draw;
     bool any_clear;
     bool closed_cleanly;
+    bool tight_valid;
+    int32_t min_x, min_y, max_x, max_y;
 } PassWriteScan;
 
+static uint64_t stat_tight_render_area;
+
 // mhrise-arch (executor.cpp scan_pass): scan forward in the current command list to identify untouched or
-// discarded render targets before the pass closes, enabling VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE on Adreno GMEM.
-static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
+// discarded render targets AND union draw scissor/viewport bounds for tight Adreno GMEM renderArea.
+static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor, float sx, float sy) {
     PassWriteScan ps;
     memset(&ps, 0, sizeof ps);
+    ps.min_x = INT32_MAX;
+    ps.min_y = INT32_MAX;
+    ps.max_x = INT32_MIN;
+    ps.max_y = INT32_MIN;
     if (!start) return ps;
     uint32_t cmask = st.channel_mask;
     uint8_t ds0 = st.ds[0], ds1 = st.ds[1], ds3 = st.ds[3];
     uint32_t smask = (st.stencil_mask[0] | st.stencil_mask[1]) & 0xFFu;
+    int32_t sc[4] = {st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]};
+    float vp[4] = {st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3]};
+    bool tight_ok = true;
     const CmdRec *q = start;
     for (int step = 0; step < 256 && q && q->size; step++) {
         const uint8_t *qx = (const uint8_t *)(q + 1);
@@ -2419,6 +2448,7 @@ static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
         case CMD_CLEAR_TEXTURE:
         case CMD_FENCE_SYNC:
             ps.closed_cleanly = true;
+            ps.tight_valid = tight_ok && ps.has_draw && ps.min_x < ps.max_x && ps.min_y < ps.max_y;
             return ps;
         case CMD_BIND_CHANNEL_MASK:
             memcpy(&cmask, qx, 4);
@@ -2428,6 +2458,12 @@ static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
             break;
         case CMD_SET_STENCIL:
             if (q->x[6] == 1 && (q->x[0] & 3)) smask |= (uint32_t)(q->x[1] & 0xFFu);
+            break;
+        case CMD_SET_SCISSORS:
+            if (q->x[0] == 0 && q->x[1] >= 1) memcpy(sc, qx, 16);
+            break;
+        case CMD_SET_VIEWPORTS:
+            if (q->x[0] == 0 && q->x[1] >= 1) memcpy(vp, qx, 16);
             break;
         case CMD_CLEAR_COLOR:
             ps.any_clear = true;
@@ -2455,6 +2491,33 @@ static PassWriteScan scan_pass_writes(const CmdRec *start, int ncolor) {
             }
             if (ds0 && ds1) ps.depth_written = true;
             if (ds3 && smask) ps.stencil_written = true;
+            if (tight_ok) {
+                if (q->op == CMD_DRAW_TEXTURE) {
+                    tight_ok = false;
+                } else {
+                    double vx0 = floor((double)vp[0] * (double)sx);
+                    double vy0 = floor((double)vp[1] * (double)sy);
+                    double vx1 = ceil(((double)vp[0] + (double)vp[2]) * (double)sx);
+                    double vy1 = ceil(((double)vp[1] + (double)vp[3]) * (double)sy);
+                    double sx0 = floor((double)sc[0] * (double)sx);
+                    double sy0 = floor((double)sc[1] * (double)sy);
+                    double sx1 = sc[2] >= 16384 ? vx1 : ceil(((double)sc[0] + (double)sc[2]) * (double)sx);
+                    double sy1 = sc[3] >= 16384 ? vy1 : ceil(((double)sc[1] + (double)sc[3]) * (double)sy);
+                    double x0 = vx0 > sx0 ? vx0 : sx0;
+                    double y0 = vy0 > sy0 ? vy0 : sy0;
+                    double x1 = vx1 < sx1 ? vx1 : sx1;
+                    double y1 = vy1 < sy1 ? vy1 : sy1;
+                    if (x1 > x0 && y1 > y0 && x0 >= -16384.0 && y0 >= -16384.0 && x1 <= 16384.0 && y1 <= 16384.0) {
+                        int32_t ix0 = (int32_t)x0, iy0 = (int32_t)y0, ix1 = (int32_t)x1, iy1 = (int32_t)y1;
+                        if (ix0 < ps.min_x) ps.min_x = ix0;
+                        if (iy0 < ps.min_y) ps.min_y = iy0;
+                        if (ix1 > ps.max_x) ps.max_x = ix1;
+                        if (iy1 > ps.max_y) ps.max_y = iy1;
+                    } else {
+                        tight_ok = false;
+                    }
+                }
+            }
             break;
         default:
             break;
@@ -2687,42 +2750,68 @@ static void begin_pass(void) {
 #ifdef __ANDROID__
     // mhrise-arch: apply VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE to read-only or discarded attachments
     // so Adreno GMEM avoids writing untouched tiles back to system RAM across KTGL's ~150 passes/frame.
-    if (g_settings.tiler_store_none && g_vk.store_op_none && g_cur_rec && !naliases) {
+    VkRect2D pass_area = {{0, 0}, {minw, minh}};
+    if (g_settings.tiler_store_none && g_cur_rec && !naliases) {
         const VkAttachmentStoreOp kStoreNone = (VkAttachmentStoreOp)1000301000;
-        PassWriteScan ps = scan_pass_writes((const CmdRec *)g_cur_rec, (int)pass_ncolor);
+        PassWriteScan ps = scan_pass_writes((const CmdRec *)g_cur_rec, (int)pass_ncolor, pass_sx, pass_sy);
         if (ps.closed_cleanly) {
-            for (uint32_t i = 0; i < pass_ncolor; i++) {
-                if (!ca[i].imageView) continue;
-                if (ps.colors_discarded & (1u << i)) {
-                    ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                    stat_store_none_att++;
-                } else if (!(ps.colors_written & (1u << i)) && ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
-                    ca[i].storeOp = kStoreNone;
-                    stat_store_none_att++;
+            if (g_vk.store_op_none) {
+                for (uint32_t i = 0; i < pass_ncolor; i++) {
+                    if (!ca[i].imageView) continue;
+                    if (ps.colors_discarded & (1u << i)) {
+                        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                        stat_store_none_att++;
+                    } else if (!(ps.colors_written & (1u << i)) && ca[i].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                        ca[i].storeOp = kStoreNone;
+                        stat_store_none_att++;
+                    }
+                }
+                if (has_d) {
+                    if (ps.depth_discarded) {
+                        da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                        stat_store_none_att++;
+                    } else if (!ps.depth_written && da.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                        da.storeOp = kStoreNone;
+                        stat_store_none_att++;
+                    }
+                }
+                if (has_s) {
+                    if (ps.depth_discarded) {
+                        sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                        stat_store_none_att++;
+                    } else if (!ps.stencil_written && sa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+                        sa.storeOp = kStoreNone;
+                        stat_store_none_att++;
+                    }
                 }
             }
-            if (has_d) {
-                if (ps.depth_discarded) {
-                    da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                    stat_store_none_att++;
-                } else if (!ps.depth_written && da.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
-                    da.storeOp = kStoreNone;
-                    stat_store_none_att++;
-                }
-            }
-            if (has_s) {
-                if (ps.depth_discarded) {
-                    sa.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                    stat_store_none_att++;
-                } else if (!ps.stencil_written && sa.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
-                    sa.storeOp = kStoreNone;
-                    stat_store_none_att++;
+            // mhrise-arch v2: shrink GMEM renderArea to union of draw scissor/viewport bounds when no clears occur
+            // (skip RS_OUT widescreen-shifted UI targets to avoid clipping shifted HUD elements).
+            bool any_load_clear = (has_d && da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) ||
+                                  (has_s && sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR);
+            for (uint32_t i = 0; i < pass_ncolor && !any_load_clear; i++)
+                if (ca[i].imageView && ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) any_load_clear = true;
+            bool is_rs_out = st.rt.ncolor && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_OUT;
+            if (!ps.any_clear && !any_load_clear && ps.tight_valid && !is_rs_out && minw > 0 && minh > 0) {
+                int32_t rx0 = ps.min_x > 2 ? ps.min_x - 2 : 0;
+                int32_t ry0 = ps.min_y > 2 ? ps.min_y - 2 : 0;
+                int32_t rx1 = ps.max_x + 2 < (int32_t)minw ? ps.max_x + 2 : (int32_t)minw;
+                int32_t ry1 = ps.max_y + 2 < (int32_t)minh ? ps.max_y + 2 : (int32_t)minh;
+                if (rx0 < rx1 && ry0 < ry1 &&
+                    ((uint64_t)(rx1 - rx0) * (uint64_t)(ry1 - ry0) < (uint64_t)minw * (uint64_t)minh)) {
+                    pass_area.offset.x = rx0;
+                    pass_area.offset.y = ry0;
+                    pass_area.extent.width = (uint32_t)(rx1 - rx0);
+                    pass_area.extent.height = (uint32_t)(ry1 - ry0);
+                    stat_tight_render_area++;
                 }
             }
         }
     }
+#else
+    VkRect2D pass_area = {{0, 0}, {minw, minh}};
 #endif
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = pass_area, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     {   // A destroyed view reaching the driver (#176, Mali: a crash in vkCmdBeginRendering after ~30 min): say which
@@ -5978,6 +6067,9 @@ static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
         if (slot >= 0 && slot == ga_nres - 1 && !ga_res[slot].shadow) ga_nres--;  // (the index taken back)
         return NULL;
     }
+#ifdef __ANDROID__
+    gm_note_gpu_write(ulo, uhi);
+#endif
     GaRes *n = &ga_res[slot];
     uint8_t *shadow = malloc(len);
     uint64_t *bseq = calloc((len + 255) / 256, sizeof *bseq);
@@ -6049,9 +6141,99 @@ static void gres_learn(uint32_t off) {
         (unsigned long long)in->lo, (unsigned long long)(in->hi - in->lo));
 }
 
+#ifdef __ANDROID__
+// mhrise-arch v2: Persistent Page-Tracked GPU Mirrors for large read-only global memory ranges (>= 64 KB).
+// Backed by a bounded 16 MB mirror budget inside ga_buf; refreshed page-by-page (4 KB dirty pages) via
+// plat_written_pages() / vc_page_gen with zero full-buffer memcmp() and zero arena ring thrashing.
+#define GM_MAX 128
+#define GM_MIN_SIZE 65536ull
+#define GM_MAX_SIZE (4ull << 20)
+#define GM_BUDGET (16ull << 20)
+typedef struct {
+    uint64_t lo, hi, off, synced_seq, used_seq;
+    uint32_t pt_gen;
+    bool live;
+} GmMirror;
+static GmMirror gm_tab[GM_MAX];
+static uint64_t gm_bytes;
+static uint64_t stat_gm_hits, stat_gm_dirty_pages, stat_gm_evicts;
+static int vk_sync_dirty_pages_to_arena(uint64_t lo, uint64_t hi, uint32_t since, uint64_t ga_off, uint32_t *now_pt);
+
+static void gm_note_gpu_write(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < GM_MAX; i++) {
+        if (!gm_tab[i].live) continue;
+        if (gm_tab[i].hi > lo && gm_tab[i].lo < hi) {
+            gm_tab[i].live = false;
+            stat_gm_evicts++;
+        }
+    }
+}
+
+static void gm_reset(void) {
+    memset(gm_tab, 0, sizeof gm_tab);
+    gm_bytes = 0;
+}
+
+static uint64_t gm_lookup_or_create(uint64_t at, uint64_t size) {
+    if (!g_settings.gpu_mirrors || size < GM_MIN_SIZE || size > GM_MAX_SIZE || !ga_ptr) return ~0ull;
+    uint64_t lo = at & ~4095ull;
+    uint64_t hi = (at + size + 4095ull) & ~4095ull;
+    if (hi > HEAP_MAX || hi <= lo) return ~0ull;
+    uint64_t len = hi - lo;
+    uint64_t seq = vk_pending_seq();
+    int free_slot = -1;
+    int reusable_slot = -1;
+    for (int i = 0; i < GM_MAX; i++) {
+        GmMirror *m = &gm_tab[i];
+        if (m->live && m->lo <= at && at + size <= m->hi) {
+            m->used_seq = seq;
+            if (m->synced_seq != seq) {
+                uint32_t now_pt = 0;
+                uint64_t ct0 = plat_now_ns();
+                int dirty = vk_sync_dirty_pages_to_arena(m->lo, m->hi, m->pt_gen, m->off, &now_pt);
+                if (dirty > 0) {
+                    stat_gm_dirty_pages += (uint64_t)dirty;
+                    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
+                }
+                if (now_pt) m->pt_gen = now_pt;
+                m->synced_seq = seq;
+            }
+            stat_gm_hits++;
+            return m->off + (at - m->lo);
+        }
+        if (!m->live && !m->hi && free_slot < 0) free_slot = i;
+        if (!m->live && m->hi > m->lo && (m->hi - m->lo) >= len && m->used_seq < seq && reusable_slot < 0)
+            reusable_slot = i;
+    }
+    int slot = reusable_slot >= 0 ? reusable_slot : free_slot;
+    uint64_t off = ~0ull;
+    if (reusable_slot >= 0) {
+        off = gm_tab[reusable_slot].off;
+    } else if (slot >= 0 && gm_bytes + len <= GM_BUDGET) {
+        off = ga_res_alloc(len);
+        if (off != ~0ull) gm_bytes += len;
+    }
+    if (off == ~0ull || slot < 0) return ~0ull;
+    uint64_t ct0 = plat_now_ns();
+    memcpy(ga_ptr + off, (const void *)(uintptr_t)(HEAP_BASE + lo), len);
+    ga_wrote(off, len);
+    atomic_fetch_add_explicit(&s_gcopy_ns_acc, plat_now_ns() - ct0, memory_order_relaxed);
+    uint32_t init_pt = 0;
+    (void)vk_pages_changed(HEAP_BASE + lo, len, 0, &init_pt);
+    gm_tab[slot] = (GmMirror){.lo = lo, .hi = hi, .off = off, .synced_seq = seq, .used_seq = seq, .pt_gen = init_pt, .live = true};
+    return off + (at - lo);
+}
+#endif
+
 // Load-only arena copies are immutable until their submission retires. Coalesce across batched lists and submissions
-// using page write-tracking and guest-RAM hashing so unchanged global memory ranges are not re-copied per draw.
+// using persistent GPU mirrors + page write-tracking and guest-RAM hashing so unchanged ranges are not re-copied.
 static uint64_t ga_load_copy(uint64_t at, uint64_t size) {
+#ifdef __ANDROID__
+    if (g_settings.gpu_mirrors && size >= GM_MIN_SIZE && size <= GM_MAX_SIZE) {
+        uint64_t moff = gm_lookup_or_create(at, size);
+        if (moff != ~0ull) return moff;
+    }
+#endif
     static struct { uint64_t at, size, off, seg_gen, gen, hash; uint32_t pt_gen; bool valid; } cache[256];
     static int reuse = -1;
     if (reuse < 0) { const char *e = getenv("LARECOMP_GCOPY_REUSE"); reuse = !e || atoi(e) != 0; }
@@ -6252,6 +6434,9 @@ static void gres_reset(void) {
     gc_nback = 0;  // (their shadow / bseq pointers and guest addresses belong to the boot being torn down)
     pthread_mutex_unlock(&gc_lock);
     for (int i = 0; i < ga_nres; i++) { free(ga_res[i].shadow); free(ga_res[i].bseq); }
+#ifdef __ANDROID__
+    gm_reset();
+#endif
     memset(ga_res, 0, sizeof ga_res);
     ga_nres = 0;
     ga_res_top = 0;
@@ -6522,7 +6707,25 @@ static uint64_t vc_budget_bytes(void) {
     }
     return budget;
 }
-typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+typedef struct {
+    uint64_t lo, hi, used_seq;
+    uint32_t gen, epoch;
+    VkBuffer buf;
+    VmaAllocation mem;
+    bool gpu;
+#ifdef __ANDROID__
+    // mhrise-arch v2: 3-Copy Direct Mirror promotion for frequently rewritten vertex/index buffers
+    bool direct;
+    bool promote_pending;
+    bool direct_noncoherent;
+    uint8_t direct_slot;
+    uint8_t rewrite_streak;
+    VkBuffer direct_buf[3];
+    VmaAllocation direct_mem[3];
+    uint8_t *direct_ptr[3];
+#endif
+} VcEnt;
+static uint64_t stat_mirror_direct_promos, stat_mirror_direct_hits;
 static VcEnt vc_tab[VC_TAB];
 static uint32_t vc_pend[VC_TAB];  // entries the pending submission draws from (vc_flush brings them up to date)
 static int vc_npend;
@@ -6548,13 +6751,87 @@ static void vc_free_dead(bool all) {
 }
 
 static bool vc_drop(VcEnt *e) {  // (freed once the submissions that may read it are done)
-    if (vc_ndead == VC_DEAD) { wait_why = "vcache drop"; vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
-    if (vc_ndead == VC_DEAD) return false;  // (all read by the pending submission: keep it)
-    vc_dead[vc_ndead].b = e->buf; vc_dead[vc_ndead].m = e->mem; vc_dead[vc_ndead++].seq = e->used_seq;
-    vc_bytes -= e->hi - e->lo;
+    int need_dead = 1;
+#ifdef __ANDROID__
+    if (e->direct) need_dead = 3;
+#endif
+    if (vc_ndead + need_dead > VC_DEAD) { wait_why = "vcache drop"; vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
+    if (vc_ndead + need_dead > VC_DEAD) return false;  // (all read by the pending submission: keep it)
+#ifdef __ANDROID__
+    if (e->direct) {
+        for (int k = 0; k < 3; k++) {
+            vc_dead[vc_ndead].b = e->direct_buf[k];
+            vc_dead[vc_ndead].m = e->direct_mem[k];
+            vc_dead[vc_ndead++].seq = e->used_seq;
+        }
+        vc_bytes -= (e->hi - e->lo) * 3ull;
+    } else
+#endif
+    {
+        vc_dead[vc_ndead].b = e->buf; vc_dead[vc_ndead].m = e->mem; vc_dead[vc_ndead++].seq = e->used_seq;
+        vc_bytes -= e->hi - e->lo;
+    }
     memset(e, 0, sizeof *e);
     return true;
 }
+
+#ifdef __ANDROID__
+// mhrise-arch v2: Promote a frequently rewritten VcEnt (3+ consecutive frames >=50% dirty) to a
+// 3-ring persistently mapped Direct Mirror (zero staging allocation, zero vkCmdCopyBuffer, zero transfer barrier).
+static void vc_promote_direct(VcEnt *e) {
+    uint64_t len = e->hi - e->lo;
+    if (e->direct || !g_settings.gpu_mirrors || len == 0 || len > (8ull << 20)) {
+        e->promote_pending = false;
+        return;
+    }
+    if (vc_bytes + len * 2ull > vc_budget_bytes() || vc_ndead >= VC_DEAD) {
+        e->promote_pending = false;
+        return;
+    }
+    VkBufferCreateInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = len,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+    };
+    VmaAllocationCreateInfo ai = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+    };
+    VkBuffer bufs[3] = {0};
+    VmaAllocation mems[3] = {0};
+    uint8_t *ptrs[3] = {0};
+    bool noncoh = false;
+    for (int k = 0; k < 3; k++) {
+        VmaAllocationInfo inf = {0};
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &bufs[k], &mems[k], &inf) != VK_SUCCESS || !inf.pMappedData) {
+            for (int j = 0; j < k; j++) vmaDestroyBuffer(g_vk.vma, bufs[j], mems[j]);
+            e->promote_pending = false;
+            return;
+        }
+        ptrs[k] = (uint8_t *)inf.pMappedData;
+        VkMemoryPropertyFlags mf = 0;
+        vmaGetMemoryTypeProperties(g_vk.vma, inf.memoryType, &mf);
+        if (!(mf & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) noncoh = true;
+    }
+    // Retire the single device-local buffer safely once its last submission finishes
+    vc_dead[vc_ndead].b = e->buf;
+    vc_dead[vc_ndead].m = e->mem;
+    vc_dead[vc_ndead++].seq = e->used_seq;
+    e->buf = bufs[0];  // keeps c->buf != NULL invariant for open-addressing probes
+    e->mem = VK_NULL_HANDLE;
+    for (int k = 0; k < 3; k++) {
+        e->direct_buf[k] = bufs[k];
+        e->direct_mem[k] = mems[k];
+        e->direct_ptr[k] = ptrs[k];
+    }
+    e->direct_noncoherent = noncoh;
+    e->direct_slot = 0;
+    e->direct = true;
+    e->promote_pending = false;
+    vc_bytes += len * 2ull;  // net +2x (3 copies replace 1)
+    stat_mirror_direct_promos++;
+}
+#endif
 
 static void vc_trim_to(uint64_t target_bytes) {
     uint64_t pend = vk_pending_seq();
@@ -6644,6 +6921,34 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
     }
     return changed;
 }
+
+#ifdef __ANDROID__
+// mhrise-arch v2: Copy ONLY dirty 4 KB pages in [lo, hi) into arena offset ga_off using shared vc_page_gen[].
+static int vk_sync_dirty_pages_to_arena(uint64_t lo, uint64_t hi, uint32_t since, uint64_t ga_off, uint32_t *now_pt) {
+    uint32_t g = 0;
+    int chg = vk_pages_changed(HEAP_BASE + lo, hi - lo, since, &g);
+    if (now_pt) *now_pt = g;
+    if (chg == 0) return 0;
+    if (chg < 0 || !vc_page_gen) {
+        memcpy(ga_ptr + ga_off, (const void *)(uintptr_t)(HEAP_BASE + lo), hi - lo);
+        ga_wrote(ga_off, hi - lo);
+        return (int)((hi - lo) / VC_PAGE);
+    }
+    int dirty = 0;
+    uint64_t p_lo = lo / VC_PAGE, p_hi = hi / VC_PAGE;
+    for (uint64_t p = p_lo; p < p_hi;) {
+        if (since && vc_page_gen[p] <= since) { p++; continue; }
+        uint64_t run_start = p;
+        while (p < p_hi && (!since || vc_page_gen[p] > since)) p++;
+        uint64_t off = (run_start - p_lo) * VC_PAGE;
+        uint64_t len = (p - run_start) * VC_PAGE;
+        memcpy(ga_ptr + ga_off + off, (const void *)(uintptr_t)(HEAP_BASE + lo + off), len);
+        ga_wrote(ga_off + off, len);
+        dirty += (int)(p - run_start);
+    }
+    return dirty;
+}
+#endif
 
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
@@ -6738,10 +7043,21 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     }
     if (e->gpu) { prof_vc_bypass++; return false; }
     if (e->used_seq != pend) {  // first use in this submission: brought up to date by vc_flush before it runs
+#ifdef __ANDROID__
+        if (e->promote_pending && !e->direct) vc_promote_direct(e);
+        if (e->direct) e->direct_slot = (uint8_t)((e->direct_slot + 1u) % 3u);
+#endif
         e->used_seq = pend;
         vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
     }
     prof_vc_hits++;
+#ifdef __ANDROID__
+    if (e->direct) {
+        *buf = e->direct_buf[e->direct_slot];
+        *off = addr - HEAP_BASE - lo;
+        return true;
+    }
+#endif
     *buf = e->buf;
     *off = addr - HEAP_BASE - lo;
     return true;
@@ -6762,10 +7078,18 @@ void vc_flush(void) {
     static uint64_t pages[4096];
     uint64_t t0 = SDL_GetTicksNS();
     for (int i = 0; i < vc_npend;) {
+#ifdef __ANDROID__
+        if (vc_tab[vc_pend[i]].direct) { i++; continue; }
+#endif
         uint64_t lo = vc_tab[vc_pend[i]].lo, hi = vc_tab[vc_pend[i]].hi;
         int j = i + 1;
-        for (; j < vc_npend && vc_tab[vc_pend[j]].lo <= hi + 64 * VC_PAGE; j++)
+        for (; j < vc_npend; j++) {
+#ifdef __ANDROID__
+            if (vc_tab[vc_pend[j]].direct) continue;
+#endif
+            if (vc_tab[vc_pend[j]].lo > hi + 64 * VC_PAGE) break;
             if (vc_tab[vc_pend[j]].hi > hi) hi = vc_tab[vc_pend[j]].hi;
+        }
         uint64_t pg = VC_PAGE;
         int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
         prof_vc_queries++;
@@ -6776,18 +7100,33 @@ void vc_flush(void) {
     }
     prof_vc_scan_ns += SDL_GetTicksNS() - t0;
     uint64_t vc_cp_t0 = plat_now_ns();
-    VkCommandBuffer cb = vk_upload_cmd();
+    VkCommandBuffer cb = VK_NULL_HANDLE;
     for (int i = 0; i < vc_npend; i++) {
         VcEnt *e = &vc_tab[vc_pend[i]];
+#ifdef __ANDROID__
+        if (e->direct) {
+            uint64_t len = e->hi - e->lo;
+            uint8_t slot = e->direct_slot;
+            memcpy(e->direct_ptr[slot], (const void *)(uintptr_t)(HEAP_BASE + e->lo), len);
+            if (e->direct_noncoherent) vmaFlushAllocation(g_vk.vma, e->direct_mem[slot], 0, len);
+            prof_vc_copied += len;
+            stat_mirror_direct_hits++;
+            e->gen = g;
+            continue;
+        }
+#endif
         VkBufferCopy cp[64];
         int nc = 0;
+        uint64_t dirty_pages = 0;
         for (uint64_t p = e->lo / VC_PAGE; p < e->hi / VC_PAGE; p++) {
             if (e->gen && vc_page_gen[p] <= e->gen) continue;
+            dirty_pages++;
             uint64_t o = p * VC_PAGE;
             if (nc && cp[nc - 1].srcOffset + cp[nc - 1].size == o) { cp[nc - 1].size += VC_PAGE; continue; }
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
+        if (nc && !cb) cb = vk_upload_cmd();
         if (nc && gmem_buf) vkCmdCopyBuffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
         else if (nc) {  // (copy mode: no heap buffer - the written pages go through the upload ring)
             uint64_t tot = 0, o = 0;
@@ -6800,6 +7139,17 @@ void vc_flush(void) {
             }
             vkCmdCopyBuffer(cb, sp.buf, e->buf, (uint32_t)nc, cp);
         }
+#ifdef __ANDROID__
+        if (g_settings.gpu_mirrors && !gmem_buf && (e->hi - e->lo) <= (8ull << 20)) {
+            uint64_t tot_pages = (e->hi - e->lo) / VC_PAGE;
+            if (dirty_pages > 0 && dirty_pages * 2ull >= tot_pages) {
+                if (e->rewrite_streak < 255) e->rewrite_streak++;
+                if (e->rewrite_streak >= 3) e->promote_pending = true;
+            } else {
+                e->rewrite_streak = 0;
+            }
+        }
+#endif
         for (int k = 0; k < nc; k++) prof_vc_copied += cp[k].size;
         e->gen = g;
     }
@@ -6880,8 +7230,15 @@ void vk_exec_reset(void) {
     pthread_mutex_lock(&cq_lock);
     for (int i = 0; i < SUBS; i++) { cq[i].n = 0; cq[i].ts = false; }
     pthread_mutex_unlock(&cq_lock);
-    for (int i = 0; i < VC_TAB; i++)  // (the vertex cache: copies of the old pages)
+    for (int i = 0; i < VC_TAB; i++) {  // (the vertex cache & 3-ring direct mirrors: copies of the old pages)
+#ifdef __ANDROID__
+        if (vc_tab[i].direct) {
+            for (int k = 0; k < 3; k++)
+                if (vc_tab[i].direct_buf[k]) vmaDestroyBuffer(g_vk.vma, vc_tab[i].direct_buf[k], vc_tab[i].direct_mem[k]);
+        } else
+#endif
         if (vc_tab[i].buf) vmaDestroyBuffer(g_vk.vma, vc_tab[i].buf, vc_tab[i].mem);
+    }
     memset(vc_tab, 0, sizeof vc_tab);
     vc_npend = 0;
     vc_free_dead(true);
@@ -7528,10 +7885,17 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(kc, st.rt.color, sizeof kc);
             kd = st.rt.depth;
             kframe = frame;
-            kkeep = !st.rt.depth && st.rt.ncolor && wait_no_depth();
+#ifdef __ANDROID__
+            // mhrise-arch v2: when async_shaders is enabled, skip uncompiled non-persistent graphics draws for 1-2 frames
+            // instead of blocking vk-render on wait_built() (only truly persistent multi-level/cubemap/3D targets wait).
+            bool async_skip = (g_settings.async_shaders != 0);
+#else
+            bool async_skip = false;
+#endif
+            kkeep = !async_skip && !st.rt.depth && st.rt.ncolor && wait_no_depth();
             for (int i = 0; i < st.rt.ncolor; i++) {  // (every target: rt_one_off records each one's frame)
                 bool once = rt_one_off(st.rt.color[i], frame);
-                kkeep |= rt_is_persistent(st.rt.color[i]) | (once && !st.rt.depth);
+                kkeep |= rt_is_persistent(st.rt.color[i]) | (!async_skip && once && !st.rt.depth);
             }
         }
         keep = kkeep;

@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,11 +1157,11 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
-    assert ".target_fps = 60" in settings_c and ".skip_postfx = 1" in settings_c
+    assert ".target_fps = 30" in settings_c and ".skip_postfx = 1" in settings_c
     assert "g_settings.target_fps" in menu_mm and "g_settings.skip_postfx" in menu_mm
     assert "g_settings.target_fps" in overlay_mm and "g_settings.skip_postfx" in overlay_mm
 
@@ -1216,9 +1216,9 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-1")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-1"' in forensics_c
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-2")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
     assert "bool usable_affinity = (fast_cnt >= 3);" in android_c
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,9 +1387,9 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-1")' in cmake_txt
-    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-1"' in forensics_c
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-2")' in cmake_txt
+    assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
     assert "void vk_async_kick_flush(uint64_t target_seq)" in async_c
@@ -1444,15 +1444,17 @@ def _verify_exp_mhrise_arch():
     workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
 
     # 0. Version & CI branch trigger
-    assert "versionCode = 54" in gradle_kts and "0.3.2-exp-mhrise-1" in gradle_kts
+    assert "versionCode = 55" in gradle_kts and "0.3.2-exp-mhrise-2" in gradle_kts
     assert "- 'exp/*'" in workflow
     assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
 
     # 1. Settings & high-FPS experimental defaults
     for field in ["int fast_depth;", "int tight_barriers;", "int tiler_store_none;", "int frame_gen;"]:
         assert field in settings_h, f"Missing {field} in settings.h"
-    for d in [".fps_mode = 2", ".render_scale = 0.60f", ".shadow_scale = 0.25f", ".target_fps = 60",
-              ".skip_postfx = 1", ".fast_depth = 1", ".tight_barriers = 1", ".tiler_store_none = 1", ".frame_gen = 1"]:
+    for d in [".fps_mode = 1", ".render_scale = 0.60f", ".shadow_scale = 0.25f", ".target_fps = 30",
+              ".present_mode = 2", ".swapchain_images = 4", ".skip_postfx = 1", ".fast_depth = 1",
+              ".tight_barriers = 1", ".tiler_store_none = 1", ".frame_gen = 1",
+              ".async_shaders = 1", ".gpu_mirrors = 1", ".gpu_writeback = 0"]:
         assert d in settings_c, f"Missing default {d} in settings.c"
 
     # 2. Pillar 1: Adreno robustBufferAccess=false + STORE_OP_NONE extension
@@ -1488,3 +1490,63 @@ def _verify_exp_mhrise_arch():
 
 
 _verify_exp_mhrise_arch()
+
+
+def _verify_exp_mhrise_arch_v2():
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch v2 (Auto-FIFO 30->60 + overload backoff, honest Real FPS, async_shaders, GPU Mirrors + 3-ring direct, gpu_writeback=0, tight renderArea)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    fg_h = (repo_root / "runtime" / "nvn" / "vulkan" / "framegen.h").read_text(encoding="utf-8")
+    fg_c = (repo_root / "runtime" / "nvn" / "vulkan" / "framegen.c").read_text(encoding="utf-8")
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+
+    # 1. Settings fields & INI persistence
+    for f in ["int async_shaders;", "int gpu_mirrors;", "int gpu_writeback;"]:
+        assert f in settings_h, f"Missing {f} in settings.h"
+    for k in ['"async_shaders"', '"gpu_mirrors"', '"gpu_writeback"']:
+        assert k in settings_c, f"Missing INI loader for {k} in settings.c"
+
+    # 2. Pillar A: Auto-FIFO swapchain + FrameGen warmup/hitch/overload auto-backoff state machine
+    assert "FG_STATUS_PAUSED_LOAD" in fg_h and "int vk_framegen_status(void);" in fg_h
+    assert "FG_WARM_FRAMES 3" in fg_c and "FG_HITCH_MS 100.0" in fg_c and "FG_OVERLOAD_EMA_MS 38.0" in fg_c
+    assert "{5u, 15u, 30u, 60u}" in fg_c
+    assert "if (g_settings.frame_gen > 0) {\n            want = VK_PRESENT_MODE_FIFO_KHR;" in device_c
+    assert "uint32_t fg_min = caps.minImageCount + 2u;" in device_c
+    assert "last_fg_on != fg_on" in device_c
+    assert "bool vk_is_fg_present_pass(void)" in device_c
+
+    # 3. Pillar B: Mass GPU->CPU RT write-back disabled by default
+    assert "return g_settings.gpu_writeback != 0;" in exec_c
+
+    # 4. Pillar C: Persistent GPU Mirrors + 3-Ring Direct Mirrors
+    assert "gm_lookup_or_create(" in exec_c and "vk_sync_dirty_pages_to_arena(" in exec_c
+    assert "gm_note_gpu_write(" in exec_c and "gm_reset();" in exec_c
+    assert "static void vc_promote_direct(VcEnt *e)" in exec_c
+    assert "e->direct_buf[e->direct_slot]" in exec_c and "e->rewrite_streak >= 3" in exec_c
+
+    # 5. Pillar D: Non-blocking async_shaders + low priority background threads
+    assert "return g_settings.async_shaders == 0;" in exec_c
+    assert "setpriority(PRIO_PROCESS, 0, 10);" in exec_c
+    assert "bool async_skip = (g_settings.async_shaders != 0);" in exec_c
+    assert "int vk_compiles_pending(void)" in exec_c
+
+    # 6. Pillar E: Tight GMEM renderArea in scan_pass_writes
+    assert "ps.tight_valid" in exec_c and "stat_tight_render_area++" in exec_c
+
+    # 7. Honest Real FPS overlay & UI controls
+    assert "vk_is_fg_present_pass()" in overlay_mm and "renderer_present_count()" in overlay_mm
+    assert "FG paused: load" in overlay_mm and "Shaders: %d" in overlay_mm
+    for ui in [menu_mm, launcher_mm, overlay_mm]:
+        for key in ["async_shaders", "gpu_mirrors", "gpu_writeback"]:
+            assert key in ui, f"Missing {key} in UI"
+
+    print("  -> PASS: exp/mhrise-arch v2 (full mhrise-recomp architecture + slow-mo/judder fix) verified.")
+
+
+_verify_exp_mhrise_arch_v2()

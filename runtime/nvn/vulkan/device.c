@@ -1049,9 +1049,16 @@ static VkPresentModeKHR present_mode(void) {
              : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     } else {
 #ifdef __ANDROID__
-        want = g_settings.present_mode == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR
-             : g_settings.present_mode == 2 ? VK_PRESENT_MODE_FIFO_KHR
-                                            : VK_PRESENT_MODE_MAILBOX_KHR;
+        // mhrise-arch v2 (mhrise-recomp/lsfg/framegen.cpp:12): 2x optical-flow frame generation REQUIRES
+        // VK_PRESENT_MODE_FIFO_KHR so SurfaceFlinger spaces generated frame G (VSync #1) and real frame N
+        // (VSync #2) evenly 16.6ms apart instead of Mailbox overwriting/bunching them into judder.
+        if (g_settings.frame_gen > 0) {
+            want = VK_PRESENT_MODE_FIFO_KHR;
+        } else {
+            want = g_settings.present_mode == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                 : g_settings.present_mode == 2 ? VK_PRESENT_MODE_FIFO_KHR
+                                                : VK_PRESENT_MODE_MAILBOX_KHR;
+        }
 #else
         want = VK_PRESENT_MODE_MAILBOX_KHR;
 #endif
@@ -1127,7 +1134,14 @@ static void create_swapchain(void) {
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
 #ifdef __ANDROID__
     uint32_t count = (uint32_t)(g_settings.swapchain_images >= 2 && g_settings.swapchain_images <= 5
-                                ? g_settings.swapchain_images : 3);
+                                ? g_settings.swapchain_images : 4);
+    // mhrise-arch v2: Auto-FIFO 2x frame generation needs minImageCount + 2 spare images (at least 4)
+    // so acquiring the real frame immediately after queuing generated frame G never stalls vk-render.
+    if (g_settings.frame_gen > 0) {
+        uint32_t fg_min = caps.minImageCount + 2u;
+        if (fg_min < 4u) fg_min = 4u;
+        if (count < fg_min) count = fg_min;
+    }
 #else
     uint32_t count = caps.minImageCount + 1;
     if (count > 3 && caps.minImageCount <= 3) count = 3;  // triple buffering: cuts BufferQueue/swapchain stall vs 5+ images
@@ -1236,8 +1250,8 @@ static void android_frame_rate(struct ANativeWindow *aw) {
     float want = g_settings.target_fps > 0
                      ? (float)g_settings.target_fps
                      : (g_settings.fps_mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f);
-    if (g_settings.frame_gen > 0 && want > 0.0f) {
-        want *= 2.0f;
+    if (g_settings.frame_gen > 0) {
+        want = (want > 0.0f) ? (want * 2.0f) : 60.0f;
         if (want > 120.0f) want = 120.0f;
     }
     if (aw == asked_aw && want == asked) return;
@@ -1316,10 +1330,14 @@ bool vk_frame_begin(const float clear[4]) {
     if (!w || !h) return false;  // minimised
 #ifdef __ANDROID__
     if (!android_surface_ready()) return false;
-    static int last_sc_images = -1, last_present_mode = -1;
-    bool sc_cfg_changed = (last_sc_images != g_settings.swapchain_images || last_present_mode != g_settings.present_mode);
+    static int last_sc_images = -1, last_present_mode = -1, last_fg_on = -1;
+    int fg_on = g_settings.frame_gen > 0 ? 1 : 0;
+    bool sc_cfg_changed = (last_sc_images != g_settings.swapchain_images ||
+                           last_present_mode != g_settings.present_mode ||
+                           last_fg_on != fg_on);
     last_sc_images = g_settings.swapchain_images;
     last_present_mode = g_settings.present_mode;
+    last_fg_on = fg_on;
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height || sc_cfg_changed) recreate_swapchain();
 #else
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
@@ -1582,6 +1600,8 @@ static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
 static NvnTexture *g_last_presented;
 
+static bool g_fg_present_pass = false;
+bool vk_is_fg_present_pass(void) { return g_fg_present_pass; }
 const float *vk_shot_crop(void) { return g_shot_crop; }
 
 void backend_present(NvnTexture *t);
@@ -1728,10 +1748,13 @@ void backend_present(NvnTexture *t) {
         memcpy(g_shot_crop, crop, sizeof crop);
         extern void vk_gp_note(VkCommandBuffer cb, const char *what);  // (LARECOMP_GPUPROF_AT: the present's own rows)
         if (fg_view != VK_NULL_HANDLE) {
-            // Present optical-flow interpolated intermediate frame (t = 0.5) first, then acquire next image for real frame
+            // Present optical-flow interpolated intermediate frame (t = 0.5) first onto FIFO VSync #1,
+            // then acquire the next spare swapchain image for real frame N onto FIFO VSync #2.
             VkCommandBuffer fg_cb = vk_cmd();
             vk_present_draw_view(fg_cb, fg_view, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+            g_fg_present_pass = true;
             menu_render((void *)fg_cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+            g_fg_present_pass = false;
             vk_frame_end(NULL);
             have = vk_frame_begin(black);
         }

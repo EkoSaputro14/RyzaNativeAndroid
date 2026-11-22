@@ -1681,8 +1681,23 @@ static void prelaunch_tab(float sc) {
                 changed = true;
             }
             bool sn_b = g_settings.tiler_store_none != 0;
-            if (ImGui::Checkbox(tr("Tiler STORE_OP_NONE (mhrise-arch Adreno GMEM)"), &sn_b)) {
+            if (ImGui::Checkbox(tr("Tiler STORE_OP_NONE + tight renderArea (Adreno GMEM)"), &sn_b)) {
                 g_settings.tiler_store_none = sn_b ? 1 : 0;
+                changed = true;
+            }
+            bool ash_b = g_settings.async_shaders != 0;
+            if (ImGui::Checkbox(tr("Async background shaders (skip 1-2 frames, zero stutter)"), &ash_b)) {
+                g_settings.async_shaders = ash_b ? 1 : 0;
+                changed = true;
+            }
+            bool gmir_b = g_settings.gpu_mirrors != 0;
+            if (ImGui::Checkbox(tr("Persistent GPU Mirrors + 3-Ring Direct Mirrors"), &gmir_b)) {
+                g_settings.gpu_mirrors = gmir_b ? 1 : 0;
+                changed = true;
+            }
+            bool gwb_b = g_settings.gpu_writeback != 0;
+            if (ImGui::Checkbox(tr("Legacy GPU->CPU RT write-back (OFF = mhrise-recomp high FPS)"), &gwb_b)) {
+                g_settings.gpu_writeback = gwb_b ? 1 : 0;
                 changed = true;
             }
             ImGui::PushID("fg_pre");

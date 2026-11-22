@@ -810,9 +810,27 @@ static void tab_display(void) {
             settings_save();
         }
         bool sn_on = g_settings.tiler_store_none != 0;
-        if (opt_toggle("Tiler STORE_OP_NONE (GMEM)", &sn_on, true,
-                       "Uses VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE for read-only and discarded attachments so Adreno GMEM skips redundant tile writebacks. Applies at once.")) {
+        if (opt_toggle("Tiler STORE_OP_NONE + tight renderArea", &sn_on, true,
+                       "Uses VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE and tight draw-bounds renderArea so Adreno GMEM skips redundant tile writebacks. Applies at once.")) {
             g_settings.tiler_store_none = sn_on ? 1 : 0;
+            settings_save();
+        }
+        bool ash_on = g_settings.async_shaders != 0;
+        if (opt_toggle("Async shaders (mhrise-arch)", &ash_on, true,
+                       "Compiles missing graphics shaders/pipelines on low-priority background workers (skipping draws for 1-2 frames instead of stuttering). Applies at once.")) {
+            g_settings.async_shaders = ash_on ? 1 : 0;
+            settings_save();
+        }
+        bool gmir_on = g_settings.gpu_mirrors != 0;
+        if (opt_toggle("GPU Mirrors + 3-Ring Direct", &gmir_on, true,
+                       "Keeps large read-only guest buffers in persistent page-tracked GPU mirrors and promotes hot vertex/index buffers to 3-ring direct mapped memory. Applies at once.")) {
+            g_settings.gpu_mirrors = gmir_on ? 1 : 0;
+            settings_save();
+        }
+        bool gwb_on = g_settings.gpu_writeback != 0;
+        if (opt_toggle("GPU->CPU RT write-back (legacy)", &gwb_on, false,
+                       "Automatic per-pass render-target readback to guest RAM. Keep OFF (mhrise-recomp default) for maximum FPS; explicit copy readbacks remain enabled. Applies at once.")) {
+            g_settings.gpu_writeback = gwb_on ? 1 : 0;
             settings_save();
         }
     }

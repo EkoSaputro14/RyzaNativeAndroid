@@ -72,9 +72,24 @@ static struct {
 
     uint64_t seq_n;
     uint64_t last_ns;
+    uint64_t hold_until;
+    uint64_t backoff_until;
+    double ema_ms;
+    int warm_count;
+    int overload_streak;
+    int smooth_streak;
+    int backoff_level;
     _Atomic uint64_t generated_total;
     _Atomic bool is_active;
+    _Atomic int status;
+    _Atomic uint32_t backoff_rem_sec;
 } g_fg;
+
+#define FG_WARM_FRAMES 3
+#define FG_HITCH_MS 100.0
+#define FG_TOO_FAST_MS 22.0
+#define FG_OVERLOAD_EMA_MS 38.0
+#define FG_OVERLOAD_FRAMES 15
 
 static VkExtent2D fg_grid(VkExtent2D lv) {
     uint32_t gw = (lv.width > 8u ? lv.width - 8u : 0u);
@@ -454,10 +469,32 @@ static void fg_dispatch(VkCommandBuffer cb, int pass, VkDescriptorSet set, VkExt
         vkCmdDispatch(cb, (size.width + 7u) / 8u, (size.height + 7u) / 8u, 1);
 }
 
+static void fg_hard_reset(void) {
+    g_fg.seq_n = 0;
+    g_fg.last_ns = 0;
+    g_fg.hold_until = 0;
+    g_fg.backoff_until = 0;
+    g_fg.ema_ms = 33.333;
+    g_fg.warm_count = 0;
+    g_fg.overload_streak = 0;
+    g_fg.smooth_streak = 0;
+    g_fg.backoff_level = 0;
+    atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+    atomic_store_explicit(&g_fg.status, FG_STATUS_OFF, memory_order_relaxed);
+    atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
+}
+
 void vk_framegen_reset(void) {
     g_fg.seq_n = 0;
     g_fg.last_ns = 0;
+    g_fg.warm_count = 0;
+    g_fg.overload_streak = 0;
+    g_fg.smooth_streak = 0;
     atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+    if (!g_fg.backoff_until) {
+        atomic_store_explicit(&g_fg.status, FG_STATUS_OFF, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
+    }
 }
 
 uint64_t vk_framegen_generated_count(void) {
@@ -468,17 +505,115 @@ bool vk_framegen_active(void) {
     return atomic_load_explicit(&g_fg.is_active, memory_order_relaxed);
 }
 
+int vk_framegen_status(void) {
+    return atomic_load_explicit(&g_fg.status, memory_order_relaxed);
+}
+
+uint32_t vk_framegen_backoff_sec(void) {
+    return atomic_load_explicit(&g_fg.backoff_rem_sec, memory_order_relaxed);
+}
+
+double vk_framegen_ema_ms(void) {
+    return g_fg.ema_ms > 0.0 ? g_fg.ema_ms : 33.333;
+}
+
 VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
 #ifdef __ANDROID__
     int mode = g_settings.frame_gen;
 #else
     int mode = 0;
 #endif
-    if (mode <= 0 || !src_tex || !src_tex->image || src_tex->width < 64u || src_tex->height < 64u ||
+    if (mode <= 0) {
+        fg_hard_reset();
+        return VK_NULL_HANDLE;
+    }
+    if (!src_tex || !src_tex->image || src_tex->width < 64u || src_tex->height < 64u ||
         (src_tex->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_framegen_reset();
         return VK_NULL_HANDLE;
     }
+
+    uint64_t now = plat_now_ns();
+    double dt_ms = (g_fg.last_ns > 0 && now > g_fg.last_ns) ? (double)(now - g_fg.last_ns) / 1e6 : 33.333;
+    g_fg.last_ns = now;
+    if (g_fg.ema_ms <= 0.0) g_fg.ema_ms = 33.333;
+    if (dt_ms > 1.0 && dt_ms < 250.0) {
+        g_fg.ema_ms = g_fg.ema_ms * 0.85 + dt_ms * 0.15;
+    }
+
+    // 1. Exponential overload auto-backoff (5s -> 15s -> 30s -> 60s): skip ALL optical-flow GPU work during cooldown
+    // so Adreno 618 immediately recovers full 30 FPS real-time speed without slow-motion.
+    if (g_fg.backoff_until > 0) {
+        if (now < g_fg.backoff_until) {
+            uint32_t rem = (uint32_t)((g_fg.backoff_until - now + 999999999ull) / 1000000000ull);
+            atomic_store_explicit(&g_fg.backoff_rem_sec, rem, memory_order_relaxed);
+            atomic_store_explicit(&g_fg.status, FG_STATUS_PAUSED_LOAD, memory_order_relaxed);
+            atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+            g_fg.warm_count = 0;
+            return VK_NULL_HANDLE;
+        }
+        g_fg.backoff_until = 0;
+        g_fg.ema_ms = 33.333;
+        g_fg.warm_count = 0;
+        g_fg.overload_streak = 0;
+        atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
+        LOG("[framegen] overload backoff ended -> resuming warmup\n");
+    }
+
+    // 2. Hitch hold (mhrise-recomp framegen.cpp kHitchMs=100ms -> 1s pause, zero compute cost during loads/transitions)
+    if (g_fg.seq_n > 0 && dt_ms > FG_HITCH_MS) {
+        g_fg.hold_until = now + 1000000000ull;
+        g_fg.warm_count = 0;
+        g_fg.overload_streak = 0;
+    }
+    if (g_fg.hold_until > 0) {
+        if (now < g_fg.hold_until) {
+            atomic_store_explicit(&g_fg.status, FG_STATUS_PAUSED_HITCH, memory_order_relaxed);
+            atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+            return VK_NULL_HANDLE;
+        }
+        g_fg.hold_until = 0;
+        g_fg.warm_count = 0;
+    }
+
+    // 3. Overload detector while FG is active: if real frame EMA stays > 38.0 ms (<26.3 FPS) for 15 frames, back off!
+    if (g_fg.warm_count >= FG_WARM_FRAMES) {
+        if (g_fg.ema_ms > FG_OVERLOAD_EMA_MS) {
+            g_fg.smooth_streak = 0;
+            if (++g_fg.overload_streak >= FG_OVERLOAD_FRAMES) {
+                static const uint32_t kBackoffSecs[4] = {5u, 15u, 30u, 60u};
+                uint32_t sec = kBackoffSecs[g_fg.backoff_level < 4 ? g_fg.backoff_level : 3];
+                if (g_fg.backoff_level < 3) g_fg.backoff_level++;
+                g_fg.backoff_until = now + (uint64_t)sec * 1000000000ull;
+                g_fg.warm_count = 0;
+                g_fg.overload_streak = 0;
+                atomic_store_explicit(&g_fg.backoff_rem_sec, sec, memory_order_relaxed);
+                atomic_store_explicit(&g_fg.status, FG_STATUS_PAUSED_LOAD, memory_order_relaxed);
+                atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+                LOG("[framegen] overload auto-backoff: real ema %.1f ms (>38ms) -> pausing FG for %us (level %d)\n",
+                    g_fg.ema_ms, sec, g_fg.backoff_level);
+                return VK_NULL_HANDLE;
+            }
+        } else {
+            g_fg.overload_streak = 0;
+            if (g_fg.ema_ms <= 35.0) {
+                if (++g_fg.smooth_streak >= 90) {
+                    g_fg.backoff_level = 0;
+                    g_fg.smooth_streak = 0;
+                }
+            } else {
+                g_fg.smooth_streak = 0;
+            }
+        }
+    }
+
+    // 4. Too-fast skip (mhrise-recomp kTooFastMs): if real FPS is already >45 FPS natively, skip FG compute cost
+    if (g_fg.warm_count >= FG_WARM_FRAMES && dt_ms < FG_TOO_FAST_MS && g_fg.ema_ms < FG_TOO_FAST_MS) {
+        atomic_store_explicit(&g_fg.status, FG_STATUS_TOO_FAST, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+        return VK_NULL_HANDLE;
+    }
+
     if (!fg_build_pipelines()) {
         vk_framegen_reset();
         return VK_NULL_HANDLE;
@@ -507,6 +642,7 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
             return VK_NULL_HANDLE;
         }
         rebuilt = true;
+        g_fg.warm_count = 0;
     }
 
     if (!g_fg.images_initialized) fg_init_layouts(cb);
@@ -545,7 +681,7 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
                              0, 1, &mb, 0, NULL, 0, NULL);
     }
 
-    // Build luma pyramid for current frame
+    // Build luma pyramid for current frame (also populates history during warmup)
     VkExtent2D full_ext = {fw, fh};
     fg_dispatch(cb, FG_PASS_LUMA, g_fg.luma_set[p], g_fg.lum[p][0].extent, full_ext, 0, (int)scale, 0.5f, false);
     for (int l = 1; l < g_fg.levels; l++) {
@@ -553,8 +689,8 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
         fg_dispatch(cb, FG_PASS_DOWN, g_fg.down_set[p][l], g_fg.lum[p][l].extent, g_fg.lum[p][l - 1].extent, 0, 0, 0.5f, false);
     }
 
-    uint64_t now = plat_now_ns();
-    bool can_gen = !rebuilt && g_fg.seq_n > 0 && g_fg.last_ns > 0 && (now - g_fg.last_ns) < 250000000ull;
+    if (g_fg.warm_count < FG_WARM_FRAMES) g_fg.warm_count++;
+    bool can_gen = !rebuilt && g_fg.seq_n > 0 && g_fg.warm_count >= FG_WARM_FRAMES;
 
     if (can_gen) {
         fg_compute_barrier(cb);
@@ -584,12 +720,13 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
                              0, 1, &mb, 0, NULL, 0, NULL);
         atomic_fetch_add_explicit(&g_fg.generated_total, 1, memory_order_relaxed);
         atomic_store_explicit(&g_fg.is_active, true, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.status, FG_STATUS_ACTIVE, memory_order_relaxed);
     } else {
         atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.status, FG_STATUS_WARMUP, memory_order_relaxed);
     }
 
     vk_mark_cb_dirty(cb);
     g_fg.seq_n++;
-    g_fg.last_ns = now;
     return can_gen ? g_fg.output.view : VK_NULL_HANDLE;
 }

@@ -12,8 +12,22 @@
 
 #include "imgui.h"
 
+enum {
+    FG_STATUS_OFF = 0,
+    FG_STATUS_WARMUP = 1,
+    FG_STATUS_ACTIVE = 2,
+    FG_STATUS_PAUSED_HITCH = 3,
+    FG_STATUS_PAUSED_LOAD = 4,
+    FG_STATUS_TOO_FAST = 5,
+};
+
 extern "C" {
 bool vk_framegen_active(void);
+int vk_framegen_status(void);
+uint32_t vk_framegen_backoff_sec(void);
+bool vk_is_fg_present_pass(void);
+uint64_t renderer_present_count(void);
+int vk_compiles_pending(void);
 extern int g_exec_mode;
 extern uint64_t g_bench_native_calls, g_bench_recomp_calls;
 extern uint64_t g_bench_native_ns, g_bench_recomp_ns;
@@ -54,38 +68,46 @@ static void record(void) {
 }
 
 void perf_overlay_draw(ImVec2 display, float scale) {
-    // frame times: this runs once per presented frame
+    // Frame times: record ONLY real game frames (ignore intermediate optical-flow FG pass so
+    // frame-time graph, P50/P95/P99, and Real FPS are 100% honest and never double-counted).
     static float ft[FT_N];
     static int nft, head;
     static uint64_t last_ns;
+    bool is_fg_pass = vk_is_fg_present_pass();
     uint64_t now = SDL_GetTicksNS();
-    if (last_ns) {
-        ft[head] = (float)((now - last_ns) / 1e6);
-        head = (head + 1) % FT_N;
-        if (nft < FT_N) nft++;
+    if (!is_fg_pass) {
+        if (last_ns) {
+            ft[head] = (float)((now - last_ns) / 1e6);
+            head = (head + 1) % FT_N;
+            if (nft < FT_N) nft++;
+        }
+        last_ns = now;
     }
-    last_ns = now;
 
     // the rest twice a second
-    static uint64_t next_ns, t0, wait0;
-    static int frames;
-    static float fps, avg_ms, max_ms, wait_pct;
+    static uint64_t next_ns, t0, wait0, real0;
+    static int out_frames;
+    static float fps, out_fps, avg_ms, max_ms, wait_pct;
     static float p50_ms, p95_ms, p99_ms;
     static double s_overlay_cpu_exec_ms, s_overlay_gpu_ms;
     static double s_overlay_guest_ms, s_overlay_sync_ms, s_overlay_present_ms, s_overlay_copy_ms;
     static uint64_t s_overlay_draws;
     static PlatDeviceStats ds;
-    frames++;
-    if (now >= next_ns) {
+    out_frames++;
+    if (!is_fg_pass && now >= next_ns) {
         uint64_t w = vk_cum_wait_ns();
+        uint64_t rcur = renderer_present_count();
         if (t0) {
             double dt = (now - t0) / 1e9;
-            fps = (float)(frames / dt);
+            uint64_t rdelta = rcur >= real0 ? (rcur - real0) : 0;
+            fps = (float)(rdelta / dt);
+            out_fps = (float)(out_frames / dt);
             wait_pct = (float)((w - wait0) / 1e9 / dt * 100.0);
             if (wait_pct > 100) wait_pct = 100;
         }
         wait0 = w;
-        frames = 0;
+        real0 = rcur;
+        out_frames = 0;
         t0 = now;
         next_ns = now + 500000000ull;
         float s = 0, mx = 0;
@@ -112,9 +134,18 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         ImGui::Begin("##perf", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                                          ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::SetWindowFontScale(0.62f);
-        bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
-        if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "FPS %.0f (%.0fx2 FG)", fps * 2.0f, fps);
-        else ImGui::TextColored(grade(fps, 55, 28), "FPS %.0f", fps);
+        int fgs = vk_framegen_status();
+        const char *fg_q = g_settings.frame_gen == 2 ? "Bal" : "Light";
+        if (fgs == FG_STATUS_ACTIVE)
+            ImGui::TextColored(grade(fps, 28, 22), "%.0f -> %.0f FG [%s]", fps, out_fps > fps ? out_fps : fps * 2.0f, fg_q);
+        else if (fgs == FG_STATUS_PAUSED_LOAD)
+            ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG load %us]", fps, vk_framegen_backoff_sec());
+        else if (fgs == FG_STATUS_PAUSED_HITCH)
+            ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG hitch]", fps);
+        else if (fgs == FG_STATUS_WARMUP)
+            ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG warm]", fps);
+        else
+            ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS", fps);
         {
             const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
             ImGui::SameLine();
@@ -138,9 +169,20 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::SetWindowFontScale(0.62f);
 
-    bool fg_live = (g_settings.frame_gen > 0) && vk_framegen_active();
-    if (fg_live) ImGui::TextColored(grade(fps * 2.0f, 55, 28), "%.0f FPS (%.0f real + FG 2x)", fps * 2.0f, fps);
-    else ImGui::TextColored(grade(fps, 55, 28), "%.0f FPS", fps);
+    int fgs = vk_framegen_status();
+    const char *fg_q = g_settings.frame_gen == 2 ? "Bal" : "Light";
+    if (fgs == FG_STATUS_ACTIVE)
+        ImGui::TextColored(grade(fps, 28, 22), "%.0f real -> %.0f FG [%s]", fps, out_fps > fps ? out_fps : fps * 2.0f, fg_q);
+    else if (fgs == FG_STATUS_PAUSED_LOAD)
+        ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG paused: load %us]", fps, vk_framegen_backoff_sec());
+    else if (fgs == FG_STATUS_PAUSED_HITCH)
+        ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG paused: hitch]", fps);
+    else if (fgs == FG_STATUS_WARMUP)
+        ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS [FG warmup]", fps);
+    else if (fgs == FG_STATUS_TOO_FAST)
+        ImGui::TextColored(grade(fps, 45, 28), "%.0f FPS [FG idle: fast]", fps);
+    else
+        ImGui::TextColored(grade(fps, 28, 22), "%.0f FPS", fps);
     {
         const char *ms = g_exec_mode == 1 ? "Recomp" : g_exec_mode == 2 ? "Hybrid" : "Native";
         ImGui::SameLine();
@@ -148,6 +190,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%.1f ms", fps > 0 ? 1000.0f / fps : 0.0f);
+    {
+        int sh_pend = vk_compiles_pending();
+        if (sh_pend > 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "| Shaders: %d", sh_pend);
+        }
+    }
     float graph[FT_N];  // (oldest first)
     for (int i = 0; i < nft; i++) graph[i] = ft[(head - nft + i + FT_N) % FT_N];
     ImGui::PushStyleColor(ImGuiCol_PlotLines, grade(fps, 55, 28));
@@ -344,6 +393,17 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             if (sel) ImGui::PopStyleColor();
             if (i < 2) ImGui::SameLine();
         }
+        ImGui::Text("async_sh:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.async_shaders ? "ON##ash" : "OFF##ash")) { g_settings.async_shaders ^= 1; ini_dirty = true; }
+        ImGui::SameLine();
+        ImGui::Text("| mirrors:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.gpu_mirrors ? "ON##gmir" : "OFF##gmir")) { g_settings.gpu_mirrors ^= 1; ini_dirty = true; }
+        ImGui::SameLine();
+        ImGui::Text("| wb:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.gpu_writeback ? "ON##gwb" : "OFF##gwb")) { g_settings.gpu_writeback ^= 1; ini_dirty = true; }
 
         static const int tf_presets[] = {0, 20, 30, 45, 60};
         ImGui::Text("target_fps:");

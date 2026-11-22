@@ -70,7 +70,10 @@ typedef struct {
     int fast_depth;       // mhrise-arch: Adreno LRZ preservation (EQUAL -> LEQUAL/GEQUAL for non-cutout meshes; 1 = on)
     int tight_barriers;   // mhrise-arch: elide redundant full barriers when no GPU work intervened (1 = on on Adreno)
     int tiler_store_none; // mhrise-arch: STORE_OP_NONE + pass lookahead + tight renderArea for Adreno GMEM (1 = on)
-    int frame_gen;        // mhrise-arch: built-in Vulkan compute 2x optical-flow frame gen (0 = off, 1 = 2x Light, 2 = 2x Balanced)
+    int frame_gen;        // mhrise-arch: built-in Vulkan compute 2x optical-flow frame gen (0 = off, 1 = 2x Light, 2 = 2x Balanced; auto-FIFO + backoff)
+    int async_shaders;    // mhrise-arch v2: non-blocking background graphics shader & pipeline compilation (1 = async skip 1-2 frames, 0 = sync)
+    int gpu_mirrors;      // mhrise-arch v2: persistent page-tracked GPU mirrors + 3-ring direct mirrors (1 = on, 0 = legacy ring)
+    int gpu_writeback;    // mhrise-arch v2: automatic GPU->CPU render-target write-back (0 = off [mhrise-recomp default], 1 = legacy on)
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
     char driver_env[256]; // the driver's own switches, NAME=value separated by spaces (Turnip's FD_DEV_FEATURES, TU_DEBUG;

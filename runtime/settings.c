@@ -54,7 +54,7 @@ Settings g_settings = {
     .inplace_reads = -1,
     .turnip_lrz = -1,
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
-    .fps_mode = 2,  // (mhrise-arch exp: 60 fps pacing mode to maximize throughput with optical-flow 2x frame gen)
+    .fps_mode = 1,  // (mhrise-arch v2: 30 fps native KTGL step eliminates slow-motion; paired with Auto-FIFO 2x FG for 60Hz smooth)
     .res_mode = 1,
     .render_scale = 0.60f,  // (mhrise-arch exp: 0.60x internal 3D scale ~768x432, cuts Adreno 618 fragment load by 64%)
     .shadow_scale = 0.25f,  // (mhrise-arch exp: 0.25x shadow map scale, reduces shadow fillrate by 93.75%)
@@ -69,17 +69,20 @@ Settings g_settings = {
     .sync_lag = 1,             // (1 = 1-frame CPU/GPU pipelining default; 0 = off, 2 = store-guarded lag)
     .out_lines = 720,          // (720p default: cuts GPU fillrate on Adreno 6xx from 1440p down by 4.8x)
     .heap_mb = 2560,           // (2560 MB default guest heap target on 6 GB Android devices; configurable 1536..3584 MB)
-    .swapchain_images = 3,     // (3 = triple buffering default; configurable 2..5)
-    .present_mode = 1,         // (1 = Mailbox default, 0 = Immediate, 2 = FIFO / VSync)
+    .swapchain_images = 4,     // (mhrise-arch v2: 4 swapchain images default for smooth Auto-FIFO 2x presentation; configurable 2..5)
+    .present_mode = 2,         // (mhrise-arch v2: 2 = FIFO default for even alternating VSync pacing; 0 = Immediate, 1 = Mailbox)
     .fp16_shaders = 1,         // (1 = FP16 RelaxedPrecision fragment shaders on Adreno default; 0 = FP32)
     .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
-    .target_fps = 60,          // (mhrise-arch exp: 60 fps real cap, paired with 2x frame gen for up to 120Hz smooth output)
+    .target_fps = 30,          // (mhrise-arch v2: 30 fps real native game pace; SurfaceFlinger gets 60 Hz when 2x frame_gen is active)
     .skip_postfx = 1,          // (mhrise-arch exp: cull heavy KTGL post-FX passes by default for high FPS)
     .gpu_unswizzle = 0,        // (0 = CPU tegra_deswizzle [safe default], 1 = GPU compute deswizzle)
     .fast_depth = 1,           // (mhrise-arch: Adreno LRZ preservation enabled by default)
     .tight_barriers = 1,       // (mhrise-arch: redundant barrier elision enabled by default on Adreno)
     .tiler_store_none = 1,     // (mhrise-arch: STORE_OP_NONE + pass lookahead + tight renderArea enabled by default)
-    .frame_gen = 1,            // (mhrise-arch: 2x Light Vulkan compute DIS optical-flow frame generation enabled by default)
+    .frame_gen = 1,            // (mhrise-arch v2: 2x Light DIS optical-flow FG with Auto-FIFO 30->60 + overload auto-backoff)
+    .async_shaders = 1,        // (mhrise-arch v2: non-blocking background graphics shader/pipeline workers; skip 1-2 frames vs stutter)
+    .gpu_mirrors = 1,          // (mhrise-arch v2: persistent page-tracked GPU mirrors + 3-ring direct mirrors)
+    .gpu_writeback = 0,        // (mhrise-arch v2: mass GPU->CPU RT write-back disabled per mhrise-recomp; explicit copies preserved)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -359,6 +362,15 @@ void settings_load(void) {
             else if (!strcmp(val, "balanced") || !strcmp(val, "2")) g_settings.frame_gen = 2;
             else g_settings.frame_gen = 1;
         }
+        else if (!strcmp(key, "async_shaders")) {
+            g_settings.async_shaders = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
+        }
+        else if (!strcmp(key, "gpu_mirrors")) {
+            g_settings.gpu_mirrors = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
+        }
+        else if (!strcmp(key, "gpu_writeback")) {
+            g_settings.gpu_writeback = (!strcmp(val, "1") || !strcmp(val, "on") || !strcmp(val, "true")) ? 1 : 0;
+        }
         else if (!strcmp(key, "touch_scale")) g_settings.touch_scale = (float)atof(val);
         else if (!strcmp(key, "touch_opacity")) g_settings.touch_opacity = (float)atof(val);
         else if (!strcmp(key, "touch_drag_camera")) g_settings.touch_drag_camera = atoi(val) != 0;
@@ -451,11 +463,12 @@ void settings_load(void) {
     if (g_settings.shadow_scale < 0.0f) g_settings.shadow_scale = 0.5f;
 #endif
     extern int g_exec_mode;
-    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, gpu_unswizzle=%d, fast_depth=%d, tight_barriers=%d, tiler_store_none=%d, frame_gen=%d, exec_mode=%d)\n",
+    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, gpu_unswizzle=%d, fast_depth=%d, tight_barriers=%d, tiler_store_none=%d, frame_gen=%d, async_shaders=%d, gpu_mirrors=%d, gpu_writeback=%d, exec_mode=%d)\n",
         SETTINGS_FILE, g_settings.sync_lag, g_settings.heap_mb, g_settings.swapchain_images,
         g_settings.present_mode, g_settings.upscaler, g_settings.render_scale,
         g_settings.shadow_scale, g_settings.fp16_shaders, g_settings.target_fps, g_settings.skip_postfx, g_settings.gpu_unswizzle,
-        g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen, g_exec_mode);
+        g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen,
+        g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback, g_exec_mode);
 }
 
 void settings_save(void) {
@@ -497,8 +510,10 @@ void settings_save(void) {
             g_settings.fp16_shaders, g_settings.async_spin_us);
     fprintf(f, "# Pacer, post-FX culling & GPU texture unswizzle: target_fps (0=uncapped, 20, 30, 45, 60; default 30), skip_postfx (0=off, 1=skip heavy KTGL post-FX), gpu_unswizzle (1=GPU compute deswizzle, 0=CPU)\n");
     fprintf(f, "target_fps = %d\nskip_postfx = %d\ngpu_unswizzle = %d\n", g_settings.target_fps, g_settings.skip_postfx, g_settings.gpu_unswizzle);
-    fprintf(f, "# mhrise-recomp high-FPS tiler & optical-flow architecture: fast_depth (1=Adreno LRZ), tight_barriers (1=elide empty barriers), tiler_store_none (1=STORE_OP_NONE + tight renderArea), frame_gen (0=off, 1=2x Light, 2=2x Balanced)\n");
-    fprintf(f, "fast_depth = %d\ntight_barriers = %d\ntiler_store_none = %d\nframe_gen = %d\n", g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen);
+    fprintf(f, "# mhrise-recomp full architecture: fast_depth (1=Adreno LRZ), tight_barriers (1=elide empty barriers), tiler_store_none (1=STORE_OP_NONE + tight renderArea), frame_gen (0=off, 1=2x Light, 2=2x Balanced), async_shaders (1=non-blocking), gpu_mirrors (1=page-tracked+3-ring direct), gpu_writeback (0=off)\n");
+    fprintf(f, "fast_depth = %d\ntight_barriers = %d\ntiler_store_none = %d\nframe_gen = %d\nasync_shaders = %d\ngpu_mirrors = %d\ngpu_writeback = %d\n",
+            g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen,
+            g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,
