@@ -6033,6 +6033,9 @@ static uint64_t ga_res_alloc(uint64_t len) {
     }
 }
 
+#ifdef __ANDROID__
+static void gm_note_gpu_write(uint64_t lo, uint64_t hi);
+#endif
 // The live resident entry covering heap [lo, hi); create: else a new one for it (and any it overlaps)
 static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
     for (int i = 0; i < ga_nres; i++)
