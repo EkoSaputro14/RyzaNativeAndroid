@@ -358,7 +358,7 @@ void vk_async_wait_id(uint64_t id) {
         __atomic_fetch_add(&q_waiters, 1, __ATOMIC_RELAXED);
         pthread_cond_signal(&q_more);
         int wait_spin = async_spin_us();
-        if (wait_spin > 100) wait_spin = 100;
+        if (wait_spin > 500) wait_spin = 500;
         if (wait_spin > 0) {
             pthread_mutex_unlock(&q_lock);
             uint64_t spin_t0 = plat_now_ns();

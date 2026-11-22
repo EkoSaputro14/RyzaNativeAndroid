@@ -1471,24 +1471,26 @@ void vk_make_scalable_like(NvnTexture *t, NvnTexture *like) {
 // when bound as a color/depth attachment in a render pass, so all scene passes scale uniformly.
 void vk_promote_scene_rt(NvnTexture *t) {
     if (!t || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & 1)) return;
-    if (t->levels > 1 || t->width < 320 || t->height < 180) return;
+    if (t->levels > 8 || t->width < 256 || t->height < 144) return;
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return;
     static int on = -1;
     if (on < 0) on = getenv("LARECOMP_NO_SCALE") == NULL;
     if (!on) return;
     TexBackend *b = tex_backend(t);
-    if (b->rs_group || b->uploaded || b->gpu_owned || b->presented) return;
+    // mhrise-arch v3: allow gpu_owned & mipmapped 16:9 non-display render targets to promote to RS_SCENE
+    // (only skip CPU-uploaded textures and swapchain-presented display buffers).
+    if (b->rs_group || b->uploaded || b->presented) return;
     b->rs_group = RS_SCENE;
     destroy_image(b);
     create_image(t, b);
 }
 
-// Promote a depth-only shadow map render target (>= 512x512 non-16:9 depth attachment) to RS_SHADOW
+// Promote a depth-only shadow map render target (>= 512x256 non-16:9 depth attachment) to RS_SHADOW
 // when shadow_scale < 1.0, reducing shadow map rasterization and depth bandwidth on mobile GPUs.
 void vk_promote_shadow_rt(NvnTexture *t) {
     if (!t || (t->target != 1 && t->target != 4) || t->samples > 1 || (t->flags & 1)) return;
-    if (t->width < 512 || t->height < 512 || !renderer_format_is_depth(t->format)) return;
+    if (t->width < 512 || t->height < 256 || !renderer_format_is_depth(t->format)) return;
     float a = (float)t->width / (float)t->height;
     if (a >= 1.74f && a <= 1.81f) return;  // 16:9 depth buffers belong to RS_SCENE
     static int on = -1;
@@ -2054,7 +2056,16 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     si.mipLodBias = d->lod_bias;
-    if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
+    if (d->max_aniso > 1) {
+        float cap = 16.0f;
+#ifdef __ANDROID__
+        static float env_aniso = -1.0f;
+        if (env_aniso < 0.0f) env_aniso = getenv("LARECOMP_MAX_ANISO") ? (float)atof(getenv("LARECOMP_MAX_ANISO")) : 0.0f;
+        cap = env_aniso > 0.0f ? env_aniso : (g_settings.render_scale < 0.75f ? 2.0f : 4.0f);
+#endif
+        si.anisotropyEnable = VK_TRUE;
+        si.maxAnisotropy = fminf(d->max_aniso, cap);
+    }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("LARECOMP_LOD_MIN") ? (float)atof(getenv("LARECOMP_LOD_MIN")) : 0;
     if (lodmin > 0 && mf > 1) si.minLod = fmaxf(si.minLod, lodmin);

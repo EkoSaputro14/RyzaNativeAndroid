@@ -208,6 +208,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     ImGui::Text("Frame split: game %.1f ms | sync %.1f ms | present %.1f ms | copy %.1f ms",
                 s_overlay_guest_ms, s_overlay_sync_ms, s_overlay_present_ms, s_overlay_copy_ms);
     {
+        static const char *const pm_short[] = {"Imm", "Mbx", "FIFO"};
+        const char *pms = (g_settings.present_mode >= 0 && g_settings.present_mode <= 2) ? pm_short[g_settings.present_mode] : "?";
+        ImGui::TextDisabled("Cfg: rs=%.2fx sh=%.2fx fp16=%d pfx=%d sl=%d fg=%d %s (v%d)",
+                            g_settings.render_scale, g_settings.shadow_scale, g_settings.fp16_shaders,
+                            g_settings.skip_postfx, g_settings.sync_lag, g_settings.frame_gen, pms, g_settings.profile_ver);
+    }
+    {
         uint64_t total_dc = g_forensic_dcache_hits + g_forensic_dcache_misses;
         double hit_rt = total_dc ? (g_forensic_dcache_hits * 100.0 / total_dc) : 100.0;
         ImGui::Text("Path: %s | RecCalls: %llu | Disp: %llu (%.1f%% hit)",

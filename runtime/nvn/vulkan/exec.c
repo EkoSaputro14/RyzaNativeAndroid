@@ -115,6 +115,7 @@ typedef struct {
     VkCommandPool cpool;  // (their own pool, reset whole when the slot is reused - begin_cb)
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
     bool barrier_clean;                 // mhrise-arch tight_barriers: no GPU work recorded on main since last barrier
+    uint8_t dirty_mask;                 // mhrise-arch v3: bit 0 = gfx render pass writes, bit 1 = compute/transfer writes
     uint64_t seq;
     VkDescriptorPool pools[16];
     int npools, cur_pool;
@@ -750,7 +751,7 @@ static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
     *begun = true;
-    if (cb == &s->main) s->barrier_clean = true;
+    if (cb == &s->main) { s->barrier_clean = true; s->dirty_mask = 0; }
     atomic_store_explicit(&g_batch_pending, true, memory_order_release);
 }
 
@@ -821,13 +822,20 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+enum { CB_DIRTY_GFX = 1, CB_DIRTY_OTHER = 2 };
 static uint64_t stat_elided_barriers;
+static uint64_t stat_narrow_pass_barriers;
 static uint64_t stat_store_none_att;
 static uint64_t stat_fast_depth_rewrites;
 
+static void vk_mark_cb_gfx_dirty(VkCommandBuffer cb) {
+    Sub *s = &subs[cur_sub];
+    if (s->main_begun && cb == s->main) { s->barrier_clean = false; s->dirty_mask |= CB_DIRTY_GFX; }
+}
+
 void vk_mark_cb_dirty(VkCommandBuffer cb) {
     Sub *s = &subs[cur_sub];
-    if (s->main_begun && cb == s->main) s->barrier_clean = false;
+    if (s->main_begun && cb == s->main) { s->barrier_clean = false; s->dirty_mask |= CB_DIRTY_OTHER; }
 }
 
 void vk_full_barrier(VkCommandBuffer cb) {
@@ -845,7 +853,52 @@ void vk_full_barrier(VkCommandBuffer cb) {
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
-    if (s->main_begun && cb == s->main) s->barrier_clean = true;
+    if (s->main_begun && cb == s->main) { s->barrier_clean = true; s->dirty_mask = 0; }
+}
+
+// mhrise-arch v3: targeted pass-to-pass graphics barrier on Adreno/Turnip. Between consecutive render passes
+// with no intervening compute or transfer writes, narrow stages/accesses to attachment+shader stages instead of
+// ALL_COMMANDS -> ALL_COMMANDS, preventing ~120x per-frame CP_WAIT_FOR_IDLE + full CCU flushes.
+static void vk_pass_barrier(VkCommandBuffer cb) {
+#ifdef __ANDROID__
+    Sub *s = &subs[cur_sub];
+    if (g_settings.tight_barriers && !vk_driver_is_mali() && s->main_begun && cb == s->main) {
+        if (s->barrier_clean || s->dirty_mask == 0) {
+            stat_elided_barriers++;
+            return;
+        }
+        if (s->dirty_mask == CB_DIRTY_GFX) {
+            VkMemoryBarrier2 mb = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            };
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+            vkCmdPipelineBarrier2(cb, &di);
+            s->barrier_clean = true;
+            s->dirty_mask = 0;
+            stat_narrow_pass_barriers++;
+            return;
+        }
+    }
+#endif
+    vk_full_barrier(cb);
 }
 
 static void ring_retire(void);
@@ -2575,7 +2628,7 @@ static void begin_pass(void) {
     static int no_barrier = -1;  // (LARECOMP_VK_NO_PASS_BARRIER=1: none - unsafe, a measurement of what it costs)
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
-    if (!no_barrier && AB("nobarrier") != 1) vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    if (!no_barrier && AB("nobarrier") != 1) vk_pass_barrier(cb);  // targeted pass barrier (falls back to full if compute/transfer ran)
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2833,7 +2886,7 @@ static void begin_pass(void) {
     }
     vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
                        (VkSampleCountFlagBits)pass_samples);
-    vk_mark_cb_dirty(cb);
+    vk_mark_cb_gfx_dirty(cb);
     if (g_debug_frame) pass_dump_b = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
     pass_dump_layer = ~0u;
     if (g_debug_frame && !pass_dump_b && st.rt.depth && st.rt.depth->backend) {  // depth only (shadow maps)
@@ -10262,11 +10315,32 @@ void vk_debug_groups_reset(void) {
     dbg_cull_active = 0;
     memset(dbg_cull_stack, 0, sizeof dbg_cull_stack);
 }
+static bool ci_contains(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return false;
+    size_t nlen = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+            i++;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
 static bool is_culled_postfx_group(const char *name) {
     if (!name || !*name) return false;
     return !strcmp(name, "RLR") || !strcmp(name, "MRLR") ||
-           !strcmp(name, "GaussianBlurX") || !strcmp(name, "GaussianBlurY") ||
-           !strcmp(name, "RenderTerrainShadowMap");
+           !strcmp(name, "GaussianBlurX") || !strcmp(name, "GaussianBlurY") || ci_contains(name, "GaussianBlur") ||
+           ci_contains(name, "DepthOfField") || ci_contains(name, "DoF") || ci_contains(name, "Bokeh") ||
+           ci_contains(name, "SSAO") || ci_contains(name, "HBAO") ||
+           ci_contains(name, "Bloom") || ci_contains(name, "Glare") ||
+           ci_contains(name, "GodRay") || ci_contains(name, "LightShaft") || ci_contains(name, "LensFlare") ||
+           ci_contains(name, "MotionBlur") || ci_contains(name, "Volumetric") ||
+           ci_contains(name, "RenderTerrainShadowMap");
 }
 
 static void exec_list(uint64_t handle, int depth) {
@@ -10502,7 +10576,9 @@ static void exec_list(uint64_t handle, int depth) {
                 }
             }
             break;
-        case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
+        case CMD_DISPATCH:
+            if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
+            dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
         case CMD_DRAW_ARRAYS:
             if (vk_skip_postfx_enabled() && dbg_cull_active > 0) { stat_postfx_culled++; stat_skipped++; break; }
             draw(r, false); split_long_pass(); break;

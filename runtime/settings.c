@@ -56,7 +56,7 @@ Settings g_settings = {
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
     .fps_mode = 1,  // (mhrise-arch v2: 30 fps native KTGL step eliminates slow-motion; paired with Auto-FIFO 2x FG for 60Hz smooth)
     .res_mode = 1,
-    .render_scale = 0.60f,  // (mhrise-arch exp: 0.60x internal 3D scale ~768x432, cuts Adreno 618 fragment load by 64%)
+    .render_scale = 0.50f,  // (mhrise-arch v3: 0.50x internal 3D scale ~640x360, cuts Adreno 618 fragment load by 75%)
     .shadow_scale = 0.25f,  // (mhrise-arch exp: 0.25x shadow map scale, reduces shadow fillrate by 93.75%)
 #else
     .show_fps = false,
@@ -72,7 +72,7 @@ Settings g_settings = {
     .swapchain_images = 4,     // (mhrise-arch v2: 4 swapchain images default for smooth Auto-FIFO 2x presentation; configurable 2..5)
     .present_mode = 2,         // (mhrise-arch v2: 2 = FIFO default for even alternating VSync pacing; 0 = Immediate, 1 = Mailbox)
     .fp16_shaders = 1,         // (1 = FP16 RelaxedPrecision fragment shaders on Adreno default; 0 = FP32)
-    .async_spin_us = 250,      // (250 us spin-wait in async render loop to prevent CPU governor downclocking)
+    .async_spin_us = 500,      // (500 us spin-wait in async render/wait loop to keep SD732G clocks up when ADPF unavailable)
     .target_fps = 30,          // (mhrise-arch v2: 30 fps real native game pace; SurfaceFlinger gets 60 Hz when 2x frame_gen is active)
     .skip_postfx = 1,          // (mhrise-arch exp: cull heavy KTGL post-FX passes by default for high FPS)
     .gpu_unswizzle = 0,        // (0 = CPU tegra_deswizzle [safe default], 1 = GPU compute deswizzle)
@@ -83,6 +83,7 @@ Settings g_settings = {
     .async_shaders = 1,        // (mhrise-arch v2: non-blocking background graphics shader/pipeline workers; skip 1-2 frames vs stutter)
     .gpu_mirrors = 1,          // (mhrise-arch v2: persistent page-tracked GPU mirrors + 3-ring direct mirrors)
     .gpu_writeback = 0,        // (mhrise-arch v2: mass GPU->CPU RT write-back disabled per mhrise-recomp; explicit copies preserved)
+    .profile_ver = 3,          // (mhrise-arch v3: one-time mobile Adreno profile migration)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -252,6 +253,10 @@ void settings_reset_defaults(void) {
     g_settings.tight_barriers = d->tight_barriers;
     g_settings.tiler_store_none = d->tiler_store_none;
     g_settings.frame_gen = d->frame_gen;
+    g_settings.async_shaders = d->async_shaders;
+    g_settings.gpu_mirrors = d->gpu_mirrors;
+    g_settings.gpu_writeback = d->gpu_writeback;
+    g_settings.profile_ver = d->profile_ver;
     g_settings.native_code = d->native_code;
     g_settings.files_in_place = d->files_in_place;
 #endif
@@ -277,6 +282,9 @@ void settings_load(void) {
     char line[256];
 #endif
     bool tip_key = false, aspect_key = false, output_key = false;
+#ifdef __ANDROID__
+    int loaded_profile_ver = 0;
+#endif
     while (fgets(line, sizeof line, f)) {
         char key[64];
 #ifdef __ANDROID__
@@ -371,6 +379,10 @@ void settings_load(void) {
         else if (!strcmp(key, "gpu_writeback")) {
             g_settings.gpu_writeback = (!strcmp(val, "1") || !strcmp(val, "on") || !strcmp(val, "true")) ? 1 : 0;
         }
+        else if (!strcmp(key, "profile_ver")) {
+            loaded_profile_ver = atoi(val);
+            g_settings.profile_ver = loaded_profile_ver;
+        }
         else if (!strcmp(key, "touch_scale")) g_settings.touch_scale = (float)atof(val);
         else if (!strcmp(key, "touch_opacity")) g_settings.touch_opacity = (float)atof(val);
         else if (!strcmp(key, "touch_drag_camera")) g_settings.touch_drag_camera = atoi(val) != 0;
@@ -459,8 +471,32 @@ void settings_load(void) {
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
 #ifdef __ANDROID__
-    if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.68f;
-    if (g_settings.shadow_scale < 0.0f) g_settings.shadow_scale = 0.5f;
+    if (loaded_profile_ver < 3) {
+        g_settings.render_scale = g_defaults.render_scale;
+        g_settings.shadow_scale = g_defaults.shadow_scale;
+        g_settings.fp16_shaders = g_defaults.fp16_shaders;
+        g_settings.skip_postfx = g_defaults.skip_postfx;
+        g_settings.present_mode = g_defaults.present_mode;
+        g_settings.swapchain_images = g_defaults.swapchain_images;
+        g_settings.target_fps = g_defaults.target_fps;
+        g_settings.fps_mode = g_defaults.fps_mode;
+        g_settings.sync_lag = g_defaults.sync_lag;
+        g_settings.async_spin_us = g_defaults.async_spin_us;
+        g_settings.frame_gen = g_defaults.frame_gen;
+        g_settings.async_shaders = g_defaults.async_shaders;
+        g_settings.gpu_mirrors = g_defaults.gpu_mirrors;
+        g_settings.gpu_writeback = g_defaults.gpu_writeback;
+        g_settings.fast_depth = g_defaults.fast_depth;
+        g_settings.tight_barriers = g_defaults.tight_barriers;
+        g_settings.tiler_store_none = g_defaults.tiler_store_none;
+        g_settings.gpu_unswizzle = g_defaults.gpu_unswizzle;
+        g_settings.profile_ver = 3;
+        LOG("[settings] migrated legacy %s (profile_ver %d -> 3) to mhrise-arch v3 mobile Adreno defaults\n",
+            SETTINGS_FILE, loaded_profile_ver);
+        settings_save();
+    }
+    if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.50f;
+    if (g_settings.shadow_scale < 0.0f) g_settings.shadow_scale = 0.25f;
 #endif
     extern int g_exec_mode;
     LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, gpu_unswizzle=%d, fast_depth=%d, tight_barriers=%d, tiler_store_none=%d, frame_gen=%d, async_shaders=%d, gpu_mirrors=%d, gpu_writeback=%d, exec_mode=%d)\n",
@@ -479,7 +515,7 @@ void settings_save(void) {
     fprintf(f, "# Internal 3D scene resolution scale (0.50 .. 1.00; default 0.68)\n");
     if (g_settings.render_scale > 0.0f) fprintf(f, "render_scale = %.2f\n", g_settings.render_scale);
     fprintf(f, "# Shadow map resolution scale (0.25, 0.50, 1.00; default 1.00)\n");
-    if (g_settings.shadow_scale > 0.0f) fprintf(f, "shadow_scale = %.2f\n", g_settings.shadow_scale);
+    if (g_settings.shadow_scale >= 0.0f) fprintf(f, "shadow_scale = %.2f\n", g_settings.shadow_scale);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
@@ -511,9 +547,9 @@ void settings_save(void) {
     fprintf(f, "# Pacer, post-FX culling & GPU texture unswizzle: target_fps (0=uncapped, 20, 30, 45, 60; default 30), skip_postfx (0=off, 1=skip heavy KTGL post-FX), gpu_unswizzle (1=GPU compute deswizzle, 0=CPU)\n");
     fprintf(f, "target_fps = %d\nskip_postfx = %d\ngpu_unswizzle = %d\n", g_settings.target_fps, g_settings.skip_postfx, g_settings.gpu_unswizzle);
     fprintf(f, "# mhrise-recomp full architecture: fast_depth (1=Adreno LRZ), tight_barriers (1=elide empty barriers), tiler_store_none (1=STORE_OP_NONE + tight renderArea), frame_gen (0=off, 1=2x Light, 2=2x Balanced), async_shaders (1=non-blocking), gpu_mirrors (1=page-tracked+3-ring direct), gpu_writeback (0=off)\n");
-    fprintf(f, "fast_depth = %d\ntight_barriers = %d\ntiler_store_none = %d\nframe_gen = %d\nasync_shaders = %d\ngpu_mirrors = %d\ngpu_writeback = %d\n",
+    fprintf(f, "fast_depth = %d\ntight_barriers = %d\ntiler_store_none = %d\nframe_gen = %d\nasync_shaders = %d\ngpu_mirrors = %d\ngpu_writeback = %d\nprofile_ver = %d\n",
             g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen,
-            g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback);
+            g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback, g_settings.profile_ver);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,

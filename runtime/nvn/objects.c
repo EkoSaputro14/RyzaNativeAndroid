@@ -527,7 +527,16 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     uint64_t newest_prev = (lag >= 2 && prev2_newest_seq) ? prev2_newest_seq : prev_newest_seq;
     bool can_lag = vk_async_on() && (cur_fseq >= newest_prev || sync_of(A(0))->lseq == __atomic_load_n(&g_newest_fence_lseq, __ATOMIC_RELAXED));
     if (lag_now && can_lag) {
+        extern bool vk_gmem_placed(void);
         uint64_t seq = cur_fseq, target = newest_prev < seq ? newest_prev : seq;
+        // mhrise-arch v3: double-buffered KTGL games wait on Frame N-1's fence at frame start (seq == newest_prev),
+        // which serialized CPU game work and GPU execution (game + GPU = 134 ms). When placed=no & gpu_writeback=0,
+        // vk_async_wait_id() above has already copied all vertices/UBOs/textures out of guest RAM into Vulkan device
+        // memory, so stepping 1 frame back to prev2_newest_seq safely overlaps CPU & GPU.
+        if (lag == 1 && !vk_gmem_placed() && g_settings.gpu_writeback == 0 &&
+            target >= seq && prev2_newest_seq && prev2_newest_seq < seq) {
+            target = prev2_newest_seq;
+        }
         // (3: the newest frame's write-backs waited for - they land once their submission is done, vulkan/exec.c wb_apply)
         extern uint64_t vk_last_writeback_seq(void);
         static uint64_t n, wb_n, wb_pos, st_n, st_pos;  // (LARECOMP_LOG_SYNC_LAG: how often, how far into the frame)
