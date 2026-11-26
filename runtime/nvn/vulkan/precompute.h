@@ -84,6 +84,13 @@ void precompute_register_program(void *nvn_program);
 void precompute_record_pipeline_hash(uint64_t hash);
 bool precompute_has_pipeline_cached(uint64_t hash);
 
+// Persistent POD PipeKey State Cache (pipe_state_v1.bin) for true VkPipeline pre-warming
+void precompute_set_env(uint32_t driver_id, uint32_t eds_flags, uint32_t payload_size);
+void precompute_record_pipe_state(uint64_t pipe_hash, uint64_t prog_hash, const void *payload, uint32_t payload_size);
+uint32_t precompute_lookup_prog_states(uint64_t prog_hash, uint64_t *out_pipe_hashes, void *out_payloads,
+                                       uint32_t max_out, uint32_t payload_size);
+bool precompute_is_known_pipe_state(uint64_t pipe_hash);
+
 // Static Secondary / Template Command Buffer Management
 typedef struct {
     uint64_t key;

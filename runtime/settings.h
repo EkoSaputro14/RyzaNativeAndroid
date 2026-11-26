@@ -69,6 +69,7 @@ typedef struct {
     int gpu_unswizzle;    // Vulkan compute shader Tegra block-linear texture deswizzle (1 = GPU compute, 0 = CPU [safe default])
     int fast_depth;       // mhrise-arch: Adreno LRZ preservation (EQUAL -> LEQUAL/GEQUAL for non-cutout meshes; 1 = on)
     int tight_barriers;   // mhrise-arch: elide redundant full barriers when no GPU work intervened (1 = on on Adreno)
+    int barrier_bits;     // mhrise-recomp: skip unordered NVN barriers & narrow fragment-only barriers on Adreno (1 = on)
     int tiler_store_none; // mhrise-arch: STORE_OP_NONE + pass lookahead + tight renderArea for Adreno GMEM (1 = on)
     int frame_gen;        // mhrise-arch: built-in Vulkan compute 2x optical-flow frame gen (0 = off, 1 = 2x Light, 2 = 2x Balanced; auto-FIFO + backoff)
     int async_shaders;    // mhrise-arch v2: non-blocking background graphics shader & pipeline compilation (1 = async skip 1-2 frames, 0 = sync)

@@ -809,6 +809,12 @@ static void tab_display(void) {
             g_settings.tight_barriers = tb_on ? 1 : 0;
             settings_save();
         }
+        bool bb_on = g_settings.barrier_bits != 0;
+        if (opt_toggle("Barrier Bits (NVN)", &bb_on, true,
+                       "Skips cache-only NVN barriers and narrows fragment-only barriers to fragment stages on Adreno. Applies at once.")) {
+            g_settings.barrier_bits = bb_on ? 1 : 0;
+            settings_save();
+        }
         bool sn_on = g_settings.tiler_store_none != 0;
         if (opt_toggle("Tiler STORE_OP_NONE + tight renderArea", &sn_on, true,
                        "Uses VK_ATTACHMENT_STORE_OP_NONE / DONT_CARE and tight draw-bounds renderArea so Adreno GMEM skips redundant tile writebacks. Applies at once.")) {

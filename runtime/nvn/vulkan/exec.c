@@ -32,6 +32,7 @@ uint64_t renderer_present_count(void);
 #include "ryza_forensics.h"
 #include "precompute.h"
 #include "watch.h"
+#include "barrier_bits.h"
 
 
 static inline bool ryza_guest_readable(uint64_t addr, uint64_t size) {
@@ -136,6 +137,7 @@ static uint64_t last_submit_ns;  // (begin_pass: LARECOMP_VK_CHUNK_US)
 #endif
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool in_pass;
+static bool pending_frag_barrier;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 static const void *g_cur_rec;   // (exec_list: the record being run)
@@ -751,7 +753,7 @@ static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
     *begun = true;
-    if (cb == &s->main) { s->barrier_clean = true; s->dirty_mask = 0; }
+    if (cb == &s->main) { s->barrier_clean = true; s->dirty_mask = 0; pending_frag_barrier = false; }
     atomic_store_explicit(&g_batch_pending, true, memory_order_release);
 }
 
@@ -825,6 +827,10 @@ VkCommandBuffer vk_upload_cmd(void) {
 enum { CB_DIRTY_GFX = 1, CB_DIRTY_OTHER = 2 };
 static uint64_t stat_elided_barriers;
 static uint64_t stat_narrow_pass_barriers;
+static uint64_t stat_barriers_no_order;
+static uint64_t stat_barriers_frag_only;
+static uint64_t stat_pipes_prewarmed;
+static uint64_t stat_warm_sync_hits;
 static uint64_t stat_store_none_att;
 static uint64_t stat_fast_depth_rewrites;
 
@@ -844,6 +850,7 @@ void vk_full_barrier(VkCommandBuffer cb) {
     // mhrise-arch tight_barriers (executor.cpp): elide redundant back-to-back full barriers on Adreno when no
     // GPU work intervened (kept off on ARM Mali where driver barrier merging differs).
     if (g_settings.tight_barriers && !vk_driver_is_mali() && s->main_begun && cb == s->main && s->barrier_clean) {
+        pending_frag_barrier = false;
         stat_elided_barriers++;
         return;
     }
@@ -853,7 +860,51 @@ void vk_full_barrier(VkCommandBuffer cb) {
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     vkCmdPipelineBarrier2(cb, &di);
-    if (s->main_begun && cb == s->main) { s->barrier_clean = true; s->dirty_mask = 0; }
+    if (s->main_begun && cb == s->main) { s->barrier_clean = true; s->dirty_mask = 0; pending_frag_barrier = false; }
+}
+
+// mhrise-recomp 62907c0: fragment-only NVN barriers wait only for fragment/attachment stages instead of ALL_COMMANDS.
+static void vk_frag_barrier(VkCommandBuffer cb) {
+    Sub *s = &subs[cur_sub];
+    if (s->main_begun && cb == s->main) {
+        if (s->barrier_clean || s->dirty_mask == 0) {
+            pending_frag_barrier = false;
+            stat_elided_barriers++;
+            return;
+        }
+        if (s->dirty_mask & CB_DIRTY_OTHER) {
+            vk_full_barrier(cb);
+            return;
+        }
+    }
+    VkMemoryBarrier2 mb = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    };
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    if (s->main_begun && cb == s->main) {
+        s->barrier_clean = true;
+        s->dirty_mask = 0;
+        pending_frag_barrier = false;
+    }
+    stat_barriers_frag_only++;
 }
 
 // mhrise-arch v3: targeted pass-to-pass graphics barrier on Adreno/Turnip. Between consecutive render passes
@@ -864,6 +915,7 @@ static void vk_pass_barrier(VkCommandBuffer cb) {
     Sub *s = &subs[cur_sub];
     if (g_settings.tight_barriers && !vk_driver_is_mali() && s->main_begun && cb == s->main) {
         if (s->barrier_clean || s->dirty_mask == 0) {
+            pending_frag_barrier = false;
             stat_elided_barriers++;
             return;
         }
@@ -893,6 +945,7 @@ static void vk_pass_barrier(VkCommandBuffer cb) {
             vkCmdPipelineBarrier2(cb, &di);
             s->barrier_clean = true;
             s->dirty_mask = 0;
+            pending_frag_barrier = false;
             stat_narrow_pass_barriers++;
             return;
         }
@@ -1815,12 +1868,15 @@ const char *renderer_stats(void) {
     }
     if (stat_postfx_culled && dumps <= 3) LOG("[vk] KTGL post-FX culled draws: %llu\n", (unsigned long long)stat_postfx_culled);
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches (%llu chained), %llu flushes, wait %.0fms, compile %d (waited %.0fms), fbcopy %llu (read %llu, breaks %llu), upload %.1fMB, binds %llu pipe %llu sets",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches (%llu chained), %llu flushes, wait %.0fms, compile %d (waited %.0fms), fbcopy %llu (read %llu, breaks %llu), upload %.1fMB, binds %llu pipe %llu sets, bar_skip %llu bar_frag %llu prewarm %llu/%llu",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_dchained, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (double)stat_build_wait_ns / 1e6, (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_reads, (unsigned long long)stat_inplace_breaks, (double)stat_upload_bytes / 1048576.0,
-             (unsigned long long)stat_pipe_binds, (unsigned long long)stat_set_binds);
+             (unsigned long long)stat_pipe_binds, (unsigned long long)stat_set_binds,
+             (unsigned long long)stat_barriers_no_order, (unsigned long long)stat_barriers_frag_only,
+             (unsigned long long)stat_pipes_prewarmed, (unsigned long long)stat_warm_sync_hits);
     stat_feedback_copies = stat_feedback_reads = stat_inplace_breaks = stat_upload_bytes = stat_build_wait_ns = stat_pipe_binds = stat_set_binds = 0;
+    stat_barriers_no_order = stat_barriers_frag_only = stat_warm_sync_hits = 0;
     if (getenv("LARECOMP_LOG_CBUF_BYTES")) {
         LOG("[cbuf] fixed %llu x %.1f KB, dynamic %llu x %.1f KB; copied %.1f MB; in place, patched %llu\n",
             (unsigned long long)stat_cb_n[0], stat_cb_n[0] ? stat_cb_bytes[0] / 1024.0 / stat_cb_n[0] : 0,
@@ -1972,6 +2028,8 @@ static void st_defaults(void) {
     for (int i = 0; i < 8; i++) { st.blend[i][1] = 2; st.blend[i][2] = 1; st.blend[i][3] = 2; st.blend[i][4] = 1; st.blend[i][5] = 1; st.blend[i][6] = 1; }
 }
 
+static uint32_t pipe_key_payload_size(void);
+
 void vk_exec_init(void) {
     prof = 1;
 #ifdef __ANDROID__
@@ -1998,6 +2056,8 @@ void vk_exec_init(void) {
     ryza_forensics_init();
     ryza_watch_init_heap(HEAP_BASE, HEAP_MAX);
     precompute_init();
+    precompute_set_env(g_vk.driver_id, (g_vk.eds ? 1u : 0u) | (g_vk.eds2 ? 2u : 0u),
+                       (uint32_t)pipe_key_payload_size());
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);
@@ -2382,6 +2442,11 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vk_end_rendering(vk_cmd());
     in_pass = false;
+    if (pending_frag_barrier) {
+        pending_frag_barrier = false;
+        Sub *s_ = sub();
+        if (s_->main_begun && !s_->barrier_clean) vk_frag_barrier(s_->main);
+    }
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
     }
@@ -3232,6 +3297,7 @@ typedef struct {
                            // ShaderInfo it sits 1.4 KB in, past the 64 textures - a cache miss each draw, ~7% of the
                            // render thread on the POCO F7 Ultra: draw_writes)
     uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
+    bool prewarmed;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
 
@@ -4057,9 +4123,15 @@ typedef struct {
     PipeFx fx;
 } PipeKey;
 
+_Static_assert(sizeof(PipeKey) - offsetof(PipeKey, prog_hash) <= 1024, "PipeKey payload exceeds MAX_PIPE_STATE_PAYLOAD");
+static uint32_t pipe_key_payload_size(void) {
+    return (uint32_t)(sizeof(PipeKey) - offsetof(PipeKey, prog_hash));
+}
+
 typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
 #define PIPE_TAB 8192
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
+static void vk_prewarm_prog_pipelines(Prog *pr);
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
 // stored constants (fragment-shader hashes) and must not change.
@@ -4246,6 +4318,9 @@ static void build_pipeline(void *arg) {
     atomic_fetch_add(&cum_compiles, 1);
     if (r == VK_SUCCESS) {
         precompute_record_pipeline_hash(pp->hash);
+        precompute_record_pipe_state(pp->hash, k->prog_hash,
+                                     (const uint8_t *)k + offsetof(PipeKey, prog_hash),
+                                     pipe_key_payload_size());
         atomic_store(&s_pcache_dirty, true);
     } else {  // (each failing key once: its draws are dropped)
         static int n;
@@ -4253,6 +4328,37 @@ static void build_pipeline(void *arg) {
                           (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     }
     build_mark_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
+}
+
+// Replays saved PipeKey variants for a newly compiled Prog from pipe_state_v1.bin so VkPipeline creation
+// happens asynchronously before draws request those permutations.
+static void vk_prewarm_prog_pipelines(Prog *pr) {
+    if (!pr || !pr->prog_hash || !pr->vs || !pr->fs) return;
+    enum { PREWARM_BATCH = 16 };
+    uint32_t psz = pipe_key_payload_size();
+    uint64_t phs[PREWARM_BATCH];
+    uint8_t *buf = (uint8_t *)malloc((size_t)PREWARM_BATCH * psz);
+    if (!buf) return;
+    uint32_t n = precompute_lookup_prog_states(pr->prog_hash, phs, buf, PREWARM_BATCH, psz);
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t ph = phs[i];
+        if (!ph) continue;
+        uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
+        if (pipe_tab[pslot].pipe) continue;
+        Pipe *pp = (Pipe *)calloc(1, sizeof *pp);
+        if (!pp) break;
+        pp->k.prog = pr;
+        memcpy((uint8_t *)&pp->k + offsetof(PipeKey, prog_hash), buf + (size_t)i * psz, psz);
+        pp->k.prog_hash = pr->prog_hash;
+        pp->hash = ph;
+        pipe_tab[pslot].key = ph;
+        pipe_tab[pslot].pipe = pp;
+        atomic_fetch_add(&stat_compiles_pending, 1);
+        stat_pipes_prewarmed++;
+        run_job(build_pipeline, pp);
+    }
+    free(buf);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -7958,6 +8064,10 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (pr && keep) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; skip_note("shader"); return; }
+    if (!pr->prewarmed) {
+        pr->prewarmed = true;
+        vk_prewarm_prog_pipelines(pr);
+    }
     {   // fragment-shader hash: interior backdrop detection (widescreen), skip lists, item twinkle (renderer.m)
         static uint64_t last_fs, last_hash;
         uint64_t fs = fss->code_addr;
@@ -8534,6 +8644,27 @@ static void draw_(CmdRec *r, bool indexed) {
         pipeline_dirty = false;
     }
     if (keep) wait_built(&pp->state);
+#ifdef __ANDROID__
+    else if (atomic_load(&pp->state) == 0 && g_settings.async_shaders && precompute_is_known_pipe_state(pp->hash)) {
+        static uint64_t s_warm_frame = ~0ull, s_warm_wait_ns;
+        static int64_t s_warm_budget_ns = -1;
+        if (s_warm_budget_ns < 0) {
+            const char *eb = getenv("LARECOMP_WARMUP_SYNC_MS");
+            int ms = eb ? atoi(eb) : 4;
+            if (ms < 0) ms = 0;
+            if (ms > 32) ms = 32;
+            s_warm_budget_ns = (int64_t)ms * 1000000ll;
+        }
+        uint64_t cur_f = renderer_present_count();
+        if (cur_f != s_warm_frame) { s_warm_frame = cur_f; s_warm_wait_ns = 0; }
+        if ((int64_t)s_warm_wait_ns < s_warm_budget_ns) {
+            uint64_t wt0 = plat_now_ns();
+            wait_built(&pp->state);
+            s_warm_wait_ns += plat_now_ns() - wt0;
+            stat_warm_sync_hits++;
+        }
+    }
+#endif
     if (atomic_load(&pp->state) != 1) {
         if (g_debug_frame) LOG("[draw]   skipped: pipeline %s\n", atomic_load(&pp->state) ? "failed" : "still building");
         stat_skipped++;
@@ -10595,7 +10726,34 @@ static void exec_list(uint64_t handle, int depth) {
             }
             break;
         }
-        case CMD_BARRIER: snapshots_flush_fb_dirty("barrier"); break;
+        case CMD_BARRIER: {
+            uint32_t bbits = (uint32_t)r->x[0];
+            Sub *bs = &subs[cur_sub];
+#ifdef __ANDROID__
+            bool bar_on = g_settings.barrier_bits != 0;
+            bool is_mali = vk_driver_is_mali();
+#else
+            bool bar_on = false;
+            bool is_mali = false;
+#endif
+            RyzaBarrierAction act = ryza_classify_nvn_barrier(
+                bbits, bar_on, is_mali, (bs->dirty_mask & CB_DIRTY_OTHER) != 0);
+            if (act == RYZA_BARRIER_SKIP) {
+                if (bbits != 0) stat_barriers_no_order++;
+                break;
+            }
+            if (act == RYZA_BARRIER_FRAG_ONLY) {
+                snapshots_flush_fb_dirty("barrier_frag");
+                if (in_pass) {
+                    pending_frag_barrier = true;
+                } else if (bs->main_begun && !bs->barrier_clean) {
+                    vk_frag_barrier(bs->main);
+                }
+                break;
+            }
+            snapshots_flush_fb_dirty("barrier");
+            break;
+        }
         case CMD_FENCE_SYNC: {
             list_had_fence = true;
             guest_copy_flush();

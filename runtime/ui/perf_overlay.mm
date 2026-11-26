@@ -387,6 +387,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         ImGui::SameLine();
         if (ImGui::SmallButton(g_settings.tight_barriers ? "ON##tb" : "OFF##tb")) { g_settings.tight_barriers ^= 1; ini_dirty = true; }
         ImGui::SameLine();
+        ImGui::Text("| bar_bits:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton(g_settings.barrier_bits ? "ON##bb" : "OFF##bb")) { g_settings.barrier_bits ^= 1; ini_dirty = true; }
+        ImGui::SameLine();
         ImGui::Text("| store_none:");
         ImGui::SameLine();
         if (ImGui::SmallButton(g_settings.tiler_store_none ? "ON##sn" : "OFF##sn")) { g_settings.tiler_store_none ^= 1; ini_dirty = true; }

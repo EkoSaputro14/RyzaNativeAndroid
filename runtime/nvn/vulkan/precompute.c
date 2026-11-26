@@ -1,5 +1,6 @@
 // Precomputed / Pre-recorded Draw Pipeline for Vulkan Backend (Adreno 640 / Turnip Mesa)
 // Implementation of startup precomputation, state caching, and dynamic invalidation.
+#define _POSIX_C_SOURCE 200809L
 
 #include "precompute.h"
 #ifdef __ANDROID__
@@ -31,6 +32,37 @@ static pthread_mutex_t s_manifest_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic bool s_manifest_dirty = false;
 static _Atomic uint64_t s_last_manifest_save_ns = 0;
 
+// Persistent POD PipeKey payloads for session-to-session VkPipeline pre-warming
+#define MAX_PIPE_STATES 4096
+#define MAX_PIPE_STATE_PAYLOAD 1024
+#define PIPE_STATE_MAGIC 0x52595A50u
+#define PIPE_STATE_VERSION 1u
+
+typedef struct {
+    uint64_t pipe_hash;
+    uint64_t prog_hash;
+    uint8_t payload[MAX_PIPE_STATE_PAYLOAD];
+} PipeStateEntry;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t driver_id;
+    uint32_t eds_flags;
+    uint32_t payload_size;
+    uint32_t count;
+} PipeStateHeader;
+
+static PipeStateEntry *s_pipe_states = NULL;
+static uint32_t s_pipe_state_count = 0;
+static uint32_t s_env_driver_id = 0;
+static uint32_t s_env_eds_flags = 0;
+static uint32_t s_env_payload_size = 0;
+static bool s_pipe_state_loaded = false;
+static pthread_mutex_t s_pipe_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool s_pipe_state_dirty = false;
+static _Atomic uint64_t s_last_pipe_state_save_ns = 0;
+
 // Static pass table for pre-recorded secondary / template command buffers
 #define MAX_STATIC_PASSES 256
 static StaticPassRecord s_static_passes[MAX_STATIC_PASSES];
@@ -51,23 +83,35 @@ static uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+#ifdef __ANDROID__
 extern const char *rt_data_root(void);
+#endif
 
 static const char *get_cache_dir(void) {
-    static char dir[512];
+    const char *pdir = getenv("LARECOMP_PRECOMPUTE_DIR");
+    if (pdir && *pdir) return pdir;
     const char *cdir = getenv("LARECOMP_CACHE_DIR");
     if (cdir && *cdir) return cdir;
+#ifdef __ANDROID__
+    static char dir[512];
     const char *root = rt_data_root();
     if (root && *root) {
         snprintf(dir, sizeof(dir), "%s/cache", root);
         return dir;
     }
+#endif
     return "cache";
 }
 
 static const char *get_manifest_path(void) {
     static char path[512];
     snprintf(path, sizeof(path), "%s/pipe_manifest.bin", get_cache_dir());
+    return path;
+}
+
+static const char *get_pipe_state_path(void) {
+    static char path[512];
+    snprintf(path, sizeof(path), "%s/pipe_state_v1.bin", get_cache_dir());
     return path;
 }
 
@@ -85,6 +129,50 @@ static void load_manifest(void) {
         atomic_store(&g_precompute_stats.pipelines_manifest_total, s_manifest_count);
         pthread_mutex_unlock(&s_manifest_lock);
     }
+    fclose(f);
+}
+
+static bool ensure_pipe_state_buf_locked(void) {
+    if (!s_pipe_states) {
+        s_pipe_states = (PipeStateEntry *)calloc(MAX_PIPE_STATES, sizeof(PipeStateEntry));
+    }
+    return s_pipe_states != NULL;
+}
+
+static void load_pipe_states_locked(void) {
+    s_pipe_state_loaded = true;
+    s_pipe_state_count = 0;
+    if (s_env_payload_size == 0 || s_env_payload_size > MAX_PIPE_STATE_PAYLOAD) return;
+
+    const char *path = get_pipe_state_path();
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+
+    PipeStateHeader hdr = {0};
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 ||
+        hdr.magic != PIPE_STATE_MAGIC ||
+        hdr.version != PIPE_STATE_VERSION ||
+        hdr.driver_id != s_env_driver_id ||
+        hdr.eds_flags != s_env_eds_flags ||
+        hdr.payload_size != s_env_payload_size ||
+        hdr.count > MAX_PIPE_STATES) {
+        fclose(f);
+        return;
+    }
+    if (hdr.count == 0 || !ensure_pipe_state_buf_locked()) {
+        fclose(f);
+        return;
+    }
+
+    for (uint32_t i = 0; i < hdr.count; i++) {
+        uint64_t hashes[2] = {0, 0};
+        if (fread(hashes, sizeof(uint64_t), 2, f) != 2) break;
+        if (fread(s_pipe_states[s_pipe_state_count].payload, 1, s_env_payload_size, f) != s_env_payload_size) break;
+        s_pipe_states[s_pipe_state_count].pipe_hash = hashes[0];
+        s_pipe_states[s_pipe_state_count].prog_hash = hashes[1];
+        s_pipe_state_count++;
+    }
+    atomic_store(&g_precompute_stats.pipelines_cached, s_pipe_state_count);
     fclose(f);
 }
 
@@ -136,6 +224,68 @@ static void save_manifest(void) {
     }
 }
 
+static void write_pipe_state_snapshot(uint32_t count, uint32_t driver_id, uint32_t eds_flags,
+                                      uint32_t payload_size, const PipeStateEntry *entries) {
+    if (count == 0 || !entries || payload_size == 0 || payload_size > MAX_PIPE_STATE_PAYLOAD) return;
+    const char *cdir = get_cache_dir();
+    mkdir_p(cdir);
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/pipe_state_v1.bin.tmp", cdir);
+
+    pthread_mutex_lock(&s_manifest_io_lock);
+    FILE *f = fopen(tmp_path, "wb");
+    if (f) {
+        PipeStateHeader hdr = {
+            .magic = PIPE_STATE_MAGIC,
+            .version = PIPE_STATE_VERSION,
+            .driver_id = driver_id,
+            .eds_flags = eds_flags,
+            .payload_size = payload_size,
+            .count = count
+        };
+        bool ok = fwrite(&hdr, sizeof(hdr), 1, f) == 1;
+        for (uint32_t i = 0; ok && i < count; i++) {
+            uint64_t hashes[2] = {entries[i].pipe_hash, entries[i].prog_hash};
+            if (fwrite(hashes, sizeof(uint64_t), 2, f) != 2 ||
+                fwrite(entries[i].payload, 1, payload_size, f) != payload_size) {
+                ok = false;
+            }
+        }
+        if (fclose(f) != 0) ok = false;
+        if (ok) {
+            remove(get_pipe_state_path());
+            rename(tmp_path, get_pipe_state_path());
+        } else {
+            remove(tmp_path);
+        }
+    }
+    pthread_mutex_unlock(&s_manifest_io_lock);
+}
+
+static void save_pipe_states(void) {
+    uint32_t count = 0;
+    uint32_t driver_id = 0, eds_flags = 0, payload_size = 0;
+    PipeStateEntry *snap = NULL;
+    pthread_mutex_lock(&s_pipe_state_lock);
+    if (s_pipe_state_count > 0 && s_pipe_states && s_env_payload_size > 0 &&
+        atomic_load(&s_pipe_state_dirty)) {
+        count = s_pipe_state_count;
+        driver_id = s_env_driver_id;
+        eds_flags = s_env_eds_flags;
+        payload_size = s_env_payload_size;
+        snap = (PipeStateEntry *)malloc((size_t)count * sizeof(PipeStateEntry));
+        if (snap) memcpy(snap, s_pipe_states, (size_t)count * sizeof(PipeStateEntry));
+        atomic_store(&s_pipe_state_dirty, false);
+        atomic_store(&s_last_pipe_state_save_ns, get_time_ns());
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
+    if (snap) {
+        write_pipe_state_snapshot(count, driver_id, eds_flags, payload_size, snap);
+        free(snap);
+    }
+}
+
 static void *manifest_writer_thread(void *arg) {
     (void)arg;
 #ifdef __ANDROID__
@@ -147,6 +297,7 @@ static void *manifest_writer_thread(void *arg) {
         s_manifest_io_pending = false;
         pthread_mutex_unlock(&s_manifest_io_lock);
         save_manifest();
+        save_pipe_states();
     }
     return NULL;
 }
@@ -159,12 +310,14 @@ static void save_manifest_async(void) {
     }
     if (atomic_load(&s_manifest_writer_started)) {
         atomic_store(&s_last_manifest_save_ns, get_time_ns());
+        atomic_store(&s_last_pipe_state_save_ns, get_time_ns());
         pthread_mutex_lock(&s_manifest_io_lock);
         s_manifest_io_pending = true;
         pthread_cond_signal(&s_manifest_io_cond);
         pthread_mutex_unlock(&s_manifest_io_lock);
     } else {
         save_manifest();
+        save_pipe_states();
     }
 }
 
@@ -173,10 +326,18 @@ void precompute_init(void) {
     atomic_store(&g_precompute_stats.is_warmup_active, true);
     g_precompute_stats.warmup_start_ns = get_time_ns();
     load_manifest();
+    pthread_mutex_lock(&s_pipe_state_lock);
+    if (s_env_payload_size > 0) load_pipe_states_locked();
+    else {
+        s_pipe_state_count = 0;
+        s_pipe_state_loaded = false;
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
 }
 
 void precompute_shutdown(void) {
     save_manifest();
+    save_pipe_states();
 }
 
 void precompute_warmup_start(void) {
@@ -202,13 +363,19 @@ void precompute_warmup_end(void) {
     }
     atomic_store(&g_precompute_stats.is_warmup_active, false);
     save_manifest();
+    save_pipe_states();
 }
 
 void precompute_tick(void) {
-    if (!atomic_load(&s_manifest_dirty)) return;
+    bool m_dirty = atomic_load(&s_manifest_dirty);
+    bool ps_dirty = atomic_load(&s_pipe_state_dirty);
+    if (!m_dirty && !ps_dirty) return;
     uint64_t now = get_time_ns();
-    uint64_t last = atomic_load(&s_last_manifest_save_ns);
-    if (last && now - last < 3000000000ull) return;
+    uint64_t last_m = atomic_load(&s_last_manifest_save_ns);
+    uint64_t last_ps = atomic_load(&s_last_pipe_state_save_ns);
+    bool m_due = m_dirty && (!last_m || now - last_m >= 3000000000ull);
+    bool ps_due = ps_dirty && (!last_ps || now - last_ps >= 10000000000ull);
+    if (!m_due && !ps_due) return;
     save_manifest_async();
 }
 
@@ -257,6 +424,85 @@ bool precompute_has_pipeline_cached(uint64_t hash) {
     pthread_mutex_unlock(&s_manifest_lock);
     atomic_fetch_add(&g_precompute_stats.cache_misses, 1);
     return false;
+}
+
+void precompute_set_env(uint32_t driver_id, uint32_t eds_flags, uint32_t payload_size) {
+    pthread_mutex_lock(&s_pipe_state_lock);
+    bool changed = !s_pipe_state_loaded ||
+                   s_env_driver_id != driver_id ||
+                   s_env_eds_flags != eds_flags ||
+                   s_env_payload_size != payload_size;
+    s_env_driver_id = driver_id;
+    s_env_eds_flags = eds_flags;
+    s_env_payload_size = payload_size;
+    if (changed) {
+        atomic_store(&s_pipe_state_dirty, false);
+        load_pipe_states_locked();
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
+}
+
+void precompute_record_pipe_state(uint64_t pipe_hash, uint64_t prog_hash, const void *payload, uint32_t payload_size) {
+    if (!pipe_hash || !prog_hash || !payload || payload_size == 0 || payload_size > MAX_PIPE_STATE_PAYLOAD) return;
+
+    pthread_mutex_lock(&s_pipe_state_lock);
+    if (s_env_payload_size != payload_size || !ensure_pipe_state_buf_locked()) {
+        pthread_mutex_unlock(&s_pipe_state_lock);
+        return;
+    }
+    for (uint32_t i = 0; i < s_pipe_state_count; i++) {
+        if (s_pipe_states[i].pipe_hash == pipe_hash) {
+            pthread_mutex_unlock(&s_pipe_state_lock);
+            return;
+        }
+    }
+    if (s_pipe_state_count < MAX_PIPE_STATES) {
+        PipeStateEntry *e = &s_pipe_states[s_pipe_state_count++];
+        e->pipe_hash = pipe_hash;
+        e->prog_hash = prog_hash;
+        memcpy(e->payload, payload, payload_size);
+        atomic_store(&g_precompute_stats.pipelines_cached, s_pipe_state_count);
+        atomic_store(&s_pipe_state_dirty, true);
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
+}
+
+uint32_t precompute_lookup_prog_states(uint64_t prog_hash, uint64_t *out_pipe_hashes, void *out_payloads,
+                                       uint32_t max_out, uint32_t payload_size) {
+    if (!prog_hash || !out_pipe_hashes || !out_payloads || max_out == 0 ||
+        payload_size == 0 || payload_size > MAX_PIPE_STATE_PAYLOAD) {
+        return 0;
+    }
+    uint32_t found = 0;
+    pthread_mutex_lock(&s_pipe_state_lock);
+    if (s_pipe_states && s_env_payload_size == payload_size) {
+        uint8_t *dst = (uint8_t *)out_payloads;
+        for (uint32_t i = 0; i < s_pipe_state_count && found < max_out; i++) {
+            if (s_pipe_states[i].prog_hash == prog_hash) {
+                out_pipe_hashes[found] = s_pipe_states[i].pipe_hash;
+                memcpy(dst + (size_t)found * payload_size, s_pipe_states[i].payload, payload_size);
+                found++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
+    return found;
+}
+
+bool precompute_is_known_pipe_state(uint64_t pipe_hash) {
+    if (!pipe_hash) return false;
+    bool known = false;
+    pthread_mutex_lock(&s_pipe_state_lock);
+    if (s_pipe_states) {
+        for (uint32_t i = 0; i < s_pipe_state_count; i++) {
+            if (s_pipe_states[i].pipe_hash == pipe_hash) {
+                known = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s_pipe_state_lock);
+    return known;
 }
 
 StaticPassRecord *precompute_get_static_pass(uint64_t pass_key) {

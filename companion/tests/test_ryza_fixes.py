@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,8 +1216,8 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-2")' in cmake_txt
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-4")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,8 +1387,8 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-2")' in cmake_txt
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-4")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
@@ -1444,7 +1444,7 @@ def _verify_exp_mhrise_arch():
     workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
 
     # 0. Version & CI branch trigger
-    assert "versionCode = 56" in gradle_kts and "0.3.2-exp-mhrise-3" in gradle_kts
+    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
     assert "- 'exp/*'" in workflow
     assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
 
@@ -1600,3 +1600,60 @@ def _verify_exp_mhrise_arch_v3():
 
 
 _verify_exp_mhrise_arch_v3()
+
+
+def _verify_exp_mhrise_arch_v4_quickwin():
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch v4 Quick Win (barrier_bits granularity + persistent pipe_state_v1.bin warmup + C unit tests)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    barrier_h = (repo_root / "runtime" / "nvn" / "vulkan" / "barrier_bits.h").read_text(encoding="utf-8")
+    prec_h = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.h").read_text(encoding="utf-8")
+    prec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    settings_h = (repo_root / "runtime" / "settings.h").read_text(encoding="utf-8")
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    launcher_mm = (repo_root / "runtime" / "ui" / "launcher.mm").read_text(encoding="utf-8")
+    menu_mm = (repo_root / "runtime" / "ui" / "menu.mm").read_text(encoding="utf-8")
+    overlay_mm = (repo_root / "runtime" / "ui" / "perf_overlay.mm").read_text(encoding="utf-8")
+
+    # 1. barrier_bits classifier & exec.c integration
+    assert "ryza_classify_nvn_barrier" in barrier_h
+    assert '#include "barrier_bits.h"' in exec_c
+    assert "static void vk_frag_barrier(VkCommandBuffer cb)" in exec_c
+    assert "ryza_classify_nvn_barrier(" in exec_c
+    assert "int barrier_bits;" in settings_h
+    assert ".barrier_bits = 1" in settings_c
+    assert "barrier_bits = %d" in settings_c
+    for ui in [launcher_mm, menu_mm, overlay_mm]:
+        assert "barrier_bits" in ui, "Missing barrier_bits control in UI"
+
+    # 2. Persistent PipeKey state warm-up (pipe_state_v1.bin)
+    for api in ["precompute_set_env(", "precompute_record_pipe_state(", "precompute_lookup_prog_states(", "precompute_is_known_pipe_state("]:
+        assert api in prec_h and api in prec_c and api in exec_c, f"Missing {api}"
+    assert "pipe_state_v1.bin" in prec_c
+    assert "bool prewarmed;" in exec_c
+    assert "static void vk_prewarm_prog_pipelines(Prog *pr)" in exec_c
+    assert "LARECOMP_WARMUP_SYNC_MS" in exec_c
+
+    # 3. Compile & execute real C unit tests for barrier_bits + precompute persistence
+    cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+    assert cc, "C compiler required to run companion/tests/test_quickwin_mhrise.c"
+    with tempfile.TemporaryDirectory() as td:
+        bin_path = Path(td) / "test_quickwin_mhrise"
+        cmd = [
+            cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+            f"-I{repo_root / 'runtime' / 'nvn' / 'vulkan'}",
+            str(repo_root / "companion" / "tests" / "test_quickwin_mhrise.c"),
+            str(repo_root / "runtime" / "nvn" / "vulkan" / "precompute.c"),
+            "-lpthread", "-o", str(bin_path),
+        ]
+        subprocess.run(cmd, check=True)
+        subprocess.run([str(bin_path)], check=True)
+
+    print("  -> PASS: exp/mhrise-arch v4 Quick Win (barrier_bits + pipe_state_v1.bin warmup + C unit tests) verified.")
+
+
+_verify_exp_mhrise_arch_v4_quickwin()

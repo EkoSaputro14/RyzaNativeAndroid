@@ -1680,6 +1680,11 @@ static void prelaunch_tab(float sc) {
                 g_settings.tight_barriers = tb_b ? 1 : 0;
                 changed = true;
             }
+            bool bb_b = g_settings.barrier_bits != 0;
+            if (ImGui::Checkbox(tr("Barrier Bits (mhrise-recomp skip cache-only / narrow frag barriers)"), &bb_b)) {
+                g_settings.barrier_bits = bb_b ? 1 : 0;
+                changed = true;
+            }
             bool sn_b = g_settings.tiler_store_none != 0;
             if (ImGui::Checkbox(tr("Tiler STORE_OP_NONE + tight renderArea (Adreno GMEM)"), &sn_b)) {
                 g_settings.tiler_store_none = sn_b ? 1 : 0;

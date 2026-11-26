@@ -78,6 +78,7 @@ Settings g_settings = {
     .gpu_unswizzle = 0,        // (0 = CPU tegra_deswizzle [safe default], 1 = GPU compute deswizzle)
     .fast_depth = 1,           // (mhrise-arch: Adreno LRZ preservation enabled by default)
     .tight_barriers = 1,       // (mhrise-arch: redundant barrier elision enabled by default on Adreno)
+    .barrier_bits = 1,         // (mhrise-recomp: skip unordered barriers & narrow fragment-only barriers on Adreno)
     .tiler_store_none = 1,     // (mhrise-arch: STORE_OP_NONE + pass lookahead + tight renderArea enabled by default)
     .frame_gen = 1,            // (mhrise-arch v2: 2x Light DIS optical-flow FG with Auto-FIFO 30->60 + overload auto-backoff)
     .async_shaders = 1,        // (mhrise-arch v2: non-blocking background graphics shader/pipeline workers; skip 1-2 frames vs stutter)
@@ -251,6 +252,7 @@ void settings_reset_defaults(void) {
     g_settings.gpu_unswizzle = d->gpu_unswizzle;
     g_settings.fast_depth = d->fast_depth;
     g_settings.tight_barriers = d->tight_barriers;
+    g_settings.barrier_bits = d->barrier_bits;
     g_settings.tiler_store_none = d->tiler_store_none;
     g_settings.frame_gen = d->frame_gen;
     g_settings.async_shaders = d->async_shaders;
@@ -361,6 +363,9 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "tight_barriers")) {
             g_settings.tight_barriers = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
+        }
+        else if (!strcmp(key, "barrier_bits")) {
+            g_settings.barrier_bits = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
         }
         else if (!strcmp(key, "tiler_store_none")) {
             g_settings.tiler_store_none = (!strcmp(val, "0") || !strcmp(val, "off") || !strcmp(val, "false")) ? 0 : 1;
@@ -488,6 +493,7 @@ void settings_load(void) {
         g_settings.gpu_writeback = g_defaults.gpu_writeback;
         g_settings.fast_depth = g_defaults.fast_depth;
         g_settings.tight_barriers = g_defaults.tight_barriers;
+        g_settings.barrier_bits = g_defaults.barrier_bits;
         g_settings.tiler_store_none = g_defaults.tiler_store_none;
         g_settings.gpu_unswizzle = g_defaults.gpu_unswizzle;
         g_settings.profile_ver = 3;
@@ -499,11 +505,11 @@ void settings_load(void) {
     if (g_settings.shadow_scale < 0.0f) g_settings.shadow_scale = 0.25f;
 #endif
     extern int g_exec_mode;
-    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, gpu_unswizzle=%d, fast_depth=%d, tight_barriers=%d, tiler_store_none=%d, frame_gen=%d, async_shaders=%d, gpu_mirrors=%d, gpu_writeback=%d, exec_mode=%d)\n",
+    LOG("[settings] loaded %s (sync_lag=%d, heap_mb=%d, swapchain_images=%d, present_mode=%d, upscaler=%d, render_scale=%.2f, shadow_scale=%.2f, fp16_shaders=%d, target_fps=%d, skip_postfx=%d, gpu_unswizzle=%d, fast_depth=%d, tight_barriers=%d, barrier_bits=%d, tiler_store_none=%d, frame_gen=%d, async_shaders=%d, gpu_mirrors=%d, gpu_writeback=%d, exec_mode=%d)\n",
         SETTINGS_FILE, g_settings.sync_lag, g_settings.heap_mb, g_settings.swapchain_images,
         g_settings.present_mode, g_settings.upscaler, g_settings.render_scale,
         g_settings.shadow_scale, g_settings.fp16_shaders, g_settings.target_fps, g_settings.skip_postfx, g_settings.gpu_unswizzle,
-        g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen,
+        g_settings.fast_depth, g_settings.tight_barriers, g_settings.barrier_bits, g_settings.tiler_store_none, g_settings.frame_gen,
         g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback, g_exec_mode);
 }
 
@@ -547,8 +553,8 @@ void settings_save(void) {
     fprintf(f, "# Pacer, post-FX culling & GPU texture unswizzle: target_fps (0=uncapped, 20, 30, 45, 60; default 30), skip_postfx (0=off, 1=skip heavy KTGL post-FX), gpu_unswizzle (1=GPU compute deswizzle, 0=CPU)\n");
     fprintf(f, "target_fps = %d\nskip_postfx = %d\ngpu_unswizzle = %d\n", g_settings.target_fps, g_settings.skip_postfx, g_settings.gpu_unswizzle);
     fprintf(f, "# mhrise-recomp full architecture: fast_depth (1=Adreno LRZ), tight_barriers (1=elide empty barriers), tiler_store_none (1=STORE_OP_NONE + tight renderArea), frame_gen (0=off, 1=2x Light, 2=2x Balanced), async_shaders (1=non-blocking), gpu_mirrors (1=page-tracked+3-ring direct), gpu_writeback (0=off)\n");
-    fprintf(f, "fast_depth = %d\ntight_barriers = %d\ntiler_store_none = %d\nframe_gen = %d\nasync_shaders = %d\ngpu_mirrors = %d\ngpu_writeback = %d\nprofile_ver = %d\n",
-            g_settings.fast_depth, g_settings.tight_barriers, g_settings.tiler_store_none, g_settings.frame_gen,
+    fprintf(f, "fast_depth = %d\ntight_barriers = %d\nbarrier_bits = %d\ntiler_store_none = %d\nframe_gen = %d\nasync_shaders = %d\ngpu_mirrors = %d\ngpu_writeback = %d\nprofile_ver = %d\n",
+            g_settings.fast_depth, g_settings.tight_barriers, g_settings.barrier_bits, g_settings.tiler_store_none, g_settings.frame_gen,
             g_settings.async_shaders, g_settings.gpu_mirrors, g_settings.gpu_writeback, g_settings.profile_ver);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
