@@ -53,6 +53,7 @@ struct KThread {
     void *dcache;          // dispatch.c: this thread's guest -> host function cache (TLS is slow in a dlopened library)
     bool core0_held;       // kernel.c: this thread has core 0 (it runs; the others of core 0 wait)
     bool core0_evicted;    // atomic request to reconcile core ownership at the next guest safe point
+    bool fast_boosted;     // kernel.c: boosted via plat_boost_thread_tid on t80 contention
     KThread *core0_next;   // core-0 runnable queue (c0_m)
 #endif
     uint64_t stat_dispatches, stat_dcache_hits, stat_dcache_misses, stat_recomp_calls;

@@ -116,14 +116,14 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
     return out;
 }
 
-// Fragment shaders on mobile (Adreno 6xx/7xx/8xx): decorate 32-bit float variables and float-producing ALU / sample
-// instructions with SPIR-V RelaxedPrecision (DEC_RELAXED_PRECISION = 0) when fp16_shaders=1 so the GPU executes
-// fragment math in 16-bit half registers at 2x throughput and halves register file pressure.
+// Fragment shaders on mobile (Adreno 6xx/7xx/8xx): decorate basic float arithmetic / loads / texture samples
+// with SPIR-V RelaxedPrecision (DEC_RELAXED_PRECISION = 0) when fp16_shaders=1. Keep OpFDiv (136), OpExtInst (12:
+// pow/exp/log), and OpVariable (59) in full FP32 to prevent 16-bit half overflow (Inf->NaN black tiles in HDR passes).
 static bool frag_fp16_inst(const uint32_t *w, uint32_t wc, uint32_t op, const uint8_t *f32_type, uint32_t bound) {
     if (wc < 3 || w[1] >= bound || !f32_type[w[1]]) return false;
-    if (float_arith(w, wc, op)) return true;
     switch (op) {
-    case 12:  // OpExtInst (GLSL.std.450 math returning float/vec/mat)
+    case 127: case 129: case 131: case 133:  // FNegate, FAdd, FSub, FMul (exclude OpFDiv 136)
+    case 142: case 143: case 144: case 145: case 146: case 148:  // vector/matrix products, Dot
     case 61:  // OpLoad
     case 79: case 80: case 81: case 82:  // OpVectorShuffle, OpCompositeConstruct, OpCompositeExtract, OpCompositeInsert
     case 87: case 88: case 89: case 90: case 91: case 92: case 93: case 94: case 95: case 96: case 97: case 98: case 99:  // OpImageSample* / Fetch / Gather
@@ -145,9 +145,8 @@ static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
     uint8_t *done = calloc(bound, 1);
     uint8_t *builtin = calloc(bound, 1);
     uint8_t *f32_type = calloc(bound, 1);
-    uint8_t *f32_ptr = calloc(bound, 1);
-    if (!done || !builtin || !f32_type || !f32_ptr) {
-        free(done); free(builtin); free(f32_type); free(f32_ptr);
+    if (!done || !builtin || !f32_type) {
+        free(done); free(builtin); free(f32_type);
         return spv;
     }
     for (size_t i = 5; i < n;) {
@@ -162,8 +161,6 @@ static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
             f32_type[w[1]] = 1;  // OpTypeFloat 32
         } else if ((op == 23 || op == 24) && wc >= 3 && w[1] < bound && w[2] < bound && f32_type[w[2]]) {
             f32_type[w[1]] = 1;  // OpTypeVector / OpTypeMatrix of f32
-        } else if (op == 32 && wc >= 4 && w[1] < bound && w[3] < bound && f32_type[w[3]]) {
-            f32_ptr[w[1]] = 1;   // OpTypePointer to f32 scalar/vec/mat
         }
         i += wc;
     }
@@ -171,19 +168,17 @@ static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
         uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
         if (!wc || i + wc > n) break;
         const uint32_t *w = spv + i;
-        bool want = false;
-        if (op == 59 && wc >= 4 && w[1] < bound && w[2] < bound && f32_ptr[w[1]] && !builtin[w[2]]) want = true;
-        else if (frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]]) want = true;
+        bool want = frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]];
         if (want && !done[w[2]]) count++;
         i += wc;
     }
     if (!insert || !count) {
-        free(done); free(builtin); free(f32_type); free(f32_ptr);
+        free(done); free(builtin); free(f32_type);
         return spv;
     }
     uint32_t *out = malloc((n + count * 3) * 4);
     if (!out) {
-        free(done); free(builtin); free(f32_type); free(f32_ptr);
+        free(done); free(builtin); free(f32_type);
         return spv;
     }
     memcpy(out, spv, insert * 4);
@@ -192,9 +187,7 @@ static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
         uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
         if (!wc || i + wc > n) break;
         const uint32_t *w = spv + i;
-        bool want = false;
-        if (op == 59 && wc >= 4 && w[1] < bound && w[2] < bound && f32_ptr[w[1]] && !builtin[w[2]]) want = true;
-        else if (frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]]) want = true;
+        bool want = frag_fp16_inst(w, wc, op, f32_type, bound) && w[2] < bound && !builtin[w[2]];
         if (want && !done[w[2]]) {
             done[w[2]] = 1;
             out[o++] = 3u << 16 | OP_DECORATE;
@@ -205,7 +198,7 @@ static uint32_t *relaxed_precision_frag(uint32_t *spv, size_t *nwords) {
     }
     memcpy(out + o, spv + insert, (n - insert) * 4);
     *nwords = o + (n - insert);
-    free(done); free(builtin); free(f32_type); free(f32_ptr);
+    free(done); free(builtin); free(f32_type);
     free(spv);
     return out;
 }

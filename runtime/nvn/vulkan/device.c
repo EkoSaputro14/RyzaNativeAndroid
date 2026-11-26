@@ -1664,6 +1664,7 @@ void backend_represent(void) {
 
 #ifdef __ANDROID__
 void vk_present_now(NvnTexture *t, uint64_t asked) {  // (the window's half of backend_present; asked: when the game's
+    uint64_t pre_t0 = plat_now_ns();
     present_asked = asked;                              // thread handed it over)
 #else
 void backend_present(NvnTexture *t) {
@@ -1690,6 +1691,12 @@ void backend_present(NvnTexture *t) {
     if (vk_has_pending_commands()) renderer_submit();
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = plat_now_ns();
+#ifdef __ANDROID__
+    {
+        extern void vk_async_note_pre_present_ns(uint64_t ns);
+        vk_async_note_pre_present_ns(t0 >= pre_t0 ? t0 - pre_t0 : 0);
+    }
+#endif
     stall_note_active_work("vk_acquire");
     bool have = vk_frame_begin(black);
     uint64_t nd = plat_now_ns() - t0;

@@ -25,6 +25,19 @@ typedef struct { const char *name; HostFn fn; } HleImplEntry;
         HLE_CAT(hle_entry_, __LINE__) = {sym, fn};                                          \
     static void fn(Cpu *c)
 
+typedef struct { const char *name; void *fn; } HleFastImplEntry;
+
+// HLE_FAST_FUNC("sym", fast_fn): registers a direct ARM64 ABI C implementation invoked from native_hle_gate
+// without saving/restoring the full guest Cpu context.
+#if defined(__aarch64__) && defined(__ANDROID__)
+#define HLE_FAST_SECTION "hle_fast_impls"
+#define HLE_FAST_FUNC(sym, fast_fn)                                                         \
+    __attribute__((used, section(HLE_FAST_SECTION))) static const HleFastImplEntry          \
+        HLE_CAT(hle_fast_entry_, __LINE__) = {sym, (void *)(uintptr_t)(fast_fn)}
+#else
+#define HLE_FAST_FUNC(sym, fast_fn) typedef int HLE_CAT(hle_fast_unused_, __LINE__)
+#endif
+
 // Per-boot host state. RT_ON_RESET(fn) { ... } runs when the game is torn down for an in-place reboot (switching
 // restarting the game, back to the start screen: runtime/main.c), after every guest thread has stopped and before
 // guest memory is wiped: drop guest pointers, kernel handles and lazily-initialised state, so the next

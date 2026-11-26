@@ -71,7 +71,7 @@ Settings g_settings = {
     .heap_mb = 2560,           // (2560 MB default guest heap target on 6 GB Android devices; configurable 1536..3584 MB)
     .swapchain_images = 4,     // (mhrise-arch v2: 4 swapchain images default for smooth Auto-FIFO 2x presentation; configurable 2..5)
     .present_mode = 2,         // (mhrise-arch v2: 2 = FIFO default for even alternating VSync pacing; 0 = Immediate, 1 = Mailbox)
-    .fp16_shaders = 1,         // (1 = FP16 RelaxedPrecision fragment shaders on Adreno default; 0 = FP32)
+    .fp16_shaders = 0,         // (0 = FP32 safe default: prevents HDR Inf->NaN black sky tiles; 1 = FP16 RelaxedPrecision)
     .async_spin_us = 500,      // (500 us spin-wait in async render/wait loop to keep SD732G clocks up when ADPF unavailable)
     .target_fps = 30,          // (mhrise-arch v2: 30 fps real native game pace; SurfaceFlinger gets 60 Hz when 2x frame_gen is active)
     .skip_postfx = 1,          // (mhrise-arch exp: cull heavy KTGL post-FX passes by default for high FPS)
@@ -84,7 +84,7 @@ Settings g_settings = {
     .async_shaders = 1,        // (mhrise-arch v2: non-blocking background graphics shader/pipeline workers; skip 1-2 frames vs stutter)
     .gpu_mirrors = 1,          // (mhrise-arch v2: persistent page-tracked GPU mirrors + 3-ring direct mirrors)
     .gpu_writeback = 0,        // (mhrise-arch v2: mass GPU->CPU RT write-back disabled per mhrise-recomp; explicit copies preserved)
-    .profile_ver = 3,          // (mhrise-arch v3: one-time mobile Adreno profile migration)
+    .profile_ver = 4,          // (mhrise-arch v4: one-time mobile Adreno profile migration including FP32 HDR shader fix)
 #else
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
 #endif
@@ -499,6 +499,14 @@ void settings_load(void) {
         g_settings.profile_ver = 3;
         LOG("[settings] migrated legacy %s (profile_ver %d -> 3) to mhrise-arch v3 mobile Adreno defaults\n",
             SETTINGS_FILE, loaded_profile_ver);
+        settings_save();
+    }
+    if (loaded_profile_ver < 4) {
+        // v4: disable fp16_shaders by default on KTGL HDR titles (fixes HDR sky Inf->NaN staircase black tiles)
+        g_settings.fp16_shaders = g_defaults.fp16_shaders;
+        g_settings.profile_ver = 4;
+        LOG("[settings] migrated %s (profile_ver %d -> 4): fp16_shaders=%d (FP32 HDR fix)\n",
+            SETTINGS_FILE, loaded_profile_ver, g_settings.fp16_shaders);
         settings_save();
     }
     if (g_settings.render_scale <= 0.0f) g_settings.render_scale = 0.50f;

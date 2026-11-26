@@ -72,10 +72,17 @@ static int ahead = 1;
 // The render thread's work for its last frame (requests run between two presents, ns): the frame pacer's other half
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;
 static uint64_t frame_idle_ns, frame_coalesce_ns;
+static uint64_t frame_spin_ns, frame_other_req_ns, frame_pre_present_ns;
+static int active_req_type = -1;
+static uint64_t active_req_start_ns;
 uint64_t vk_async_frame_work_ns(void) { return __atomic_load_n(&last_frame_work, __ATOMIC_RELAXED); }
 uint64_t vk_async_frame_cpu_ns(void) { return __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED); }
-uint64_t vk_async_take_idle_ns(void) { return __atomic_exchange_n(&frame_idle_ns, 0, __ATOMIC_RELAXED); }
+uint64_t vk_async_take_idle_ns(void) {
+    return __atomic_exchange_n(&frame_idle_ns, 0, __ATOMIC_RELAXED) +
+           __atomic_exchange_n(&frame_spin_ns, 0, __ATOMIC_RELAXED);
+}
 uint64_t vk_async_take_coalesce_ns(void) { return __atomic_exchange_n(&frame_coalesce_ns, 0, __ATOMIC_RELAXED); }
+void vk_async_note_pre_present_ns(uint64_t ns) { __atomic_fetch_add(&frame_pre_present_ns, ns, __ATOMIC_RELAXED); }
 int vk_async_render_tid(void) { return __atomic_load_n(&g_vk_render_tid, __ATOMIC_RELAXED); }
 
 void kernel_blocking_begin(void);        // kernel.c: core 0 to the game's other threads while a guest thread waits here
@@ -221,6 +228,7 @@ static void *render_main(void *arg) {
                     if (plat_now_ns() - spin_t0 >= spin_limit) break;
                     cpu_spin_yield(++iter);
                 }
+                __atomic_fetch_add(&frame_spin_ns, plat_now_ns() - spin_t0, __ATOMIC_RELAXED);
                 pthread_mutex_lock(&q_lock);
                 if (q_head != q_tail) break;
                 if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) continue;
@@ -246,6 +254,8 @@ static void *render_main(void *arg) {
         }
         pthread_mutex_unlock(&q_lock);
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
+        __atomic_store_n(&active_req_type, r.type, __ATOMIC_RELEASE);
+        __atomic_store_n(&active_req_start_ns, t0, __ATOMIC_RELEASE);
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
         if (r.type == REQ_EXEC || r.type == REQ_PRESENT || r.type == REQ_FENCE)
             vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
@@ -293,6 +303,10 @@ static void *render_main(void *arg) {
         if (r.type == REQ_EXEC || r.type == REQ_PRESENT)
             vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
         uint64_t elapsed = plat_now_ns() - t0;
+        __atomic_store_n(&active_req_type, -1, __ATOMIC_RELEASE);
+        if (r.type != REQ_EXEC && r.type != REQ_PRESENT) {
+            __atomic_fetch_add(&frame_other_req_ns, elapsed, __ATOMIC_RELAXED);
+        }
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
         frame_work += elapsed;
         if (r.type == REQ_PRESENT) {
@@ -302,6 +316,8 @@ static void *render_main(void *arg) {
             uint64_t report_ns = frame_work > frame_cpu ? frame_work : frame_cpu;
             plat_render_work(report_ns, 16666667ull);  // (ADPF: clocks for 60 fps on this thread too)
             frame_work = frame_cpu = 0;
+            __atomic_store_n(&frame_other_req_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&frame_pre_present_ns, 0, __ATOMIC_RELAXED);
         }
         pthread_mutex_lock(&q_lock);
         q_head++;
@@ -461,7 +477,7 @@ void vk_async_kick_flush(uint64_t target_seq) {
     pthread_mutex_unlock(&p_lock);
 }
 
-// Until every request queued so far has run (the render thread is idle after it).
+// Until every request queued so far has run and any open batch is submitted (single coalesced wait).
 void vk_async_drain(void) {
     if (!g_vk_render_started || vk_async_is_render_thread()) {
         if (vk_has_pending_commands()) {
@@ -474,30 +490,53 @@ void vk_async_drain(void) {
         return;
     }
     uint64_t w0 = plat_now_ns();
-    kernel_blocking_begin();
+    pthread_mutex_lock(&p_lock);
     pthread_mutex_lock(&q_lock);
-    uint64_t id = q_tail;
-    if (q_done < id) {
-        __atomic_fetch_add(&q_waiters, 1, __ATOMIC_RELAXED);
-        pthread_cond_signal(&q_more);
-        while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
-        __atomic_fetch_sub(&q_waiters, 1, __ATOMIC_RELAXED);
+    uint64_t q_depth0 = q_tail - q_head;
+    int act_type0 = __atomic_load_n(&active_req_type, __ATOMIC_ACQUIRE);
+    uint64_t act_t0 = __atomic_load_n(&active_req_start_ns, __ATOMIC_ACQUIRE);
+    bool need_wait = (q_done < q_tail) || vk_has_pending_commands();
+    uint64_t fid = 0;
+    if (need_wait) {
+        if (q_tail > q_head && (q_tail - 1) > q_head) {
+            Req *last = &q[(q_tail - 1) % QN];
+            if (last->type == REQ_FLUSH && last->a == 0) {
+                fid = last->id;
+            }
+        }
+        pthread_mutex_unlock(&q_lock);
+        if (!fid) fid = push(REQ_FLUSH, 0, NULL);
+    } else {
+        pthread_mutex_unlock(&q_lock);
     }
-    pthread_mutex_unlock(&q_lock);
-    if (vk_has_pending_commands()) {
-        pthread_mutex_lock(&p_lock);
-        uint64_t fid = push(REQ_FLUSH, 0, NULL);
-        pthread_mutex_unlock(&p_lock);
+    pthread_mutex_unlock(&p_lock);
+    if (fid) {
+        kernel_blocking_begin();
         vk_async_wait_id(fid);
+        kernel_blocking_end();
     }
-    kernel_blocking_end();
     uint64_t w1 = plat_now_ns();
+    uint64_t wdt = w1 >= w0 ? w1 - w0 : 0;
     {
         extern bool vk_in_sync_wait(void);
         extern void vk_record_nvn_sync_wait(uint64_t ns);
-        if (!vk_in_sync_wait()) vk_record_nvn_sync_wait(w1 >= w0 ? w1 - w0 : 0);
+        if (!vk_in_sync_wait()) vk_record_nvn_sync_wait(wdt);
     }
-    if (w1 - w0 >= 5000000ull) {
+    if (wdt >= 50000000ull) {
+        static uint64_t drain_logs;
+        if (drain_logs++ < 60 || (drain_logs & 15u) == 0) {
+            double act_ms = (act_type0 >= 0 && w0 >= act_t0) ? (double)(w0 - act_t0) / 1e6 : 0.0;
+            LOG("[async-diag] drain_ms=%.1f q_depth=%llu active_req=%d(elapsed=%.1fms) spin_ms=%.1f other_req_ms=%.1f pre_present_ms=%.1f render_cpu_ms=%.1f frame=%llu tid=%d\n",
+                wdt / 1e6, (unsigned long long)q_depth0, act_type0, act_ms,
+                __atomic_load_n(&frame_spin_ns, __ATOMIC_RELAXED) / 1e6,
+                __atomic_load_n(&frame_other_req_ns, __ATOMIC_RELAXED) / 1e6,
+                __atomic_load_n(&frame_pre_present_ns, __ATOMIC_RELAXED) / 1e6,
+                __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED) / 1e6,
+                (unsigned long long)renderer_present_count(),
+                stall_thread_tid());
+        }
+    }
+    if (wdt >= 5000000ull) {
         stall_record_wait_event(renderer_present_count(), w0, w1, "async",
                                 "vk_async_drain", vk_async_render_tid(), "vk-render", NULL);
     }

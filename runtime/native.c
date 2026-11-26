@@ -82,6 +82,11 @@ void native_thread_end(void) {
     pthread_mutex_unlock(&tab_lock);
 }
 
+Cpu *native_current_cpu(void) {
+    NativeTabEnt *e = tab_find(tp_now());
+    return e ? e->cpu : NULL;
+}
+
 void native_call(Cpu *c, uint64_t addr) {
     native_bind(c);
     uint64_t lr = c->x[30];

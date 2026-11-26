@@ -62,7 +62,7 @@ typedef struct {
     int heap_mb;          // guest heap target in MB (botwrecompandroid.ini heap_mb=, default 2560, valid 1536..3584)
     int swapchain_images; // Vulkan swapchain image count (botwrecompandroid.ini swapchain_images=, default 3, valid 2..5)
     int present_mode;     // Vulkan present mode (0 = Immediate, 1 = Mailbox [default], 2 = FIFO / VSync)
-    int fp16_shaders;     // SPIR-V fragment shader FP16 RelaxedPrecision (0 = Off / FP32, 1 = On / FP16 [default])
+    int fp16_shaders;     // SPIR-V fragment shader FP16 RelaxedPrecision (0 = Off / FP32 [default], 1 = On / FP16)
     int async_spin_us;    // vk-render / async wait spin-wait window in microseconds before sleeping (default 250; 0 = off)
     int target_fps;       // Monotonic frame pacer / SurfaceFlinger hint target (0 = uncapped, 20, 30, 45, 60; default 30)
     int skip_postfx;      // KTGL heavy post-FX pass culling (0 = off, 1 = skip RLR/MRLR/GaussianBlur/TerrainShadow)

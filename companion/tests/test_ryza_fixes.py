@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,8 +1216,8 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-4")' in cmake_txt
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-5")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,8 +1387,8 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-4")' in cmake_txt
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-5")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
@@ -1444,7 +1444,7 @@ def _verify_exp_mhrise_arch():
     workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
 
     # 0. Version & CI branch trigger
-    assert "versionCode = 57" in gradle_kts and "0.3.2-exp-mhrise-4" in gradle_kts
+    assert "versionCode = 58" in gradle_kts and "0.3.2-exp-mhrise-5" in gradle_kts
     assert "- 'exp/*'" in workflow
     assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
 
@@ -1566,7 +1566,7 @@ def _verify_exp_mhrise_arch_v3():
 
     # 1. Legacy INI profile migration (v3) + shadow_scale=0.00 persistence
     assert "int profile_ver;" in settings_h
-    assert ".profile_ver = 3" in settings_c
+    assert ".profile_ver = 3" in settings_c or ".profile_ver = 4" in settings_c
     assert "if (loaded_profile_ver < 3)" in settings_c
     assert "if (g_settings.shadow_scale >= 0.0f)" in settings_c
     assert "profile_ver = %d" in settings_c
@@ -1657,3 +1657,54 @@ def _verify_exp_mhrise_arch_v4_quickwin():
 
 
 _verify_exp_mhrise_arch_v4_quickwin()
+
+
+def _verify_exp_mhrise_arch_v5():
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch v5 (FP32 HDR sky fix, vk_async_drain coalescing/diag, t80 mutex boost, Phase 2 ARM64 HLE fast-path)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    settings_c = (repo_root / "runtime" / "settings.c").read_text(encoding="utf-8")
+    shaders_c = (repo_root / "runtime" / "nvn" / "vulkan" / "shaders.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    kernel_h = (repo_root / "runtime" / "kernel.h").read_text(encoding="utf-8")
+    kernel_c = (repo_root / "runtime" / "kernel.c").read_text(encoding="utf-8")
+    hle_h = (repo_root / "runtime" / "hle.h").read_text(encoding="utf-8")
+    dispatch_c = (repo_root / "runtime" / "dispatch.c").read_text(encoding="utf-8")
+    native_c = (repo_root / "runtime" / "native.c").read_text(encoding="utf-8")
+    native_gate_s = (repo_root / "runtime" / "native_gate.S").read_text(encoding="utf-8")
+    cmdbuf_c = (repo_root / "runtime" / "nvn" / "cmdbuf.c").read_text(encoding="utf-8")
+
+    # 1. FP32 default + v4 INI migration + OpFDiv/OpExtInst/OpVariable excluded from RelaxedPrecision
+    assert ".fp16_shaders = 0" in settings_c
+    assert ".profile_ver = 4" in settings_c
+    assert "if (loaded_profile_ver < 4)" in settings_c
+    assert "exclude OpFDiv 136" in shaders_c
+    assert "case 12:" not in shaders_c.split("static bool frag_fp16_inst")[1].split("static uint32_t *relaxed_precision_frag")[0]
+
+    # 2. vk_async_drain single coalesced flush wait + render breakdown instrumentation
+    assert "frame_spin_ns" in async_c and "frame_other_req_ns" in async_c and "frame_pre_present_ns" in async_c
+    assert "[async-diag]" in async_c
+    assert "vk_async_note_pre_present_ns(" in device_c
+    drain_body = async_c.split("void vk_async_drain(void)")[1].split("static void mark_fences")[0]
+    assert "push(REQ_FLUSH, 0, NULL)" in drain_body
+    assert "vk_async_wait_id(fid)" in drain_body
+
+    # 3. t80 mutex priority inversion boost
+    assert "bool fast_boosted;" in kernel_h
+    assert "mt->fast_boosted" in kernel_c and "plat_boost_thread_tid((int32_t)mt->host_tid)" in kernel_c
+
+    # 4. Phase 2 Direct ARM64 ABI HLE fast-path
+    assert "HLE_FAST_FUNC(" in hle_h and "hle_fast_impls" in hle_h
+    assert "void *g_hle_fast_fn[MAX_HLE]" in dispatch_c and "LARECOMP_HLE_FAST" in dispatch_c
+    assert "Cpu *native_current_cpu(void)" in native_c
+    assert "native_hle_fast_path" in native_gate_s and "C_HOST_X18" in native_gate_s and "CPU_LOOKUP x17, x14, x15" in native_gate_s
+    assert "static inline CmdRec *rec_fast(" in cmdbuf_c
+    for sym in ["nvnCommandBufferBindUniformBuffer", "nvnCommandBufferBindTexture", "nvnCommandBufferDrawElements",
+                "nvnCommandBufferSetViewport", "nvnCommandBufferSetScissor", "nvnCommandBufferUpdateUniformBuffer"]:
+        assert f'HLE_FAST_FUNC("{sym}"' in cmdbuf_c, f"Missing HLE_FAST_FUNC for {sym}"
+
+    print("  -> PASS: exp/mhrise-arch v5 (FP32 HDR sky fix + drain coalescing/diag + t80 mutex boost + Phase 2 HLE fast-path) verified.")
+
+
+_verify_exp_mhrise_arch_v5()

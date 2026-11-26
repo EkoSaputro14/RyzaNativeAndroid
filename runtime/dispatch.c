@@ -30,6 +30,9 @@ static int n_tables = 2;
 typedef struct { const char *name; HostFn fn; } HleSlot;
 static HleSlot hle_slots[MAX_HLE];
 static int hle_count;
+__attribute__((visibility("hidden"), aligned(64))) void *g_hle_fast_fn[MAX_HLE];
+static int hle_fast_count;
+int hle_fast_slot_count(void) { return hle_fast_count; }
 
 // Overrides of recompiled guest functions (by address)
 #define MAX_OVERRIDE 1024
@@ -59,15 +62,40 @@ HostFn hle_lookup_impl(const char *name) {
     return NULL;
 }
 
+#if defined(__aarch64__) && defined(__ANDROID__)
+extern const HleFastImplEntry __start_hle_fast_impls[] __attribute__((weak));
+extern const HleFastImplEntry __stop_hle_fast_impls[] __attribute__((weak));
+static void *hle_lookup_fast_impl(const char *name) {
+    const char *e = ENV("LARECOMP_HLE_FAST");
+    if (e && atoi(e) == 0) return NULL;
+    const HleFastImplEntry *start = __start_hle_fast_impls, *stop = __stop_hle_fast_impls;
+    if (!start || !stop) return NULL;
+    __asm__("" : "+r"(start), "+r"(stop));
+    for (const HleFastImplEntry *p = start; p < stop; p++)
+        if (p->name && !strcmp(p->name, name)) return p->fn;
+    return NULL;
+}
+#endif
+
 static void hle_unimplemented(Cpu *c);
 
 uint64_t hle_register(const char *name, HostFn fn) {
     for (int i = 0; i < hle_count; i++)
         if (!strcmp(hle_slots[i].name, name)) return HLE_BASE + 16ull * i;
     if (hle_count == MAX_HLE) FATAL("too many HLE stubs\n");
-    hle_slots[hle_count].name = strdup(name);
-    hle_slots[hle_count].fn = fn;
-    return HLE_BASE + 16ull * hle_count++;
+    int slot = hle_count++;
+    hle_slots[slot].name = strdup(name);
+    hle_slots[slot].fn = fn;
+#if defined(__aarch64__) && defined(__ANDROID__)
+    void *ffn = hle_lookup_fast_impl(name);
+    if (ffn) {
+        g_hle_fast_fn[slot] = ffn;
+        hle_fast_count++;
+        if (ENV("LARECOMP_LOG_NATIVE_FAST"))
+            LOG("[native-fast] slot %d -> %s\n", slot, name);
+    }
+#endif
+    return HLE_BASE + 16ull * slot;
 }
 
 void hle_override(uint64_t addr, HostFn fn, const char *name) {

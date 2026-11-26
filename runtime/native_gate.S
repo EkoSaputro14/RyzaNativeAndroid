@@ -279,12 +279,16 @@ native_patch_gate:
     .size native_patch_gate, .-native_patch_gate
 
 // From an HLE slot (native.c prepare_hle): a call into the runtime. x17 = the slot, x30 = the guest's return, x16 free
-// (as at any call). The arguments go into the Cpu, the function runs on the host stack (native_hle_c), and the
-// registers come back from the Cpu - its results, and whatever the function set there.
+// (as at any call). If g_hle_fast_fn[x17] is populated, branch to native_hle_fast_path to invoke the direct ARM64 ABI
+// C function using the host stack and host x18 without saving/restoring the full guest Cpu context.
     .globl native_hle_gate
     .hidden native_hle_gate
     .type native_hle_gate, %function
 native_hle_gate:
+    adrp x16, g_hle_fast_fn
+    add  x16, x16, :lo12:g_hle_fast_fn
+    ldr  x16, [x16, x17, lsl #3]
+    cbnz x16, native_hle_fast_path
     sub sp, sp, #32
     str x17, [sp]
     str x15, [sp, #8]
@@ -315,4 +319,27 @@ native_hle_gate:
     LOAD_GUEST_X x16
     ret
     .size native_hle_gate, .-native_hle_gate
+
+    .p2align 4
+    .type native_hle_fast_path, %function
+native_hle_fast_path:
+    CPU_LOOKUP x17, x14, x15
+    mov  x14, sp
+    str  x14, [x17, #C_SP]
+    str  x30, [x17, #240]
+    ldr  x15, [x17, #C_HOST_SP]
+    sub  x15, x15, #32
+    stp  x18, x30, [x15, #0]
+    stp  x14, x17, [x15, #16]
+    str  x15, [x17, #C_HOST_SP]
+    ldr  x18, [x17, #C_HOST_X18]
+    mov  sp, x15
+    blr  x16
+    ldp  x14, x17, [sp, #16]
+    add  x15, sp, #32
+    str  x15, [x17, #C_HOST_SP]
+    ldp  x18, x30, [sp, #0]
+    mov  sp, x14
+    ret
+    .size native_hle_fast_path, .-native_hle_fast_path
 #endif

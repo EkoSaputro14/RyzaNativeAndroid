@@ -734,6 +734,10 @@ static uint32_t block_current(int64_t timeout_ns) {
                 wait_owner_prio = mt->prio;
                 wait_owner_core = __atomic_load_n(&mt->core, __ATOMIC_RELAXED);
                 wait_owner_lr = mt->cpu.x[30];
+                if (t->id == 0x50 && mt->host_tid > 0 &&
+                    !__atomic_exchange_n(&mt->fast_boosted, true, __ATOMIC_RELAXED)) {
+                    plat_boost_thread_tid((int32_t)mt->host_tid);
+                }
             }
         }
     }

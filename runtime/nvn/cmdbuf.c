@@ -803,3 +803,517 @@ NVN(nvnCommandBufferPushDebugGroupDynamic) { record_push_debug_group(c, A(2)); }
 NVN(nvnCommandBufferPushDebugGroupStatic) { record_push_debug_group(c, A(2)); }
 NVN(nvnCommandBufferPopDebugGroup) { Snap s = snap(c); record(c, CMD_POP_DEBUG_GROUP, 0, &s); }
 NVN(nvnCommandBufferPopDebugGroupId) { Snap s = snap(c); record(c, CMD_POP_DEBUG_GROUP, 0, &s); }
+
+#if defined(__aarch64__) && defined(__ANDROID__)
+extern Cpu *native_current_cpu(void);
+
+// Direct ARM64 ABI command-buffer recorder: bypasses full Cpu register save/restore for hot NVN calls
+// while falling back to rec(native_current_cpu(), ...) on rare chunk-full or shadow-page boundaries.
+static inline CmdRec *rec_fast(NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
+    uint32_t real = (uint32_t)((sizeof(CmdRec) + extra + 7u) & ~7u);
+    uint32_t size = (real + SHADOW_K - 1u) / SHADOW_K;
+    if (__builtin_expect((cb->gmem || cb->mem) && cb->used + size + JUMP_RESERVE <= cb->size, 1)) {
+        if (cb->gmem) {
+            uint64_t guest = cb->gmem + cb->used;
+            uint64_t in_page = guest & (SHADOW_PAGE - 1u);
+            if (__builtin_expect(in_page + size + JUMP_RESERVE <= SHADOW_PAGE, 1)) {
+                uint64_t page = guest / SHADOW_PAGE + 1u;
+                if (__builtin_expect(page == cb->shadow_page, 1)) {
+                    CmdRec *r = raw_rec(cb->shadow_mem + in_page * SHADOW_K, op, real);
+                    cb->used += size;
+                    return r;
+                }
+            }
+        } else {
+            CmdRec *r = raw_rec(cb->mem + cb->used * SHADOW_K, op, real);
+            cb->used += size;
+            return r;
+        }
+    }
+    return rec(native_current_cpu(), cb, op, extra);
+}
+
+static inline CmdRec *fast_rec_copy1(uint64_t cmd, uint32_t op, uint64_t src, uint32_t len) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return NULL;
+    CmdRec *r = rec_fast(cb, op, len);
+    r->x[0] = src;
+    if (src >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)src, len);
+    return r;
+}
+
+static void fast_nvnCommandBufferBindProgram(uint64_t cmd, uint64_t prog, uint64_t stages) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_PROGRAM, 0);
+    r->x[0] = (uint64_t)(uintptr_t)HOST(NvnProgram, prog);
+    r->x[1] = stages;
+}
+HLE_FAST_FUNC("nvnCommandBufferBindProgram", fast_nvnCommandBufferBindProgram);
+
+static void fast_nvnCommandBufferBindBlendState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_BLEND, s, 8); }
+HLE_FAST_FUNC("nvnCommandBufferBindBlendState", fast_nvnCommandBufferBindBlendState);
+
+static void fast_nvnCommandBufferBindChannelMaskState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_CHANNEL_MASK, s, 4); }
+HLE_FAST_FUNC("nvnCommandBufferBindChannelMaskState", fast_nvnCommandBufferBindChannelMaskState);
+
+static void fast_nvnCommandBufferBindColorState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_COLOR, s, 4); }
+HLE_FAST_FUNC("nvnCommandBufferBindColorState", fast_nvnCommandBufferBindColorState);
+
+static void fast_nvnCommandBufferBindDepthStencilState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_DEPTH_STENCIL, s, 8); }
+HLE_FAST_FUNC("nvnCommandBufferBindDepthStencilState", fast_nvnCommandBufferBindDepthStencilState);
+
+static void fast_nvnCommandBufferBindMultisampleState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_MULTISAMPLE, s, 0x18); }
+HLE_FAST_FUNC("nvnCommandBufferBindMultisampleState", fast_nvnCommandBufferBindMultisampleState);
+
+static void fast_nvnCommandBufferBindPolygonState(uint64_t cmd, uint64_t s) { fast_rec_copy1(cmd, CMD_BIND_POLYGON, s, 4); }
+HLE_FAST_FUNC("nvnCommandBufferBindPolygonState", fast_nvnCommandBufferBindPolygonState);
+
+static void fast_nvnCommandBufferBindVertexAttribState(uint64_t cmd, uint64_t count, uint64_t states) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 4u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_VERTEX_ATTRIB, len);
+    r->x[0] = count;
+    r->x[1] = states;
+    if (states >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)states, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindVertexAttribState", fast_nvnCommandBufferBindVertexAttribState);
+
+static void fast_nvnCommandBufferBindVertexStreamState(uint64_t cmd, uint64_t count, uint64_t states) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 8u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_VERTEX_STREAM, len);
+    r->x[0] = count;
+    r->x[1] = states;
+    if (states >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)states, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindVertexStreamState", fast_nvnCommandBufferBindVertexStreamState);
+
+static void fast_nvnCommandBufferBindVertexBuffers(uint64_t cmd, uint64_t first, uint64_t count, uint64_t buffers) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 16u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_VERTEX_BUFFERS, len);
+    r->x[0] = first;
+    r->x[1] = count;
+    r->x[2] = buffers;
+    if (buffers >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)buffers, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindVertexBuffers", fast_nvnCommandBufferBindVertexBuffers);
+
+static void fast_nvnCommandBufferBindVertexBuffer(uint64_t cmd, uint64_t idx, uint64_t addr, uint64_t sz) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_VERTEX_BUFFERS, 16u);
+    r->x[0] = idx;
+    r->x[1] = 1;
+    uint64_t range[2] = {addr, sz};
+    memcpy(r->extra, range, 16);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindVertexBuffer", fast_nvnCommandBufferBindVertexBuffer);
+
+static void fast_nvnCommandBufferBindUniformBuffers(uint64_t cmd, uint64_t stage, uint64_t first, uint64_t count, uint64_t buffers) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 16u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_UNIFORM_BUFFERS, len);
+    r->x[0] = stage;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = buffers;
+    if (buffers >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)buffers, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindUniformBuffers", fast_nvnCommandBufferBindUniformBuffers);
+
+static void fast_nvnCommandBufferBindUniformBuffer(uint64_t cmd, uint64_t stage, uint64_t idx, uint64_t addr, uint64_t sz) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_UNIFORM_BUFFERS, 16u);
+    r->x[0] = stage;
+    r->x[1] = idx;
+    r->x[2] = 1;
+    uint64_t range[2] = {addr, sz};
+    memcpy(r->extra, range, 16);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindUniformBuffer", fast_nvnCommandBufferBindUniformBuffer);
+
+static void fast_nvnCommandBufferBindStorageBuffers(uint64_t cmd, uint64_t stage, uint64_t first, uint64_t count, uint64_t buffers) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 16u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_STORAGE_BUFFERS, len);
+    r->x[0] = stage;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = buffers;
+    if (buffers >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)buffers, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindStorageBuffers", fast_nvnCommandBufferBindStorageBuffers);
+
+static void fast_nvnCommandBufferBindStorageBuffer(uint64_t cmd, uint64_t stage, uint64_t idx, uint64_t addr, uint64_t sz) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_STORAGE_BUFFERS, 16u);
+    r->x[0] = stage;
+    r->x[1] = idx;
+    r->x[2] = 1;
+    uint64_t range[2] = {addr, sz};
+    memcpy(r->extra, range, 16);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindStorageBuffer", fast_nvnCommandBufferBindStorageBuffer);
+
+static void fast_nvnCommandBufferBindTextures(uint64_t cmd, uint64_t stage, uint64_t first, uint64_t count, uint64_t tex) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 8u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_TEXTURES, len);
+    r->x[0] = stage;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = tex;
+    if (tex >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)tex, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindTextures", fast_nvnCommandBufferBindTextures);
+HLE_FAST_FUNC("nvnCommandBufferBindSeparateTextures", fast_nvnCommandBufferBindTextures);
+
+static void fast_nvnCommandBufferBindTexturesDeferred(uint64_t cmd, uint64_t stage, uint64_t first, uint64_t count, uint64_t tex) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_TEXTURES_DEFERRED, 0);
+    r->x[0] = stage;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = tex;
+}
+HLE_FAST_FUNC("nvnCommandBufferBindTexturesDeferred", fast_nvnCommandBufferBindTexturesDeferred);
+
+static void fast_nvnCommandBufferBindTexture(uint64_t cmd, uint64_t stage, uint64_t idx, uint64_t handle) {
+    extern int nvn_watch_texid(void);
+    if (__builtin_expect((int)(handle & 0xFFFFFu) == nvn_watch_texid(), 0))
+        LOG("[watch] BindTexture stage %llu slot %llu handle %llx\n",
+            (unsigned long long)stage, (unsigned long long)idx, (unsigned long long)handle);
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_TEXTURES, 8u);
+    r->x[0] = stage;
+    r->x[1] = idx;
+    r->x[2] = 1;
+    memcpy(r->extra, &handle, 8);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindTexture", fast_nvnCommandBufferBindTexture);
+
+static void fast_nvnCommandBufferBindImages(uint64_t cmd, uint64_t stage, uint64_t first, uint64_t count, uint64_t imgs) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 8u;
+    CmdRec *r = rec_fast(cb, CMD_BIND_IMAGES, len);
+    r->x[0] = stage;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = imgs;
+    if (imgs >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)imgs, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindImages", fast_nvnCommandBufferBindImages);
+
+static void fast_nvnCommandBufferBindImage(uint64_t cmd, uint64_t stage, uint64_t idx, uint64_t handle) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_IMAGES, 8u);
+    r->x[0] = stage;
+    r->x[1] = idx;
+    r->x[2] = 1;
+    memcpy(r->extra, &handle, 8);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindImage", fast_nvnCommandBufferBindImage);
+
+static void fast_nvnCommandBufferBindSeparateTexture(uint64_t cmd, uint64_t stage, uint64_t idx, uint64_t handle) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_BIND_TEXTURES, 8u);
+    r->x[0] = stage;
+    r->x[1] = idx;
+    r->x[2] = 1;
+    memcpy(r->extra, &handle, 8);
+}
+HLE_FAST_FUNC("nvnCommandBufferBindSeparateTexture", fast_nvnCommandBufferBindSeparateTexture);
+
+static void fast_nvnCommandBufferSetTexturePool(uint64_t cmd, uint64_t pool) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    rec_fast(cb, CMD_SET_TEXTURE_POOL, 0)->x[0] = (uint64_t)(uintptr_t)HOST(NvnDescPool, pool);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetTexturePool", fast_nvnCommandBufferSetTexturePool);
+
+static void fast_nvnCommandBufferSetSamplerPool(uint64_t cmd, uint64_t pool) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    rec_fast(cb, CMD_SET_SAMPLER_POOL, 0)->x[0] = (uint64_t)(uintptr_t)HOST(NvnDescPool, pool);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetSamplerPool", fast_nvnCommandBufferSetSamplerPool);
+
+static void fast_nvnCommandBufferSetRenderTargets(uint64_t cmd, uint64_t num_colors, uint64_t colors_g,
+                                                  uint64_t views_g, uint64_t depth_g, uint64_t dview_g) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    int n = (int)num_colors;
+    if (n < 0) n = 0;
+    if (n > 8) n = 8;
+    RtRec rt = {0};
+    const uint64_t *colors = colors_g >= 0x10000ull ? (const uint64_t *)(uintptr_t)colors_g : NULL;
+    const uint64_t *views = views_g >= 0x10000ull ? (const uint64_t *)(uintptr_t)views_g : NULL;
+    for (int i = 0; i < n; i++) {
+        rt.tex[i] = colors && colors[i] ? (uint64_t)(uintptr_t)HOST(NvnTexture, colors[i]) : 0;
+        if (views && views[i] >= 0x10000ull) {
+            rt.has_view[i] = 1;
+            memcpy(&rt.views[i], (const void *)(uintptr_t)views[i], sizeof(NvnTextureView));
+        }
+    }
+    rt.depth = depth_g ? (uint64_t)(uintptr_t)HOST(NvnTexture, depth_g) : 0;
+    if (dview_g >= 0x10000ull) {
+        rt.has_dview = 1;
+        memcpy(&rt.dview, (const void *)(uintptr_t)dview_g, sizeof(NvnTextureView));
+    }
+    CmdRec *r = rec_fast(cb, CMD_SET_RENDER_TARGETS, sizeof rt);
+    r->x[0] = (uint64_t)n;
+    memcpy(r->extra, &rt, sizeof rt);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetRenderTargets", fast_nvnCommandBufferSetRenderTargets);
+
+static void fast_nvnCommandBufferSetViewports(uint64_t cmd, uint64_t first, uint64_t count, uint64_t viewports) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 16u;
+    CmdRec *r = rec_fast(cb, CMD_SET_VIEWPORTS, len);
+    r->x[0] = first;
+    r->x[1] = count;
+    r->x[2] = viewports;
+    if (viewports >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)viewports, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetViewports", fast_nvnCommandBufferSetViewports);
+
+static void fast_nvnCommandBufferSetViewport(uint64_t cmd, uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_VIEWPORTS, 16u);
+    float v[4] = {(float)(int32_t)x, (float)(int32_t)y, (float)(int32_t)w, (float)(int32_t)h};
+    r->x[0] = 0;
+    r->x[1] = 1;
+    memcpy(r->extra, v, 16);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetViewport", fast_nvnCommandBufferSetViewport);
+
+static void fast_nvnCommandBufferSetScissors(uint64_t cmd, uint64_t first, uint64_t count, uint64_t scissors) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 16u;
+    CmdRec *r = rec_fast(cb, CMD_SET_SCISSORS, len);
+    r->x[0] = first;
+    r->x[1] = count;
+    r->x[2] = scissors;
+    if (scissors >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)scissors, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetScissors", fast_nvnCommandBufferSetScissors);
+
+static void fast_nvnCommandBufferSetScissor(uint64_t cmd, uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_SCISSORS, 16u);
+    int32_t v[4] = {(int32_t)x, (int32_t)y, (int32_t)w, (int32_t)h};
+    r->x[0] = 0;
+    r->x[1] = 1;
+    memcpy(r->extra, v, 16);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetScissor", fast_nvnCommandBufferSetScissor);
+
+static void fast_nvnCommandBufferSetDepthRanges(uint64_t cmd, uint64_t first, uint64_t count, uint64_t ranges) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)count * 8u;
+    CmdRec *r = rec_fast(cb, CMD_SET_DEPTH_RANGES, len);
+    r->x[0] = first;
+    r->x[1] = count;
+    r->x[2] = ranges;
+    if (ranges >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)ranges, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetDepthRanges", fast_nvnCommandBufferSetDepthRanges);
+
+static void fast_nvnCommandBufferSetDepthRange(uint64_t cmd, float zn, float zf) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_DEPTH_RANGES, 8u);
+    float f[2] = {zn, zf};
+    r->x[0] = 0;
+    r->x[1] = 1;
+    r->f[0] = zn;
+    r->f[1] = zf;
+    memcpy(r->extra, f, 8);
+}
+HLE_FAST_FUNC("nvnCommandBufferSetDepthRange", fast_nvnCommandBufferSetDepthRange);
+
+static void fast_nvnCommandBufferSetStencilRef(uint64_t cmd, uint64_t faces, uint64_t ref) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_STENCIL, 0);
+    r->x[0] = faces;
+    r->x[1] = ref;
+    r->x[6] = 0;
+}
+HLE_FAST_FUNC("nvnCommandBufferSetStencilRef", fast_nvnCommandBufferSetStencilRef);
+
+static void fast_nvnCommandBufferSetStencilMask(uint64_t cmd, uint64_t faces, uint64_t mask) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_STENCIL, 0);
+    r->x[0] = faces;
+    r->x[1] = mask;
+    r->x[6] = 1;
+}
+HLE_FAST_FUNC("nvnCommandBufferSetStencilMask", fast_nvnCommandBufferSetStencilMask);
+
+static void fast_nvnCommandBufferSetStencilValueMask(uint64_t cmd, uint64_t faces, uint64_t mask) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_SET_STENCIL, 0);
+    r->x[0] = faces;
+    r->x[1] = mask;
+    r->x[6] = 2;
+}
+HLE_FAST_FUNC("nvnCommandBufferSetStencilValueMask", fast_nvnCommandBufferSetStencilValueMask);
+
+static void fast_nvnCommandBufferDrawArrays(uint64_t cmd, uint64_t mode, uint64_t first, uint64_t count) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_DRAW_ARRAYS, 0);
+    r->x[0] = mode;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = 0;
+    r->x[4] = 1;
+}
+HLE_FAST_FUNC("nvnCommandBufferDrawArrays", fast_nvnCommandBufferDrawArrays);
+
+static void fast_nvnCommandBufferDrawArraysInstanced(uint64_t cmd, uint64_t mode, uint64_t first, uint64_t count,
+                                                     uint64_t base_inst, uint64_t inst_cnt) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_DRAW_ARRAYS, 0);
+    r->x[0] = mode;
+    r->x[1] = first;
+    r->x[2] = count;
+    r->x[3] = base_inst;
+    r->x[4] = inst_cnt;
+}
+HLE_FAST_FUNC("nvnCommandBufferDrawArraysInstanced", fast_nvnCommandBufferDrawArraysInstanced);
+
+static void fast_nvnCommandBufferDrawElements(uint64_t cmd, uint64_t mode, uint64_t type, uint64_t count, uint64_t ibuf) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_DRAW_ELEMENTS, 0);
+    r->x[0] = mode;
+    r->x[1] = type;
+    r->x[2] = count;
+    r->x[3] = ibuf;
+    r->x[4] = 0;
+    r->x[5] = 0;
+    r->x[6] = 1;
+}
+HLE_FAST_FUNC("nvnCommandBufferDrawElements", fast_nvnCommandBufferDrawElements);
+
+static void fast_nvnCommandBufferDrawElementsBaseVertex(uint64_t cmd, uint64_t mode, uint64_t type, uint64_t count,
+                                                        uint64_t ibuf, uint64_t base_vtx) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_DRAW_ELEMENTS, 0);
+    r->x[0] = mode;
+    r->x[1] = type;
+    r->x[2] = count;
+    r->x[3] = ibuf;
+    r->x[4] = base_vtx;
+    r->x[5] = 0;
+    r->x[6] = 1;
+}
+HLE_FAST_FUNC("nvnCommandBufferDrawElementsBaseVertex", fast_nvnCommandBufferDrawElementsBaseVertex);
+
+static void fast_nvnCommandBufferDrawElementsInstanced(uint64_t cmd, uint64_t mode, uint64_t type, uint64_t count,
+                                                       uint64_t ibuf, uint64_t base_vtx, uint64_t base_inst, uint64_t inst_cnt) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    CmdRec *r = rec_fast(cb, CMD_DRAW_ELEMENTS, 0);
+    r->x[0] = mode;
+    r->x[1] = type;
+    r->x[2] = count;
+    r->x[3] = ibuf;
+    r->x[4] = base_vtx;
+    r->x[5] = base_inst;
+    r->x[6] = inst_cnt;
+}
+HLE_FAST_FUNC("nvnCommandBufferDrawElementsInstanced", fast_nvnCommandBufferDrawElementsInstanced);
+
+static void fast_nvnCommandBufferUpdateUniformBuffer(uint64_t cmd, uint64_t buf, uint64_t sz, uint64_t off,
+                                                     uint64_t data_sz, uint64_t data) {
+    extern void vk_ubo_inline_mark(uint64_t addr, uint64_t size);
+    vk_ubo_inline_mark(buf + off, data_sz);
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    uint32_t len = (uint32_t)data_sz;
+    CmdRec *r = rec_fast(cb, CMD_UPDATE_UNIFORM_BUFFER, len);
+    r->x[0] = buf;
+    r->x[1] = sz;
+    r->x[2] = off;
+    r->x[3] = data_sz;
+    r->x[4] = data;
+    if (data >= 0x10000ull && len) memcpy(r->extra, (const void *)(uintptr_t)data, len);
+}
+HLE_FAST_FUNC("nvnCommandBufferUpdateUniformBuffer", fast_nvnCommandBufferUpdateUniformBuffer);
+
+static void fast_nvnCommandBufferBarrier(uint64_t cmd, uint64_t barrier) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    rec_fast(cb, CMD_BARRIER, 0)->x[0] = barrier;
+}
+HLE_FAST_FUNC("nvnCommandBufferBarrier", fast_nvnCommandBufferBarrier);
+
+static void fast_push_debug_group_desc(uint64_t cmd, uint64_t desc_addr) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    char name[64];
+    uint32_t len = 0;
+    if (desc_addr >= 0x10000ull) {
+        const char *src = (const char *)(uintptr_t)desc_addr;
+        while (len < sizeof(name) - 1 && src[len]) {
+            name[len] = src[len];
+            len++;
+        }
+    }
+    name[len] = 0;
+    CmdRec *r = rec_fast(cb, CMD_PUSH_DEBUG_GROUP, len + 1u);
+    r->x[0] = len;
+    memcpy(r->extra, name, len + 1u);
+}
+
+static void fast_nvnCommandBufferPushDebugGroup(uint64_t cmd, uint64_t desc) { fast_push_debug_group_desc(cmd, desc); }
+HLE_FAST_FUNC("nvnCommandBufferPushDebugGroup", fast_nvnCommandBufferPushDebugGroup);
+
+static void fast_nvnCommandBufferPushDebugGroupDomain(uint64_t cmd, uint64_t domain_id, uint64_t desc) {
+    (void)domain_id;
+    fast_push_debug_group_desc(cmd, desc);
+}
+HLE_FAST_FUNC("nvnCommandBufferPushDebugGroupStatic", fast_nvnCommandBufferPushDebugGroupDomain);
+HLE_FAST_FUNC("nvnCommandBufferPushDebugGroupDynamic", fast_nvnCommandBufferPushDebugGroupDomain);
+
+static void fast_nvnCommandBufferPopDebugGroup(uint64_t cmd) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    rec_fast(cb, CMD_POP_DEBUG_GROUP, 0);
+}
+HLE_FAST_FUNC("nvnCommandBufferPopDebugGroup", fast_nvnCommandBufferPopDebugGroup);
+
+static void fast_nvnCommandBufferPopDebugGroupId(uint64_t cmd, uint64_t domain_id) {
+    NvnCmdBuf *cb = cb_of(cmd);
+    if (!cb) return;
+    rec_fast(cb, CMD_POP_DEBUG_GROUP, 0)->x[0] = domain_id;
+}
+HLE_FAST_FUNC("nvnCommandBufferPopDebugGroupId", fast_nvnCommandBufferPopDebugGroupId);
+#endif
