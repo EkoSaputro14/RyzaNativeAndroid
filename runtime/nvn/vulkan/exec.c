@@ -175,8 +175,12 @@ uint64_t vk_submitted_seq(void) {
     return __atomic_load_n(&submit_seq, __ATOMIC_ACQUIRE);
 }
 
-static _Atomic uint64_t s_sem_val_ns, s_sem_val_calls;
-static _Atomic uint64_t s_sub_endp_ns, s_sub_slot_ns, s_sub_vc_ns, s_sub_endcb_ns, s_sub_qsub_ns, s_sub_retire_ns;
+static _Atomic uint64_t s_sem_val_ns, s_sem_val_r_ns, s_sem_val_calls;
+static _Atomic uint64_t s_sub_endp_ns, s_sub_slot_ns, s_sub_vc_ns, s_sub_endcb_ns, s_sub_qsub_ns, s_sub_qsub_p_ns, s_pres_khr_ns, s_sub_retire_ns;
+
+void vk_note_present_khr_ns(uint64_t ns) {
+    atomic_fetch_add_explicit(&s_pres_khr_ns, ns, memory_order_relaxed);
+}
 
 // Poll per-submission VkFence completion with vkGetFenceStatus (non-blocking) instead of Turnip's blocking vkGetSemaphoreCounterValue.
 uint64_t vk_completed_seq(void) {
@@ -207,7 +211,16 @@ uint64_t vk_completed_seq(void) {
         pthread_mutex_unlock(&fence_lock);
     }
     v = done_seq_advance(v);
-    atomic_fetch_add_explicit(&s_sem_val_ns, plat_now_ns() - st0, memory_order_relaxed);
+    uint64_t dt = plat_now_ns() - st0;
+#ifdef __ANDROID__
+    {
+        extern bool vk_async_is_render_thread(void);
+        if (vk_async_is_render_thread()) atomic_fetch_add_explicit(&s_sem_val_r_ns, dt, memory_order_relaxed);
+        else atomic_fetch_add_explicit(&s_sem_val_ns, dt, memory_order_relaxed);
+    }
+#else
+    atomic_fetch_add_explicit(&s_sem_val_ns, dt, memory_order_relaxed);
+#endif
     atomic_fetch_add_explicit(&s_sem_val_calls, 1, memory_order_relaxed);
     return v;
 }
@@ -221,6 +234,13 @@ void vk_take_submit_breakdown(uint64_t out[8]) {
     out[5] = atomic_exchange_explicit(&s_sub_retire_ns, 0, memory_order_relaxed);
     out[6] = atomic_exchange_explicit(&s_sem_val_ns, 0, memory_order_relaxed);
     out[7] = atomic_exchange_explicit(&s_sem_val_calls, 0, memory_order_relaxed);
+}
+
+void vk_take_submit_breakdown_v10(uint64_t out[11]) {
+    vk_take_submit_breakdown(out);
+    out[8] = atomic_exchange_explicit(&s_sub_qsub_p_ns, 0, memory_order_relaxed);
+    out[9] = atomic_exchange_explicit(&s_pres_khr_ns, 0, memory_order_relaxed);
+    out[10] = atomic_exchange_explicit(&s_sem_val_r_ns, 0, memory_order_relaxed);
 }
 
 // (LARECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
@@ -1095,12 +1115,35 @@ void vk_gpuprof_report(void) {
     static uint64_t t[GP_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
+        FILE *gf = NULL;
+#ifdef __ANDROID__
+        char gppath[1100];
+        extern const char *rt_data_root(void);
+        snprintf(gppath, sizeof gppath, "%s/gpuprof_last.txt", rt_data_root());
+        gf = fopen(gppath, "w");
+        if (gf) fprintf(gf, "[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
+#endif
+        bool quiet = gp_n > 128;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
         for (int i = 0; i + 1 < gp_n; i++) {
             double ms = (t[i + 1] - t[i]) * per;
-            LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
-            if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
+            if (gf) {
+                fprintf(gf, "[gpuprof] %6.3f ms %5.1f%%  %s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i]);
+                if (gp_draws[i]) fprintf(gf, ", %u draws", gp_draws[i]);
+                fputc('\n', gf);
+            }
+            if (!quiet || ms >= 0.25) {
+                LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
+                if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
+            }
         }
+#ifdef __ANDROID__
+        if (gf) {
+            fprintf(gf, "[gpuprof] (last mark: %s)\n", gp_label[gp_n - 1]);
+            fclose(gf);
+            LOG("[gpuprof] wrote %d marks to %s\n", gp_n, gppath);
+        }
+#endif
         LOG("[gpuprof] (last mark: %s)\n", gp_label[gp_n - 1]);
     }
     gp_n = 0;
@@ -1203,7 +1246,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     uint64_t sb6 = plat_now_ns();
     atomic_fetch_add_explicit(&s_sub_vc_ns, sb3 - sb2, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_sub_endcb_ns, sb4 - sb3, memory_order_relaxed);
-    atomic_fetch_add_explicit(&s_sub_qsub_ns, sb5 - sb4, memory_order_relaxed);
+    atomic_fetch_add_explicit((wait || signal) ? &s_sub_qsub_p_ns : &s_sub_qsub_ns, sb5 - sb4, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_sub_retire_ns, sb6 - sb5, memory_order_relaxed);
 }
 
@@ -8210,6 +8253,14 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_ADD(prof_draw);
     if (prof) cum_draw_prep += SDL_GetTicksNS() - prof_t0_;
 }
+static bool is_shadow_depth_rt(NvnTexture *t) {
+    if (!t || !renderer_format_is_depth(t->format)) return false;
+    if (vk_texture_scale_group(t) == RS_SHADOW) return true;
+    if (t->width < 512 || t->height < 256) return false;
+    float a = (float)t->width / (float)t->height;
+    return (a < 1.74f || a > 1.81f);  // exclude 16:9 RS_SCENE depth pre-passes
+}
+
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
@@ -8228,7 +8279,7 @@ static void draw_(CmdRec *r, bool indexed) {
         return;
     }
     // mhrise-recomp Executor::draw / shadow_pass: Skip depth-only shadow map draw calls when shadows are off
-    if (st.rt.ncolor == 0 && st.rt.depth && (g_settings.shadow_scale <= 0.05f || getenv("LARECOMP_NO_SHADOW") || getenv("LARECOMP_NO_SHADOWS"))) {
+    if (st.rt.ncolor == 0 && st.rt.depth && (g_settings.shadow_scale <= 0.05f || getenv("LARECOMP_NO_SHADOW") || getenv("LARECOMP_NO_SHADOWS")) && is_shadow_depth_rt(st.rt.depth)) {
         stat_skipped++;
         return;
     }

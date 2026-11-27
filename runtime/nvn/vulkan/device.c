@@ -1532,7 +1532,13 @@ void vk_frame_end(const char *shot_path) {
     if (want_timing) pi.pNext = &times;
     uint64_t queued = plat_now_ns();
 #endif
+    uint64_t pk0 = plat_now_ns();
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    {
+        extern void vk_note_present_khr_ns(uint64_t ns);
+        uint64_t pk1 = plat_now_ns();
+        vk_note_present_khr_ns(pk1 >= pk0 ? pk1 - pk0 : 0);
+    }
 #ifdef __ANDROID__
     if (want_timing && r >= 0) vsync_update(queued);
     if (trace_start) vk_timing_trace_wait(VK_TIMING_PRESENT, SDL_GetTicksNS() - trace_start);

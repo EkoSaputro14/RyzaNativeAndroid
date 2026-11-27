@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,8 +1216,8 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,8 +1387,8 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
@@ -1444,7 +1444,7 @@ def _verify_exp_mhrise_arch():
     workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
 
     # 0. Version & CI branch trigger
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
     assert "- 'exp/*'" in workflow
     assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
 
@@ -1722,8 +1722,8 @@ def _verify_exp_mhrise_arch_v6():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
 
     # 2. NvnDescPool shadow_tex + pool lock + canonical view copy + fast wrapper
     assert "void *shadow_tex;" in nvn_h and "pthread_mutex_t lock;" in nvn_h
@@ -1760,8 +1760,8 @@ def _verify_exp_mhrise_arch_v7():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
 
     # 2. Fast UBO hashing & 2-way gcopy + zero_drv + rs_cache
     assert "hash_words_fast(" in exec_c
@@ -1798,8 +1798,8 @@ def _verify_exp_mhrise_arch_v8():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
 
     # 2. Skip idle vk_completed_seq() polls
     assert "if (!any_ovf) return;" in exec_c
@@ -1830,8 +1830,8 @@ def _verify_exp_mhrise_arch_v9():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
 
     # 2. Per-Sub VkFence vkGetFenceStatus polling & monotonic done_seq_cache
     for sym in ["VkFence done_fence;", "vkGetFenceStatus(", "done_seq_advance(", "cq_resolved_seq", "sub_reclaim_fence("]:
@@ -1852,3 +1852,38 @@ def _verify_exp_mhrise_arch_v9():
 
 
 _verify_exp_mhrise_arch_v9()
+
+
+def _verify_exp_mhrise_arch_v10():
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch v10 (full Turnip UBWC on color RTs, shadow_scale=0.00 depth pre-pass guard, gpuprof_last.txt lossless dump, [sub-diag] scene/present/render/guest split)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    textures_c = (repo_root / "runtime" / "nvn" / "vulkan" / "textures.c").read_text(encoding="utf-8")
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    async_c = (repo_root / "runtime" / "nvn" / "vulkan" / "async.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    # 1. Version bump
+    assert "versionCode = 63" in gradle_kts and "0.3.2-exp-mhrise-10" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-10")' in cmake_txt
+
+    # 2. Full Turnip UBWC on color RTs (including flags==0 scene targets)
+    assert "vk_driver_is_turnip()" in textures_c
+    assert "color_rt_ubwc" in textures_c and "!is_bc(vf)" in textures_c
+
+    # 3. shadow_scale=0.00 guard excluding 16:9 RS_SCENE depth pre-passes
+    assert "is_shadow_depth_rt(" in exec_c
+
+    # 4. Lossless gpuprof_last.txt + [sub-diag] v10 attribution
+    assert "gpuprof_last.txt" in exec_c
+    assert "vk_note_present_khr_ns" in exec_c and "vk_note_present_khr_ns" in device_c
+    assert "vk_take_submit_breakdown_v10" in exec_c and "vk_take_submit_breakdown_v10" in async_c
+    for tag in ["qsub_s=", "qsub_p=", "pkhr=", "sem_r=", "sem_g="]:
+        assert tag in async_c, f"Missing {tag} in async.c"
+
+    print("  -> PASS: exp/mhrise-arch v10 (Turnip UBWC, shadow_scale pre-pass fix, gpuprof_last.txt, [sub-diag] split) verified.")
+
+
+_verify_exp_mhrise_arch_v10()

@@ -360,12 +360,12 @@ static void *render_main(void *arg) {
                 if (!last_log_ns || now_ns - last_log_ns >= 5000000000ull) {
                     last_log_ns = now_ns;
                     extern uint64_t g_tex_stat_reg, g_tex_stat_reg_dedup;
-                    extern void vk_take_submit_breakdown(uint64_t out[8]);
+                    extern void vk_take_submit_breakdown_v10(uint64_t out[11]);
                     uint64_t tot = __atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED);
                     uint64_t dedup = __atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED);
                     double pct = tot ? (100.0 * (double)dedup / (double)tot) : 0.0;
-                    uint64_t sb[8] = {0};
-                    vk_take_submit_breakdown(sb);
+                    uint64_t sb[11] = {0};
+                    vk_take_submit_breakdown_v10(sb);
                     double fdiv = sub_diag_frames ? (double)sub_diag_frames : 1.0;
                     sub_diag_frames = 0;
                     LOG("[tex-reg] total=%llu dedup=%llu (%.1f%%) frame_cpu=%.1fms exec_req=%.1fms(submit=%.1fms) pres_req=%.1fms(pre=%.1fms ring=%.1fms post=%.1fms) other_req=%.1fms\n",
@@ -373,9 +373,10 @@ static void *render_main(void *arg) {
                         frame_cpu / 1e6, exec_ns / 1e6, sub_ns / 1e6,
                         pres_ns / 1e6, prep_ns / 1e6, ring_ns / 1e6, post_ns / 1e6,
                         other_ns / 1e6);
-                    LOG("[sub-diag] per_frame(n=%.0f): endp=%.1fms slot=%.1fms vc=%.1fms endcb=%.1fms qsub=%.1fms retire=%.1fms sem_val=%.1fms(%.1f calls)\n",
+                    LOG("[sub-diag] per_frame(n=%.0f): endp=%.1fms slot=%.1fms vc=%.1fms endcb=%.1fms qsub_s=%.1fms qsub_p=%.1fms pkhr=%.1fms retire=%.1fms sem_r=%.1fms sem_g=%.1fms(%.1f calls)\n",
                         fdiv, sb[0] / 1e6 / fdiv, sb[1] / 1e6 / fdiv, sb[2] / 1e6 / fdiv,
-                        sb[3] / 1e6 / fdiv, sb[4] / 1e6 / fdiv, sb[5] / 1e6 / fdiv,
+                        sb[3] / 1e6 / fdiv, sb[4] / 1e6 / fdiv, sb[8] / 1e6 / fdiv,
+                        sb[9] / 1e6 / fdiv, sb[5] / 1e6 / fdiv, sb[10] / 1e6 / fdiv,
                         sb[6] / 1e6 / fdiv, sb[7] / fdiv);
                 }
             }

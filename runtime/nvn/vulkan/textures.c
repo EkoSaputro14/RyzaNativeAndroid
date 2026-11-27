@@ -514,7 +514,11 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     static int rt_list = -1;
     if (rt_list < 0) {
         const char *e = getenv("LARECOMP_VK_RT_FORMAT_LIST");
-        rt_list = e ? atoi(e) != 0 : getenv("LARECOMP_VK_NO_MUTABLE") != NULL || g_vk.props.vendorID == 0x13B5;
+        bool is_turnip_init = false;
+#ifdef __ANDROID__
+        is_turnip_init = vk_driver_is_turnip();
+#endif
+        rt_list = e ? atoi(e) != 0 : (getenv("LARECOMP_VK_NO_MUTABLE") != NULL || g_vk.props.vendorID == 0x13B5 || is_turnip_init);
         if (rt_list) LOG("[vk] render targets without mutable formats (their sRGB twin in a format list)\n");
     }
     VkFormat twin = vf == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : vf == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
@@ -524,7 +528,12 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat listed[2] = {vf, twin};
     VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = 2,
                                       .pViewFormats = listed};
-    bool fixed = rt_list && !depthfmt && (t->flags & 8) && (!twin || g_vk.api >= VK_API_VERSION_1_2);
+    bool is_turnip = false;
+#ifdef __ANDROID__
+    is_turnip = vk_driver_is_turnip();
+#endif
+    bool color_rt_ubwc = (t->flags & 8) || (is_turnip && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !is_bc(vf));
+    bool fixed = rt_list && !depthfmt && color_rt_ubwc && (!twin || g_vk.api >= VK_API_VERSION_1_2);
     b->fixed_fmt = fixed;
     b->view_alt = fixed ? twin : VK_FORMAT_UNDEFINED;
     if (!depthfmt && (!fixed || twin))
