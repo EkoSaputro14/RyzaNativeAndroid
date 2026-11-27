@@ -76,6 +76,8 @@ static struct {
     uint64_t backoff_until;
     double ema_ms;
     int warm_count;
+    int obs_frames;
+    bool paused_for_load;
     int overload_streak;
     int smooth_streak;
     int backoff_level;
@@ -476,6 +478,8 @@ static void fg_hard_reset(void) {
     g_fg.backoff_until = 0;
     g_fg.ema_ms = 33.333;
     g_fg.warm_count = 0;
+    g_fg.obs_frames = 0;
+    g_fg.paused_for_load = false;
     g_fg.overload_streak = 0;
     g_fg.smooth_streak = 0;
     g_fg.backoff_level = 0;
@@ -488,6 +492,7 @@ void vk_framegen_reset(void) {
     g_fg.seq_n = 0;
     g_fg.last_ns = 0;
     g_fg.warm_count = 0;
+    g_fg.obs_frames = 0;
     g_fg.overload_streak = 0;
     g_fg.smooth_streak = 0;
     atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
@@ -534,11 +539,15 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
     }
 
     uint64_t now = plat_now_ns();
-    double dt_ms = (g_fg.last_ns > 0 && now > g_fg.last_ns) ? (double)(now - g_fg.last_ns) / 1e6 : 33.333;
+    bool have_prev = (g_fg.last_ns > 0 && now > g_fg.last_ns);
+    double dt_ms = have_prev ? (double)(now - g_fg.last_ns) / 1e6 : 33.333;
     g_fg.last_ns = now;
-    if (g_fg.ema_ms <= 0.0) g_fg.ema_ms = 33.333;
-    if (dt_ms > 1.0 && dt_ms < 250.0) {
-        g_fg.ema_ms = g_fg.ema_ms * 0.85 + dt_ms * 0.15;
+    if (have_prev && dt_ms > 1.0 && dt_ms < 250.0) {
+        if (g_fg.obs_frames == 0 || g_fg.ema_ms <= 0.0) g_fg.ema_ms = dt_ms;
+        else g_fg.ema_ms = g_fg.ema_ms * 0.85 + dt_ms * 0.15;
+        if (g_fg.obs_frames < 1000) g_fg.obs_frames++;
+    } else if (g_fg.ema_ms <= 0.0) {
+        g_fg.ema_ms = 33.333;
     }
 
     // 1. Exponential overload auto-backoff (5s -> 15s -> 30s -> 60s): skip ALL optical-flow GPU work during cooldown
@@ -553,18 +562,17 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
             return VK_NULL_HANDLE;
         }
         g_fg.backoff_until = 0;
-        g_fg.ema_ms = 33.333;
         g_fg.warm_count = 0;
         g_fg.overload_streak = 0;
         atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
-        LOG("[framegen] overload backoff ended -> resuming warmup\n");
+        g_fg.paused_for_load = (g_fg.ema_ms > 35.0);
+        if (!g_fg.paused_for_load) LOG("[framegen] overload backoff ended -> resuming warmup\n");
     }
 
     // 2. Hitch hold (mhrise-recomp framegen.cpp kHitchMs=100ms -> 1s pause, zero compute cost during loads/transitions)
     if (g_fg.seq_n > 0 && dt_ms > FG_HITCH_MS) {
         g_fg.hold_until = now + 1000000000ull;
         g_fg.warm_count = 0;
-        g_fg.overload_streak = 0;
     }
     if (g_fg.hold_until > 0) {
         if (now < g_fg.hold_until) {
@@ -574,6 +582,35 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
         }
         g_fg.hold_until = 0;
         g_fg.warm_count = 0;
+    }
+
+    // Pre-warmup overload gate with hysteresis: avoid running luma/down/blit GPU passes while overloaded.
+    if (g_fg.paused_for_load) {
+        if (g_fg.ema_ms <= 35.0 && g_fg.obs_frames >= 3) {
+            if (++g_fg.smooth_streak >= 15) {
+                g_fg.paused_for_load = false;
+                g_fg.smooth_streak = 0;
+                g_fg.warm_count = 0;
+                LOG("[framegen] GPU headroom recovered (ema %.1f ms) -> resuming warmup\n", g_fg.ema_ms);
+            }
+        } else {
+            g_fg.smooth_streak = 0;
+        }
+        if (g_fg.paused_for_load) {
+            atomic_store_explicit(&g_fg.status, FG_STATUS_PAUSED_LOAD, memory_order_relaxed);
+            atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+            atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
+            g_fg.warm_count = 0;
+            return VK_NULL_HANDLE;
+        }
+    } else if (g_fg.warm_count < FG_WARM_FRAMES && g_fg.obs_frames >= 3 && g_fg.ema_ms > FG_OVERLOAD_EMA_MS) {
+        g_fg.paused_for_load = true;
+        g_fg.smooth_streak = 0;
+        g_fg.warm_count = 0;
+        atomic_store_explicit(&g_fg.status, FG_STATUS_PAUSED_LOAD, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.is_active, false, memory_order_relaxed);
+        atomic_store_explicit(&g_fg.backoff_rem_sec, 0u, memory_order_relaxed);
+        return VK_NULL_HANDLE;
     }
 
     // 3. Overload detector while FG is active: if real frame EMA stays > 38.0 ms (<26.3 FPS) for 15 frames, back off!

@@ -638,7 +638,13 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
         for (int comp = 0; comp < 4; comp++) if (mask & (1u << comp)) comps[n++] = comp;
         char v[4][16];
         for (int i = 0; i < 4; i++) { if (i < n) sprintf(v[i], "t[%d]", comps[i]); else strcpy(v[i], "0.0f"); }
-        const char *pk = c->glsl ? "      r%d = packHalf2x16(vec2(%s, %s));\n" : "      r%d = as_type<uint>(half2(half(%s), half(%s)));\n";
+        const char *pk;
+        if (use_fp16_half(c)) {
+            c->uses_fp16_half = true;
+            pk = "      r%d = packFloat2x16(f16vec2(%s, %s));\n";
+        } else {
+            pk = c->glsl ? "      r%d = packHalf2x16(vec2(%s, %s));\n" : "      r%d = as_type<uint>(half2(half(%s), half(%s)));\n";
+        }
         if (d0 != RZ) { c->reg_used[d0] = 1; sp(&c->body, pk, d0, v[0], v[1]); }
         if (d1 != RZ) { c->reg_used[d1] = 1; sp(&c->body, pk, d1, v[2], v[3]); }
         sp(&c->body, "    }\n");
@@ -1583,7 +1589,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5cb0000000000000ull, 0xfff8000000000000ull) || OPM(0x4cb0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x38b0000000000000ull, 0xfef8000000000000ull)) {  // F2I (src fmt bits 10-11: 1 F16; dst size bits 8-9)
         char srcv[512];
-        if (bits(w, 10, 2) == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
+        if (bits(w, 10, 2) == 1 && use_fp16_half(c)) {
+            c->uses_fp16_half = true;
+            sprintf(srcv, "float(unpackFloat2x16(%s).%c)", B(false), bits(w, 41, 1) ? 'y' : 'x');
+        } else if (bits(w, 10, 2) == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
         else if (bits(w, 10, 2) == 1) sprintf(srcv, "float(as_type<half2>(%s)[%d])", B(false), (int)bits(w, 41, 1));
         else strcpy(srcv, F(B(true)));
         const char *x = NA(srcv, bits(w, 45, 1), bits(w, 49, 1));
@@ -1612,7 +1621,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(u, "float(%s)", src);
         if (bits(w, 8, 2) == 1) {  // F16 result in the low half
             char h[700];
-            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
+            if (use_fp16_half(c)) c->uses_fp16_half = true;
+            snprintf(h, sizeof h, use_fp16_half(c) ? "(packFloat2x16(f16vec2(%s, 0.0f)))" : c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
                      NA(u, bits(w, 45, 1), bits(w, 49, 1)));
             set_reg(c, d, h);
         } else {
@@ -1622,7 +1632,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                OPM(0x38a8000000000000ull, 0xfef8000000000000ull)) {  // F2F (formats: 1 F16, 2 F32; bit 41 = high half)
         int dfmt = (int)bits(w, 8, 2), sfmt = (int)bits(w, 10, 2);
         char srcv[512];
-        if (sfmt == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
+        if (sfmt == 1 && use_fp16_half(c)) {
+            c->uses_fp16_half = true;
+            sprintf(srcv, "float(unpackFloat2x16(%s).%c)", B(false), bits(w, 41, 1) ? 'y' : 'x');
+        } else if (sfmt == 1 && c->glsl) sprintf(srcv, "h2f((%s >> %du) & 0xFFFFu)", B(false), 16 * (int)bits(w, 41, 1));
         else if (sfmt == 1) sprintf(srcv, "float(as_type<half2>(%s)[%d])", B(false), (int)bits(w, 41, 1));
         else strcpy(srcv, F(B(true)));
         const char *x = NA(srcv, bits(w, 45, 1), bits(w, 49, 1));
@@ -1636,7 +1649,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
         if (dfmt == 1) {  // F16 result in the low half, high half zero
             char h[1100];
-            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
+            if (use_fp16_half(c)) c->uses_fp16_half = true;
+            snprintf(h, sizeof h, use_fp16_half(c) ? "(packFloat2x16(f16vec2(%s, 0.0f)))" : c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
                      bits(w, 50, 1) ? (sprintf(u, "saturate(%s)", t), u) : t);
             set_reg(c, d, h);
         } else {
@@ -1658,16 +1672,21 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x1c00000000000000ull, 0xfe00000000000000ull)) {  // IADD32I (CC bit 52, X bit 53)
         bool wcc = bits(w, 52, 1), x = bits(w, 53, 1);
         if (wcc || x) c->uses_cc = true;
-        if (c->glsl && maxwell_no_int64) {
-            sp(&c->body, "    { uint ca, cb; uint sum = uaddCarry(%s%s, 0x%08xu, ca); sum = uaddCarry(sum, %s, cb);\n",
-                bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32), x ? "cc" : "0u");
-            if (wcc) sp(&c->body, "      cc = (ca + cb) & 1u;\n");
+        if (!wcc && !x) {
+            sprintf(t, "(%s%s + 0x%08xu)", bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32));
+            set_reg(c, d, t);
         } else {
-            sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(0x%08xu)%s;%s\n", bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32),
-               x ? " + ulong(cc)" : "", wcc ? " cc = uint(sum >> 32) & 1u;" : "");
+            if (c->glsl && maxwell_no_int64) {
+                sp(&c->body, "    { uint ca, cb; uint sum = uaddCarry(%s%s, 0x%08xu, ca); sum = uaddCarry(sum, %s, cb);\n",
+                    bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32), x ? "cc" : "0u");
+                if (wcc) sp(&c->body, "      cc = (ca + cb) & 1u;\n");
+            } else {
+                sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(0x%08xu)%s;%s\n", bits(w, 56, 1) ? "-" : "", R(a), (uint32_t)bits(w, 20, 32),
+                   x ? " + ulong(cc)" : "", wcc ? " cc = uint(sum >> 32) & 1u;" : "");
+            }
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(sum);\n", d); }
+            sp(&c->body, "    }\n");
         }
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(sum);\n", d); }
-        sp(&c->body, "    }\n");
     } else if (OPM(0x5cc0000000000000ull, 0xfff0000000000000ull) || OPM(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
                OPM(0x38c0000000000000ull, 0xfef0000000000000ull)) {  // IADD3
         bool wcc3 = bits(w, 47, 1), x3 = bits(w, 48, 1);
@@ -3053,8 +3072,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "#define fmin min\n#define fmax max\n#define saturate(x) clamp((x), 0.0f, 1.0f)\n");
     }
     if (c->uses_fp16_half) {
-        sp(&s, "uint hpack_lo16(f16vec2 r, uint old) { return (old & 0xFFFF0000u) | (packFloat2x16(f16vec2(r.x, float16_t(0.0))) & 0xFFFFu); }\n"
-               "uint hpack_hi16(f16vec2 r, uint old) { return (old & 0xFFFFu) | (packFloat2x16(f16vec2(float16_t(0.0), r.y)) & 0xFFFF0000u); }\n");
+        sp(&s, "uint hpack_lo16(f16vec2 r, uint old) { return packFloat2x16(f16vec2(r.x, unpackFloat2x16(old).y)); }\n"
+               "uint hpack_hi16(f16vec2 r, uint old) { return packFloat2x16(f16vec2(unpackFloat2x16(old).x, r.y)); }\n");
         if (maxwell_fast_minmax)
             sp(&s, "f16vec2 hsat16(f16vec2 x) { return clamp(x, float16_t(0.0), float16_t(1.0)); }\n");
         else
