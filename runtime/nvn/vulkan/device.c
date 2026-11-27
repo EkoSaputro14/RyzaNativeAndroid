@@ -1680,7 +1680,7 @@ void backend_present(NvnTexture *t) {
     VkImageView fg_view = VK_NULL_HANDLE;
 #ifdef __ANDROID__
     if (g_settings.frame_gen > 0) {
-        fg_view = vk_framegen_prepare(vk_cmd(), b);
+        fg_view = vk_framegen_prepare(VK_NULL_HANDLE, b);
     } else {
         vk_framegen_reset();
     }

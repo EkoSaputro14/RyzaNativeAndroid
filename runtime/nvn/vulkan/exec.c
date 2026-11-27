@@ -111,6 +111,7 @@ void vk_collect_dead(void);
 #else
 #define SUBS 8
 #endif
+enum { FENCE_IDLE = 0, FENCE_SUBMITTED = 1, FENCE_SIGNALED = 2 };
 typedef struct {
     VkCommandBuffer main, upload;
     VkCommandPool cpool;  // (their own pool, reset whole when the slot is reused - begin_cb)
@@ -118,6 +119,9 @@ typedef struct {
     bool barrier_clean;                 // mhrise-arch tight_barriers: no GPU work recorded on main since last barrier
     uint8_t dirty_mask;                 // mhrise-arch v3: bit 0 = gfx render pass writes, bit 1 = compute/transfer writes
     uint64_t seq;
+    VkFence done_fence;
+    uint64_t fence_seq;
+    uint8_t fence_state;
     VkDescriptorPool pools[16];
     int npools, cur_pool;
 } Sub;
@@ -146,6 +150,26 @@ static int nlclear;
 static int naliases;
 
 static _Atomic uint64_t done_seq_cache;
+static _Atomic uint64_t cq_resolved_seq;
+static pthread_mutex_t fence_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t fence_done_seq;
+
+static inline uint64_t done_seq_advance(uint64_t v) {
+    uint64_t cur = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+    while (v > cur) {
+        if (atomic_compare_exchange_weak_explicit(&done_seq_cache, &cur, v, memory_order_release, memory_order_acquire))
+            return v;
+    }
+    return cur;
+}
+
+static inline void cq_resolved_advance(uint64_t v) {
+    uint64_t cur = atomic_load_explicit(&cq_resolved_seq, memory_order_acquire);
+    while (v > cur) {
+        if (atomic_compare_exchange_weak_explicit(&cq_resolved_seq, &cur, v, memory_order_release, memory_order_acquire))
+            return;
+    }
+}
 
 uint64_t vk_submitted_seq(void) {
     return __atomic_load_n(&submit_seq, __ATOMIC_ACQUIRE);
@@ -154,11 +178,35 @@ uint64_t vk_submitted_seq(void) {
 static _Atomic uint64_t s_sem_val_ns, s_sem_val_calls;
 static _Atomic uint64_t s_sub_endp_ns, s_sub_slot_ns, s_sub_vc_ns, s_sub_endcb_ns, s_sub_qsub_ns, s_sub_retire_ns;
 
+// Poll per-submission VkFence completion with vkGetFenceStatus (non-blocking) instead of Turnip's blocking vkGetSemaphoreCounterValue.
 uint64_t vk_completed_seq(void) {
     if (!g_vk.timeline) return 0;
-    uint64_t v = 0;
     uint64_t st0 = plat_now_ns();
-    vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    uint64_t v = 0;
+    if (g_vk.dev) {
+        pthread_mutex_lock(&fence_lock);
+        for (;;) {
+            int best = -1;
+            uint64_t min_seq = UINT64_MAX;
+            for (int i = 0; i < SUBS; i++) {
+                if (subs[i].fence_state == FENCE_SUBMITTED && subs[i].fence_seq < min_seq) {
+                    min_seq = subs[i].fence_seq;
+                    best = i;
+                }
+            }
+            if (best < 0) break;
+            VkResult fr = vkGetFenceStatus(g_vk.dev, subs[best].done_fence);
+            if (fr == VK_SUCCESS) {
+                subs[best].fence_state = FENCE_SIGNALED;
+                if (min_seq > fence_done_seq) fence_done_seq = min_seq;
+            } else {
+                break;
+            }
+        }
+        v = fence_done_seq;
+        pthread_mutex_unlock(&fence_lock);
+    }
+    v = done_seq_advance(v);
     atomic_fetch_add_explicit(&s_sem_val_ns, plat_now_ns() - st0, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_sem_val_calls, 1, memory_order_relaxed);
     return v;
@@ -209,6 +257,12 @@ void vk_wait_seq(uint64_t seq) {
     uint64_t cached = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
     if (seq <= cached) {
         wait_why = NULL;
+        if (seq > atomic_load_explicit(&cq_resolved_seq, memory_order_acquire)) {
+            cq_resolve_done(cached);
+#ifdef __ANDROID__
+            gcopy_retire(cached);
+#endif
+        }
         return;
     }
     uint64_t cur = vk_completed_seq();
@@ -236,8 +290,7 @@ void vk_wait_seq(uint64_t seq) {
 #endif
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
     else if (r == VK_SUCCESS) {
-        uint64_t prev = atomic_load_explicit(&done_seq_cache, memory_order_relaxed);
-        if (seq > prev) atomic_store_explicit(&done_seq_cache, seq, memory_order_release);
+        done_seq_advance(seq);
         cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
         gcopy_retire(seq);
@@ -371,8 +424,8 @@ double vk_frame_gpu_ms(void) {
 
 void vk_pace_frame(void) {
     {   // (write-backs of passes the GPU has finished since: the game may read them this frame)
-        uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v) == VK_SUCCESS) wb_apply(v);
+        uint64_t v = vk_completed_seq();
+        if (v) wb_apply(v);
     }
     if (pace_on < 0) { const char *e = getenv("LARECOMP_PACE"); pace_on = !e || atoi(e) != 0; }
     static uint64_t last, last_wait;
@@ -730,6 +783,19 @@ static void cq_resolve_done(uint64_t done) {  // every slot whose submission is 
     for (int i = 0; i < SUBS; i++) if (cq[i].n && cq[i].seq <= done) cq_resolve(i);
 #endif
     pthread_mutex_unlock(&cq_lock);
+    cq_resolved_advance(done);
+}
+
+static void sub_reclaim_fence(Sub *s) {
+    if (!s->done_fence) return;
+    bool need_wait = false;
+    pthread_mutex_lock(&fence_lock);
+    if (s->fence_state == FENCE_SUBMITTED) need_wait = true;
+    if (s->fence_seq > fence_done_seq) fence_done_seq = s->fence_seq;
+    s->fence_state = FENCE_IDLE;
+    pthread_mutex_unlock(&fence_lock);
+    if (need_wait) vkWaitForFences(g_vk.dev, 1, &s->done_fence, VK_TRUE, 10ull * 1000000000ull);
+    VK_CHECK(vkResetFences(g_vk.dev, 1, &s->done_fence));
 }
 
 static Sub *sub(void) {
@@ -738,6 +804,7 @@ static Sub *sub(void) {
         wait_why = "ring slot";
         vk_wait_seq(s->seq);
         cq_resolve_done(s->seq);
+        sub_reclaim_fence(s);
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
             if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -1091,8 +1158,14 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
+        if (!s->done_fence) {
+            VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            VK_CHECK(vkCreateFence(g_vk.dev, &fci, NULL, &s->done_fence));
+        } else if (s->fence_state != FENCE_IDLE) {
+            sub_reclaim_fence(s);
+        }
         uint64_t sub_t0 = plat_now_ns();
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, s->done_fence);
         uint64_t sub_dt = plat_now_ns() - sub_t0;
         cum_submit_ns += sub_dt;
 #ifdef __ANDROID__
@@ -1104,6 +1177,10 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         if (prof) prof_submit += sub_dt;
     }
     uint64_t sb5 = plat_now_ns();
+    pthread_mutex_lock(&fence_lock);
+    s->fence_seq = submit_seq + 1;
+    s->fence_state = FENCE_SUBMITTED;
+    pthread_mutex_unlock(&fence_lock);
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
 #ifdef __ANDROID__
@@ -1306,12 +1383,17 @@ void vk_ring_begin_frame(uint64_t frame_index) {
     int next_slot = (int)(frame_index % RING_SLOTS);
     uint64_t sseq = g_ring.seq[next_slot];
     if (sseq) {
-        if (sseq > vk_completed_seq()) {
-            wait_why = "ring slot";
-            vk_wait_seq(sseq);
+        uint64_t done = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+        if (sseq > done) {
+            done = vk_completed_seq();
+            if (sseq > done) {
+                wait_why = "ring slot";
+                vk_wait_seq(sseq);
+                done = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+            }
         }
 #ifdef __ANDROID__
-        gcopy_retire(vk_completed_seq());
+        gcopy_retire(done);
 #endif
     }
     ring_free_slot_ovf(next_slot);
@@ -2787,11 +2869,6 @@ static void begin_pass(void) {
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
                 (void *)st.rt.depth);
     }
-    if (g_gpuprof_frame) {
-        NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-        gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
-                t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
-    }
     {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
         // targets the scaling rule takes and ones it does not; the unscaled ones got only part of the pass)
         extern void vk_promote_scene_rt(NvnTexture *t);
@@ -2907,6 +2984,24 @@ static void begin_pass(void) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
+    if (g_gpuprof_frame) {
+        NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+        if (t0) {
+            TexBackend *b0 = t0->backend;
+            gp_mark(cb, "pass: %d color %ux%u (vk %ux%u g%u) fmt %#x, depth %s",
+                    st.rt.ncolor, t0->width, t0->height,
+                    pass_w, pass_h, b0 ? (unsigned)b0->rs_group : 0u,
+                    t0->format, st.rt.depth ? "yes" : "no");
+        } else if (st.rt.depth) {
+            TexBackend *bd = st.rt.depth->backend;
+            gp_mark(cb, "pass: 0 color, depth %ux%u (vk %ux%u g%u) fmt %#x",
+                    st.rt.depth->width, st.rt.depth->height,
+                    pass_w, pass_h, bd ? (unsigned)bd->rs_group : 0u,
+                    st.rt.depth->format);
+        } else {
+            gp_mark(cb, "pass: 0 color, depth no");
+        }
+    }
     if (pass_ncolor != prev_ncolor || pass_samples != prev_samples || pass_depth != prev_depth ||
         pass_stencil != prev_stencil || memcmp(pass_color, prev_color, sizeof pass_color) != 0) {
         pipeline_dirty = true;

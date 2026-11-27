@@ -369,7 +369,7 @@ def _verify_p11_crash_root_cause_fixes():
     assert "uint64_t rt_host_fn_entry(uint64_t pc, uint64_t *offset)" in dispatch_c
     assert "const char *s = rt_host_fn_name(pc, &off);" in android_c
     assert "bool ours = di.dli_fbase && di.dli_fbase == self.dli_fbase;" not in android_c
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
     print("  -> PASS: p11 UnitHeap guest-window preservation, Movie full Cpu state + NV12/guest pointers, and Crash/Backtrace diagnostics verified.")
 
 _verify_p11_crash_root_cause_fixes()
@@ -390,7 +390,7 @@ def _verify_p13_safe_patch():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version sync (p13 / vc 45)
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
 
     # 2. Symbol lookup & HLE slot attribution
     assert "s->size > 0" in loader_c and "0x4000ull" in loader_c, "loader_symbol_at must bound matches by ELF symbol size"
@@ -1107,7 +1107,7 @@ def _verify_p16_thermal_affinity_memfd_ahb_dedup():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
 
     # 2. Thermal-aware CPU topology & dynamic Gold/Prime steering (avoid pinned throttling on SD855 1036 MHz Prime)
     assert "void plat_refresh_fast_affinity(void);" in platform_h
@@ -1157,7 +1157,7 @@ def _verify_p17_sigbus_pacer_thermal_batch_postfx():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
 
     # Settings & UI wiring
     assert "int target_fps;" in settings_h and "int skip_postfx;" in settings_h
@@ -1216,8 +1216,8 @@ def _verify_p19_mhrise_affinity_and_no_shadows():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-8")' in cmake_txt
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. MHRise os.cpp rule: < 3 big cores unpinning
@@ -1264,7 +1264,7 @@ def _verify_p20_gpu_unswizzle_driverid_spirv_hardening():
     gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
 
     # 1. Priority #1: GPU compute texture unswizzle (deswizzle.comp + textures.c + settings + UI)
     assert "int gpu_unswizzle;" in settings_h
@@ -1387,8 +1387,8 @@ def _verify_p21_blackscreen_and_unswizzle_fix():
     forensics_c = (repo_root / "runtime" / "nvn" / "vulkan" / "ryza_forensics.c").read_text(encoding="utf-8")
 
     # 0. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-8")' in cmake_txt
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
     assert '#define RYZA_VERSION_NAME "0.3.2-exp-mhrise-2"' in forensics_c
 
     # 1. Non-blocking vk_async_kick_flush() in async.c & used in nvnSyncWait(timeout_ns == 0)
@@ -1444,7 +1444,7 @@ def _verify_exp_mhrise_arch():
     workflow = (repo_root / ".github" / "workflows" / "android-release.yml").read_text(encoding="utf-8")
 
     # 0. Version & CI branch trigger
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
     assert "- 'exp/*'" in workflow
     assert "target_compile_options(main PRIVATE -O3 -fno-strict-aliasing" in cmake_txt
 
@@ -1476,7 +1476,7 @@ def _verify_exp_mhrise_arch():
     for sh in ["fg_luma.comp", "fg_down.comp", "fg_patch.comp", "fg_densify.comp", "fg_warp.comp"]:
         assert f'"{sh}"' in shaders_c, f"Missing embedded shader {sh}"
     assert "VkImageView vk_framegen_prepare(" in fg_h and "VkImageView vk_framegen_prepare(" in fg_c
-    assert "vk_framegen_prepare(vk_cmd(), b)" in device_c
+    assert "vk_framegen_prepare(VK_NULL_HANDLE, b)" in device_c
     assert "vk_present_draw_view(fg_cb, fg_view" in device_c
 
     # 5. Pillar 4: Native AThermal_getThermalHeadroom + UI controls + extern "C" linkage
@@ -1722,8 +1722,8 @@ def _verify_exp_mhrise_arch_v6():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-8")' in cmake_txt
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
 
     # 2. NvnDescPool shadow_tex + pool lock + canonical view copy + fast wrapper
     assert "void *shadow_tex;" in nvn_h and "pthread_mutex_t lock;" in nvn_h
@@ -1760,8 +1760,8 @@ def _verify_exp_mhrise_arch_v7():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-8")' in cmake_txt
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
 
     # 2. Fast UBO hashing & 2-way gcopy + zero_drv + rs_cache
     assert "hash_words_fast(" in exec_c
@@ -1798,8 +1798,8 @@ def _verify_exp_mhrise_arch_v8():
     cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
 
     # 1. Version bump
-    assert "versionCode = 61" in gradle_kts and "0.3.2-exp-mhrise-8" in gradle_kts
-    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-8")' in cmake_txt
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
 
     # 2. Skip idle vk_completed_seq() polls
     assert "if (!any_ovf) return;" in exec_c
@@ -1817,3 +1817,38 @@ def _verify_exp_mhrise_arch_v8():
 
 
 _verify_exp_mhrise_arch_v8()
+
+
+def _verify_exp_mhrise_arch_v9():
+    from pathlib import Path
+    print("[Test] Verifying exp/mhrise-arch v9 (per-Sub VkFence vkGetFenceStatus polling, monotonic done_seq_cache, lazy vk_cmd in framegen, [gpuprof] actual scaled dims)...")
+    repo_root = Path(__file__).resolve().parents[2]
+    exec_c = (repo_root / "runtime" / "nvn" / "vulkan" / "exec.c").read_text(encoding="utf-8")
+    device_c = (repo_root / "runtime" / "nvn" / "vulkan" / "device.c").read_text(encoding="utf-8")
+    fg_c = (repo_root / "runtime" / "nvn" / "vulkan" / "framegen.c").read_text(encoding="utf-8")
+    gradle_kts = (repo_root / "android" / "botwrecompandroid" / "app" / "build.gradle.kts").read_text(encoding="utf-8")
+    cmake_txt = (repo_root / "android" / "botwrecompandroid" / "app" / "src" / "main" / "cpp" / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    # 1. Version bump
+    assert "versionCode = 62" in gradle_kts and "0.3.2-exp-mhrise-9" in gradle_kts
+    assert 'set(RYZA_VERSION_NAME "0.3.2-exp-mhrise-9")' in cmake_txt
+
+    # 2. Per-Sub VkFence vkGetFenceStatus polling & monotonic done_seq_cache
+    for sym in ["VkFence done_fence;", "vkGetFenceStatus(", "done_seq_advance(", "cq_resolved_seq", "sub_reclaim_fence("]:
+        assert sym in exec_c, f"Missing {sym} in exec.c"
+    completed_body = exec_c.split("uint64_t vk_completed_seq(void)", 1)[1].split("void vk_take_submit_breakdown", 1)[0]
+    assert "vkGetSemaphoreCounterValue(" not in completed_body
+    pace_body = exec_c.split("void vk_pace_frame(void)", 1)[1].split("if (pace_on < 0)", 1)[0]
+    assert "vkGetSemaphoreCounterValue(" not in pace_body
+
+    # 3. Lazy vk_cmd() in vk_framegen_prepare()
+    assert "vk_framegen_prepare(VK_NULL_HANDLE, b)" in device_c
+    assert "if (cb == VK_NULL_HANDLE) cb = vk_cmd();" in fg_c
+
+    # 4. [gpuprof] actual Vulkan scaled dimensions & depth dimensions
+    assert "(vk %ux%u g%u)" in exec_c
+
+    print("  -> PASS: exp/mhrise-arch v9 (per-Sub VkFence polling, lazy framegen vk_cmd, [gpuprof] scaled dims) verified.")
+
+
+_verify_exp_mhrise_arch_v9()

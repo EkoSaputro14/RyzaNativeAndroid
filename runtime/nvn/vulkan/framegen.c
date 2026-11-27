@@ -645,6 +645,7 @@ VkImageView vk_framegen_prepare(VkCommandBuffer cb, TexBackend *src_tex) {
         g_fg.warm_count = 0;
     }
 
+    if (cb == VK_NULL_HANDLE) cb = vk_cmd();
     if (!g_fg.images_initialized) fg_init_layouts(cb);
 
     int p = (int)(g_fg.seq_n & 1ull);
