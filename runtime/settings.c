@@ -526,7 +526,7 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# BOTWRecompAndroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
-    fprintf(f, "# Internal 3D scene resolution scale (0.50 .. 1.00; default 0.68)\n");
+    fprintf(f, "# Internal 3D scene resolution scale (0.35 .. 1.00; default 0.50)\n");
     if (g_settings.render_scale > 0.0f) fprintf(f, "render_scale = %.2f\n", g_settings.render_scale);
     fprintf(f, "# Shadow map resolution scale (0.25, 0.50, 1.00; default 1.00)\n");
     if (g_settings.shadow_scale >= 0.0f) fprintf(f, "shadow_scale = %.2f\n", g_settings.shadow_scale);

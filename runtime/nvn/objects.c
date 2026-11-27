@@ -312,6 +312,7 @@ uint64_t vk_completed_seq_cached(void);
 uint64_t vk_poll_seq_upto(uint64_t max_seq);
 void renderer_wait_seq(uint64_t seq);
 extern uint32_t vk_wb_pending_count(void);
+extern uint32_t vk_wb_guest_pending_count(void);
 extern void vk_wb_apply_done(uint64_t done);
 extern bool vk_wb_has_range(uint64_t base, uint64_t size, uint64_t *max_seq_out);
 extern uint64_t vk_last_writeback_seq(void);
@@ -321,8 +322,13 @@ void vk_async_tex_pool_fin(NvnDescPool *d);
 void vk_async_tex_destroy(NvnTexture *t);
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
+static int nvn_strict_wb_finish(void) {
+    static int strict = -1;
+    if (strict < 0) strict = getenv("LARECOMP_STRICT_WB_FINISH") != NULL ? 1 : 0;
+    return strict;
+}
 static void nvn_drain_wb_range(uint64_t base, uint64_t size) {
-    if (!size || vk_wb_pending_count() == 0) return;
+    if (!size || vk_wb_guest_pending_count() == 0) return;
     uint64_t wb_seq = 0;
     if (!vk_wb_has_range(base, size, &wb_seq)) return;
     if (wb_seq > vk_submitted_seq()) {
@@ -366,23 +372,28 @@ NVN(nvnQueueFinish) {
         const char *e = getenv("LARECOMP_FINISH_LAG");
         env_finish_lag = e ? atoi(e) : -1;
     }
+    int strict_wb_finish = nvn_strict_wb_finish();
     int finish_lag = env_finish_lag >= 0 ? env_finish_lag : g_settings.sync_lag;
     static pthread_mutex_t finish_lag_lock = PTHREAD_MUTEX_INITIALIZER;
     static uint64_t prev_finish_frame = ~0ull;
     static uint64_t prev_finish_seq = 0;
+    static pid_t prev_finish_tid = 0;
+    pid_t cur_tid = gettid();
     extern bool vk_gmem_placed(void);
+    bool wb_can_lag = (vk_wb_guest_pending_count() == 0) && (!strict_wb_finish || vk_wb_pending_count() == 0);
     bool can_pipeline = vk_async_on() && finish_lag >= 1 && !vk_gmem_placed() &&
-                        g_settings.gpu_writeback == 0 && frame_id >= 30 && vk_wb_pending_count() == 0;
+                        g_settings.gpu_writeback == 0 && frame_id >= 30 && wb_can_lag;
     bool use_lag = false;
     uint64_t lag_target = 0;
     if (can_pipeline) {
         pthread_mutex_lock(&finish_lag_lock);
-        if (frame_id != prev_finish_frame && prev_finish_seq > 0) {
+        if (frame_id != prev_finish_frame && prev_finish_seq > 0 && cur_tid == prev_finish_tid) {
             prev_finish_frame = frame_id;
             lag_target = prev_finish_seq;
             use_lag = true;
-        } else if (frame_id != prev_finish_frame) {
+        } else {
             prev_finish_frame = frame_id;
+            prev_finish_tid = cur_tid;
         }
         pthread_mutex_unlock(&finish_lag_lock);
     }
@@ -395,7 +406,7 @@ NVN(nvnQueueFinish) {
             vk_async_wait_id(qid);
             kernel_blocking_end();
         }
-        if (vk_wb_pending_count() > 0) {
+        if (vk_wb_guest_pending_count() > 0 || (strict_wb_finish && vk_wb_pending_count() > 0)) {
             if (vk_async_on()) {
                 vk_async_drain();
             } else if (vk_has_pending_commands()) {
@@ -417,6 +428,13 @@ NVN(nvnQueueFinish) {
             if (cur_sub > prev_finish_seq) prev_finish_seq = cur_sub;
             pthread_mutex_unlock(&finish_lag_lock);
             if (lag_target > cur_sub) lag_target = cur_sub;
+            static int nsteady_log;
+            if (vk_wb_pending_count() > 0 && nsteady_log < 3) {
+                nsteady_log++;
+                LOG("[nvn-sync] steady-wb pipeline active: frame=%llu tid=%d lag=%llu sub=%llu wb=%u\n",
+                    (unsigned long long)frame_id, (int)cur_tid, (unsigned long long)lag_target,
+                    (unsigned long long)cur_sub, vk_wb_pending_count());
+            }
             target_seq = lag_target;
         }
     } else {
@@ -429,11 +447,11 @@ NVN(nvnQueueFinish) {
         }
         t1 = plat_now_ns();
         target_seq = vk_submitted_seq();
-        if (target_seq) {
-            pthread_mutex_lock(&finish_lag_lock);
-            if (target_seq > prev_finish_seq) prev_finish_seq = target_seq;
-            pthread_mutex_unlock(&finish_lag_lock);
-        }
+        pthread_mutex_lock(&finish_lag_lock);
+        prev_finish_frame = frame_id;
+        prev_finish_tid = cur_tid;
+        if (target_seq > prev_finish_seq) prev_finish_seq = target_seq;
+        pthread_mutex_unlock(&finish_lag_lock);
     }
     if (target_seq && vk_poll_seq_upto(target_seq) < target_seq) {
         kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)

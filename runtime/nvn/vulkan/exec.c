@@ -152,6 +152,7 @@ static int naliases;
 static _Atomic uint64_t done_seq_cache;
 static _Atomic uint64_t cq_resolved_seq;
 static _Atomic uint32_t wb_busy_count;
+static _Atomic uint32_t wb_guest_busy_count;
 static pthread_mutex_t fence_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t fence_done_seq;
 
@@ -2389,10 +2390,25 @@ static uint64_t wb_max(void) {  // (LARECOMP_WRITEBACK_MAX=<bytes>: a larger lim
 #define WB_SMALL 128
 #define WB_BIG 32
 #define WB_SLOTS (WB_SMALL + WB_BIG)
-typedef struct { uint64_t seq, addr, pitch, off, order; uint32_t wb, hb, bpb, bh, fmt, size; bool busy, raw_copy; } WbEntry;  // (pitch: linear rows, 0: block-linear; off, size: its slot in wb_buf; order: when queued)
+typedef struct { uint64_t seq, addr, pitch, off, order; uint32_t wb, hb, bpb, bh, fmt, size; int16_t cache_slot; bool busy, raw_copy, cache_only; } WbEntry;  // (pitch: linear rows, 0: block-linear; off, size: its slot in wb_buf; order: when queued)
 static WbEntry wb_ent[WB_SLOTS];
 static int wb_next_small, wb_next_big;
 static uint64_t wb_order;
+#define WB_CACHE_MAX 8
+#define WB_CACHE_MAX_BYTES 65536u
+typedef struct {
+    uint64_t src_addr;
+    uint32_t width, height, fmt, size, hits;
+    bool valid;
+    uint8_t *data;
+} WbRawCacheSlot;
+static WbRawCacheSlot wb_cache[WB_CACHE_MAX];
+static uint32_t wb_cache_cursor;
+static int wb_strict_mode(void) {
+    static int strict = -1;
+    if (strict < 0) strict = getenv("LARECOMP_STRICT_WB_FINISH") != NULL ? 1 : 0;
+    return strict;
+}
 static VkBuffer wb_buf;
 static VmaAllocation wb_mem;
 static uint8_t *wb_ptr;
@@ -2501,8 +2517,9 @@ static void wb_queue(NvnTexture *t) {
     *e = (WbEntry){.seq = submit_seq + 1, .addr = t->addr, .wb = l.wb, .hb = l.hb, .bpb = fi->bpb,
                    .pitch = (t->flags & 0x10) ? t->stride : (t->flags & 0x40) ? nvn_linear_rt_pitch((uint64_t)l.wb * fi->bpb) : 0,
                    .bh = l.block_height_log2, .fmt = t->format, .off = off, .size = small ? WB_MAX : WB_SLOT,
-                   .order = ++wb_order, .busy = true, .raw_copy = false};
+                   .order = ++wb_order, .cache_slot = -1, .busy = true, .raw_copy = false, .cache_only = false};
     atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
+    atomic_fetch_add_explicit(&wb_guest_busy_count, 1, memory_order_release);
     atomic_store(&g_wb_seq, e->seq);
     pthread_mutex_unlock(&wb_lock);
     {   // LARECOMP_LOG_WB_FRAME=<n>: every write-back of every n-th frame - size, format, flags, submission (the frame's
@@ -2553,9 +2570,17 @@ static void wb_apply(uint64_t done) {
     for (int r = 0; r < nready; r++) {
         WbEntry *e = &wb_ent[ready[r]];
         vmaInvalidateAllocation(g_vk.vma, wb_mem, (VkDeviceSize)e->off, e->size);
-        if (e->raw_copy)
-            memcpy((uint8_t *)(uintptr_t)e->addr, wb_ptr + (size_t)e->off, e->size);
-        else if (e->pitch)
+        if (e->raw_copy) {
+            if (!e->cache_only && e->addr)
+                memcpy((uint8_t *)(uintptr_t)e->addr, wb_ptr + (size_t)e->off, e->size);
+            if (e->cache_slot >= 0 && e->cache_slot < WB_CACHE_MAX) {
+                WbRawCacheSlot *cs = &wb_cache[e->cache_slot];
+                if (cs->data && cs->size == e->size && e->size <= WB_CACHE_MAX_BYTES) {
+                    memcpy(cs->data, wb_ptr + (size_t)e->off, e->size);
+                    cs->valid = true;
+                }
+            }
+        } else if (e->pitch)
             for (uint32_t y = 0; y < e->hb; y++)
                 memcpy((uint8_t *)(uintptr_t)(e->addr + y * e->pitch), wb_ptr + (size_t)e->off + (size_t)y * e->wb * e->bpb, (size_t)e->wb * e->bpb);
         else tegra_swizzle(wb_ptr + (size_t)e->off, (uint8_t *)(uintptr_t)e->addr, e->wb, e->hb, 1, e->bpb, e->bh, 0);
@@ -2597,8 +2622,11 @@ static void wb_apply(uint64_t done) {
                 }
             }
         }
+        bool was_guest = !e->cache_only;
         e->busy = false;
         atomic_fetch_sub_explicit(&wb_busy_count, 1, memory_order_release);
+        if (was_guest)
+            atomic_fetch_sub_explicit(&wb_guest_busy_count, 1, memory_order_release);
     }
     pthread_mutex_unlock(&wb_lock);
 }
@@ -2607,19 +2635,23 @@ uint32_t vk_wb_pending_count(void) {
     return atomic_load_explicit(&wb_busy_count, memory_order_acquire);
 }
 
+uint32_t vk_wb_guest_pending_count(void) {
+    return atomic_load_explicit(&wb_guest_busy_count, memory_order_acquire);
+}
+
 void vk_wb_apply_done(uint64_t done) {
     if (done) wb_apply(done);
 }
 
 bool vk_wb_has_range(uint64_t base, uint64_t size, uint64_t *max_seq_out) {
-    if (!size || atomic_load_explicit(&wb_busy_count, memory_order_acquire) == 0) return false;
+    if (!size || atomic_load_explicit(&wb_guest_busy_count, memory_order_acquire) == 0) return false;
     uint64_t end = (base <= UINT64_MAX - size) ? base + size : UINT64_MAX;
     bool hit = false;
     uint64_t max_seq = 0;
     pthread_mutex_lock(&wb_lock);
     for (int i = 0; i < WB_SLOTS; i++) {
         const WbEntry *e = &wb_ent[i];
-        if (!e->busy || !e->size) continue;
+        if (!e->busy || e->cache_only || !e->addr || !e->size) continue;
         uint64_t e_end = (e->addr <= UINT64_MAX - (uint64_t)e->size) ? e->addr + (uint64_t)e->size : UINT64_MAX;
         if (e->addr < end && base < e_end) {
             hit = true;
@@ -2634,6 +2666,8 @@ bool vk_wb_has_range(uint64_t base, uint64_t size, uint64_t *max_seq_out) {
 static bool wb_queue_raw_copy(VkCommandBuffer cb, VkImage srcimg, const VkBufferImageCopy *c_in,
                               uint64_t dst, uint64_t total, const NvnTexture *t) {
     if (!total || total > 65536 || total > WB_SLOT) return false;
+    uint64_t src_addr = t ? t->addr : 0;
+    uint32_t w = t ? t->width : 0, h = t ? t->height : 0, fmt = t ? t->format : 0;
     pthread_mutex_lock(&wb_lock);
     if (!wb_buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -2669,10 +2703,51 @@ static bool wb_queue_raw_copy(VkCommandBuffer cb, VkImage srcimg, const VkBuffer
     int slot = *next;
     *next = (*next + 1) % count;
     uint64_t off = small ? (uint64_t)slot * WB_MAX : (uint64_t)WB_MAX * WB_SMALL + (uint64_t)slot * WB_SLOT;
-    *e = (WbEntry){.seq = submit_seq + 1, .addr = dst, .off = off, .size = (uint32_t)total,
-                   .fmt = t ? t->format : 0, .order = ++wb_order, .busy = true, .raw_copy = true};
-    atomic_store(&g_wb_seq, e->seq);
-    atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
+
+    int cache_slot = -1;
+    if (src_addr != 0 && total <= WB_CACHE_MAX_BYTES) {
+        int found = -1, empty = -1;
+        for (int k = 0; k < WB_CACHE_MAX; k++) {
+            const WbRawCacheSlot *cs = &wb_cache[k];
+            if (cs->src_addr == src_addr && cs->width == w && cs->height == h &&
+                cs->fmt == fmt && cs->size == (uint32_t)total) {
+                found = k;
+                break;
+            }
+            if (!cs->src_addr && empty < 0) empty = k;
+        }
+        if (found >= 0) {
+            if (wb_cache[found].hits < 1000u) wb_cache[found].hits++;
+            cache_slot = found;
+        } else {
+            int k = empty >= 0 ? empty : (int)(wb_cache_cursor++ % WB_CACHE_MAX);
+            uint8_t *buf = wb_cache[k].data;
+            if (!buf) buf = malloc(WB_CACHE_MAX_BYTES);
+            wb_cache[k] = (WbRawCacheSlot){
+                .src_addr = src_addr, .width = w, .height = h, .fmt = fmt,
+                .size = (uint32_t)total, .hits = 1, .valid = false, .data = buf};
+            cache_slot = k;
+        }
+    }
+
+    bool use_cache = (cache_slot >= 0 && wb_cache[cache_slot].hits >= 3u &&
+                      wb_cache[cache_slot].valid && wb_cache[cache_slot].data &&
+                      !wb_strict_mode() && dst >= HEAP_BASE);
+    if (use_cache) {
+        memcpy((void *)(uintptr_t)dst, wb_cache[cache_slot].data, (size_t)total);
+        *e = (WbEntry){.seq = submit_seq + 1, .addr = 0, .off = off, .size = (uint32_t)total,
+                       .fmt = fmt, .order = ++wb_order, .cache_slot = (int16_t)cache_slot,
+                       .busy = true, .raw_copy = true, .cache_only = true};
+        atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
+    } else {
+        *e = (WbEntry){.seq = submit_seq + 1, .addr = dst, .off = off, .size = (uint32_t)total,
+                       .fmt = fmt, .order = ++wb_order, .cache_slot = (int16_t)cache_slot,
+                       .busy = true, .raw_copy = true, .cache_only = false};
+        atomic_store(&g_wb_seq, e->seq);
+        atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
+        atomic_fetch_add_explicit(&wb_guest_busy_count, 1, memory_order_release);
+    }
+    uint64_t out_seq = e->seq;
     pthread_mutex_unlock(&wb_lock);
 
     VkBufferImageCopy c = *c_in;
@@ -2687,9 +2762,16 @@ static bool wb_queue_raw_copy(VkCommandBuffer cb, VkImage srcimg, const VkBuffer
     vkCmdPipelineBarrier2(cb, &di);
     static int nraw;
     if (nraw++ < 5) {
-        LOG("[vk] async tex->buf readback %ux%u f%#x %llu bytes -> %llx (seq %llu)\n",
-            t ? t->width : 0, t ? t->height : 0, t ? t->format : 0,
-            (unsigned long long)total, (unsigned long long)dst, (unsigned long long)e->seq);
+        LOG("[vk] async tex->buf readback %ux%u f%#x %llu bytes src=%llx -> %llx (seq %llu)\n",
+            w, h, fmt, (unsigned long long)total, (unsigned long long)src_addr,
+            (unsigned long long)dst, (unsigned long long)out_seq);
+    }
+    static int ncache_log;
+    if (use_cache && ncache_log < 3) {
+        ncache_log++;
+        LOG("[vk] steady-wb shadow cache active: %ux%u f%#x %llu bytes src=%llx dst=%llx (seq %llu)\n",
+            w, h, fmt, (unsigned long long)total, (unsigned long long)src_addr,
+            (unsigned long long)dst, (unsigned long long)out_seq);
     }
     return true;
 }
@@ -7756,7 +7838,12 @@ void vk_exec_reset(void) {
 #endif
     pthread_mutex_lock(&wb_lock);
     for (int i = 0; i < WB_SLOTS; i++) wb_ent[i].busy = false;
+    for (int k = 0; k < WB_CACHE_MAX; k++) {
+        wb_cache[k].valid = false;
+        wb_cache[k].hits = 0;
+    }
     atomic_store_explicit(&wb_busy_count, 0, memory_order_release);
+    atomic_store_explicit(&wb_guest_busy_count, 0, memory_order_release);
     pthread_mutex_unlock(&wb_lock);
     pthread_mutex_lock(&cq_lock);
     for (int i = 0; i < SUBS; i++) { cq[i].n = 0; cq[i].ts = false; }

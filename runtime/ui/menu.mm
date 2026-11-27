@@ -668,17 +668,17 @@ static void tab_display(void) {
                "a little. Most useful at a lower internal resolution.");
 #ifdef __ANDROID__
     {
-        static const char *rs_names[] = {"50% (0.50x)", "60% (0.60x)", "68% (0.68x)", "75% (0.75x)", "100% (1.00x)"};
-        static const float rs_vals[] = {0.50f, 0.60f, 0.68f, 0.75f, 1.00f};
+        static const char *rs_names[] = {"35% (0.35x)", "40% (0.40x)", "50% (0.50x)", "60% (0.60x)", "68% (0.68x)", "75% (0.75x)", "100% (1.00x)"};
+        static const float rs_vals[] = {0.35f, 0.40f, 0.50f, 0.60f, 0.68f, 0.75f, 1.00f};
         int rsi = 2;
         float best_d = 999.0f;
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 7; i++) {
             float d = fabsf(g_settings.render_scale - rs_vals[i]);
             if (d < best_d) { best_d = d; rsi = i; }
         }
-        if (opt_choice("3D render scale", &rsi, rs_names, 5, 2,
+        if (opt_choice("3D render scale", &rsi, rs_names, 7, 2,
                        "Scales offscreen 3D scene color and depth render targets while keeping the HUD and presentation sharp. "
-                       "Lower values (0.50x - 0.68x) significantly reduce Adreno fragment shader and bandwidth load. Applies at once.", false)) {
+                       "Lower values (0.35x - 0.68x) significantly reduce Adreno fragment shader and bandwidth load. Applies at once.", false)) {
             g_settings.render_scale = rs_vals[rsi];
             settings_save();
         }
