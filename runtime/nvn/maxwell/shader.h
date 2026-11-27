@@ -49,6 +49,7 @@ typedef struct {
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
     bool gmem_linear_lookup;  // Qualcomm compute: cached linear GMap lookup avoids its compiler's binary-search failure
+    bool no_shadow;         // (Android fragment, shadow_scale <= 0.05f): short-circuit shadow sampler lookups to 1.0f
 } ShaderKey;
 
 typedef struct {

@@ -1381,6 +1381,11 @@ bool vk_frame_begin(const float clear[4]) {
     cur_frame.acquired = acquire_sem[slot];
     slot_seq[slot] = vk_pending_seq();
     VkCommandBuffer cb = vk_cmd();
+    extern bool vk_has_pending_commands(void);
+    if (vk_has_pending_commands()) {
+        extern void vk_full_barrier(VkCommandBuffer cb);
+        vk_full_barrier(cb);
+    }
     image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = g_vk.sc_views[cur_frame.image],
                                     .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1691,10 +1696,12 @@ void backend_present(NvnTexture *t) {
         vk_framegen_reset();
     }
 #endif
-    // Kick the 3D scene (+ optical-flow compute) GPU submission before acquiring a swapchain image so Adreno
-    // renders concurrently while vkAcquireNextImageKHR waits.
+    // Only submit the 3D scene before vkAcquireNextImageKHR when FrameGen emitted an intermediate frame
+    // or LARECOMP_SPLIT_PRESENT_SUBMIT=1 is set; otherwise fold scene + present into one submission.
+    static int split_present = -1;
+    if (split_present < 0) split_present = getenv("LARECOMP_SPLIT_PRESENT_SUBMIT") != NULL ? 1 : 0;
     extern bool vk_has_pending_commands(void);
-    if (vk_has_pending_commands()) renderer_submit();
+    if (vk_has_pending_commands() && (fg_view != VK_NULL_HANDLE || split_present)) renderer_submit();
     static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = plat_now_ns();
 #ifdef __ANDROID__

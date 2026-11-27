@@ -370,9 +370,15 @@ static void attr_store(Ctx *c, int src, uint32_t addr) {
 // Swizzle: 0 H1_H0 (both halves), 1 F32 (one f32 used for both lanes), 2 H0_H0, 3 H1_H1.
 // Merge: 0 H1_H0 (pack both), 1 F32 (lane 0 as f32), 2 MRG_H0 (replace low half), 3 MRG_H1 (replace high half).
 static const char *hsrc(Ctx *c, const char *v, int swz, bool neg, bool abs_, char *buf) {
-    (void)c;
     char t[300];
-    sprintf(t, "hx(%s, %du)", v, swz);
+    if (c->glsl && maxwell_native_half && c->stage != STAGE_VERTEX) {
+        if (swz == 0) sprintf(t, "unpackHalf2x16(%s)", v);
+        else if (swz == 1) sprintf(t, "vec2(uintBitsToFloat(%s))", v);
+        else if (swz == 2) sprintf(t, "unpackHalf2x16(%s).xx", v);
+        else sprintf(t, "unpackHalf2x16(%s).yy", v);
+    } else {
+        sprintf(t, "hx(%s, %du)", v, swz);
+    }
     if (abs_ && neg) sprintf(buf, "(-abs(%s))", t);
     else if (abs_) sprintf(buf, "abs(%s)", t);
     else if (neg) sprintf(buf, "(-%s)", t);
@@ -386,7 +392,14 @@ static void hstore(Ctx *c, int d, const char *expr, int merge, bool sat) {
     if (sat) sprintf(e, "saturate(%s)", expr); else strcpy(e, expr);
     if (d == RZ) return;
     c->reg_used[d] = 1;
-    sprintf(t, "hpack(%s, %du, r%d)", e, merge, d);
+    if (c->glsl) {
+        if (merge == 0) sprintf(t, "packHalf2x16(%s)", e);
+        else if (merge == 1) sprintf(t, "floatBitsToUint((%s).x)", e);
+        else if (merge == 2) sprintf(t, "hpack_lo(%s, r%d)", e, d);
+        else sprintf(t, "hpack_hi(%s, r%d)", e, d);
+    } else {
+        sprintf(t, "hpack(%s, %du, r%d)", e, merge, d);
+    }
     set_reg(c, d, t);
 }
 
@@ -682,6 +695,10 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         strcpy(out, "vec4(0.0f)");
         return;
     }
+    if (c->glsl && c->stage == STAGE_FRAGMENT && c->key && c->key->no_shadow && t->shadow) {
+        strcpy(out, "vec4(1.0f)");
+        return;
+    }
     char L[600], xs[1600], P[2000];
     if (lod_kind == 1) snprintf(L, sizeof L, "int(%s)", lod); else strcpy(L, "0");
     if (n == 1) {
@@ -737,6 +754,10 @@ static void glsl_gather(Ctx *c, char *out, int slot, const char *const *co, cons
                         const char *off, int comp) {
     if (c->fail) { strcpy(out, "vec4(0.0f)"); return; }
     const ShaderTexture *t = &c->info->tex[slot];
+    if (c->glsl && c->stage == STAGE_FRAGMENT && c->key && c->key->no_shadow && t->shadow) {
+        strcpy(out, "vec4(1.0f)");
+        return;
+    }
     int type = t->type;
     bool cube = type == TEXTYPE_CUBE || type == TEXTYPE_CUBE_ARRAY;
     int n = cube ? 3 : 2;
@@ -2437,7 +2458,9 @@ static const char glsl_prelude[] =
     " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
     "vec2 unpack_h2(uint v) { return vec2(h2f(v & 0xFFFFu), h2f(v >> 16)); }\n"
     "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
-    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
+    "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); if (merge == 0u) return packHalf2x16(r); if (merge == 2u) return (old & 0xFFFF0000u) | (packHalf2x16(vec2(r.x, 0.0f)) & 0xFFFFu); return (old & 0xFFFFu) | (packHalf2x16(vec2(0.0f, r.y)) & 0xFFFF0000u); }\n"
+    "uint hpack_lo(vec2 r, uint old) { return (old & 0xFFFF0000u) | (packHalf2x16(vec2(r.x, 0.0f)) & 0xFFFFu); }\n"
+    "uint hpack_hi(vec2 r, uint old) { return (old & 0xFFFFu) | (packHalf2x16(vec2(0.0f, r.y)) & 0xFFFF0000u); }\n"
     "uint prmt(uint a, uint b, uint sel) { uint r = 0u; for (uint i = 0u; i < 4u; i++) { uint s = (sel >> (i * 4u)) & 7u; uint bt = s < 4u ? (a >> (s * 8u)) & 0xFFu : (b >> ((s - 4u) * 8u)) & 0xFFu; r |= bt << (i * 8u); } return r; }\n";
 
 // The prelude, a line each: directives (kept) and helpers by name (kept when called).

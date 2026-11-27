@@ -259,10 +259,12 @@ static void *render_main(void *arg) {
         uint64_t batch_last_id = r.id;
         bool next_needs_submit = false;
         if (r.type == REQ_EXEC) {
+            static int split_present = -1;
+            if (split_present < 0) split_present = getenv("LARECOMP_SPLIT_PRESENT_SUBMIT") != NULL ? 1 : 0;
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
                 int nt = q[scan % QN].type;
                 if (nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE) continue;
-                next_needs_submit = (nt == REQ_PRESENT) || (nt == REQ_FLUSH && q[scan % QN].a == 0);
+                next_needs_submit = (split_present && nt == REQ_PRESENT) || (nt == REQ_FLUSH && q[scan % QN].a == 0);
                 break;
             }
         } else if (r.type == REQ_TEX_REG) {

@@ -1149,6 +1149,11 @@ void vk_gpuprof_report(void) {
     gp_n = 0;
 }
 
+static bool list_had_fence;
+static uint32_t batch_lists;
+static uint64_t batch_start_draws;
+static uint64_t batch_start_upload_bytes;
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
@@ -1160,6 +1165,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     atomic_fetch_add_explicit(&s_sub_endp_ns, sb1 - sb0, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_sub_slot_ns, sb2 - sb1, memory_order_relaxed);
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
+    bool had_scene = (batch_lists > 0) || game_pending;
     VkCommandBufferSubmitInfo cbs[2];
     int n = 0;
     vc_flush();
@@ -1178,7 +1184,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cq[cur_sub].pool, CQ_MAX + 1);
         pthread_mutex_lock(&cq_lock);
         cq[cur_sub].ts = true;
-        cq[cur_sub].presentation = wait != VK_NULL_HANDLE || signal != VK_NULL_HANDLE;
+        cq[cur_sub].presentation = (wait != VK_NULL_HANDLE || signal != VK_NULL_HANDLE) && !had_scene;
         pthread_mutex_unlock(&cq_lock);
     }
 #endif
@@ -1228,7 +1234,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     submit_seq++;
 #ifdef __ANDROID__
     last_submit_ns = SDL_GetTicksNS();
-    if (game_pending) work_seq = submit_seq;  // (cleared when backend_execute is done: flushes inside it come first)
+    if (had_scene) work_seq = submit_seq;  // (cleared when backend_execute is done: flushes inside it come first)
 #endif
     s->main_begun = s->upload_begun = false;
     atomic_store_explicit(&g_batch_pending, false, memory_order_release);
@@ -1238,6 +1244,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         if (log < 0) log = getenv("LARECOMP_LOG_SYNCSEQ") != NULL;
         if (log) LOG("[syncseq] t %.2f submitted seq %llu%s\n", SDL_GetTicksNS() / 1e6, (unsigned long long)submit_seq, signal ? " (present)" : "");
     }
+    batch_lists = 0;
+    batch_start_draws = stat_draws;
+    batch_start_upload_bytes = stat_upload_bytes;
     cur_sub = (cur_sub + 1) % SUBS;
     stat_flushes++;
     cum_submits++;
@@ -1249,11 +1258,6 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     atomic_fetch_add_explicit((wait || signal) ? &s_sub_qsub_p_ns : &s_sub_qsub_ns, sb5 - sb4, memory_order_relaxed);
     atomic_fetch_add_explicit(&s_sub_retire_ns, sb6 - sb5, memory_order_relaxed);
 }
-
-static bool list_had_fence;
-static uint32_t batch_lists;
-static uint64_t batch_start_draws;
-static uint64_t batch_start_upload_bytes;
 
 void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
@@ -3810,6 +3814,7 @@ static Prog *get_program(NvnProgram *vnp, NvnProgram *fnp, ShaderKey *vkey, Shad
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
 #ifdef __ANDROID__
     if (fkey->no_ds_write) { h ^= 0xE1; h *= 0x100000001B3ull; }  // (keys without it hash as before)
+    if (fkey->no_shadow) { h ^= 0xE2; h *= 0x100000001B3ull; }
 #endif
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
@@ -8292,6 +8297,15 @@ static void draw_(CmdRec *r, bool indexed) {
 #ifdef __ANDROID__
     if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
         fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
+    {
+        static int env_no_shadow = -1, env_no_shadow_bypass = -1;
+        if (env_no_shadow < 0) {
+            env_no_shadow = (getenv("LARECOMP_NO_SHADOW") || getenv("LARECOMP_NO_SHADOWS")) ? 1 : 0;
+            env_no_shadow_bypass = getenv("LARECOMP_NO_SHADOW_SHADER_BYPASS") != NULL ? 1 : 0;
+        }
+        if (!env_no_shadow_bypass && (g_settings.shadow_scale <= 0.05f || env_no_shadow))
+            fkey.no_shadow = true;
+    }
 #endif
     Prog *pr = get_program(vnp, fnp, &vkey, &fkey);
     bool keep = false;  // (a target built once and kept: wait for the shader and pipeline - wait_built)
