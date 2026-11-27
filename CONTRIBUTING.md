@@ -1,62 +1,87 @@
-# Contributing to BOTWRecompAndroid
+# Contributing to RyzaNativeAndroid
 
-Thanks for wanting to help! Bug reports, testing on different hardware and code contributions are all welcome.
+Thank you for helping improve **RyzaNativeAndroid** (*Atelier Ryza: Ever Darkness & the Secret Hideout* on Android via Native ARM64 execution / static recompilation and NVN-to-Vulkan translation). Bug reports, real-device hardware benchmarks, and focused code contributions are all welcome.
 
 > [!NOTE]
-> This project is developed mostly with AI (see the README). Contributions written by hand, with AI assistance or
-> anything in between are equally welcome - what matters is that a change works, is tested, and follows the rules
-> below.
+> Parts of this codebase were authored and iterated with AI engineering assistance under human architectural direction, hardware profiling, and test verification. Human-written and AI-assisted contributions are equally welcome as long as every change is tested, minimal, and follows the guidelines below.
 
-## The one hard rule: no Nintendo files
+---
 
-Nothing owned by Nintendo may ever be committed or attached to an issue or pull request:
+## Hard Rule: No Game Files or Copyrighted Assets
 
-- no copies of the game in any form
-- no dumps (`Dump/`), extracted game files (`extracted/`), generated code (`generated*/`) or fonts (`.bfttf` / Switch
-  `.ttf`)
-- no game assets of any kind: textures, models, music, text, map files - also not "just one file for testing"
+Never commit, upload, or attach any copyrighted game files or proprietary assets owned by **Koei Tecmo Games / Gust** or **Nintendo** to commits, issues, or pull requests:
 
-Pull requests that include Nintendo files can't be merged. Screenshots and short clips of the game in bug reports are
-fine.
+- No game dumps (`Dump/`), `exefs`, `romfs`, NSP/XCI containers, or `prod.keys`.
+- No extracted assets (`extracted/`), generated guest source files (`generated*/`), Switch fonts (`.bfttf` / `.ttf`), textures, 3D models, audio, shaders from dumps, or event/map scripts — not even a single sample file for testing.
 
-## Reporting bugs
+Pull requests containing copyrighted game files or assets cannot be merged. Screenshots and short gameplay clips attached to bug reports or performance comparisons are welcome.
 
-Open a [GitHub issue](https://github.com/mamcjr/BOTWRecompAndroid/issues). Please include the Android device, OS version, GPU and driver, what you did, what happened, and logcat output (tag `BOTWRecompAndroid`).
+---
 
-## Building
+## Reporting Bugs & Benchmarks
 
-Android is the only application target. The plan and phase notes are in [docs/BOTW-PORT.md](docs/BOTW-PORT.md) (Portuguese).
-Build the APK with `cd android/botwrecompandroid && ./gradlew assembleDebug` (Windows: `gradlew.bat assembleDebug`).
-Check your dump with `cd tools && python botw_dump.py`. Build its game library with
-`android/build_gamelib.sh Dump/01007EF00011E000/exefs`.
+Open an issue on **[EkoSaputro14/RyzaNativeAndroid Issues](https://github.com/EkoSaputro14/RyzaNativeAndroid/issues)** and include:
 
-## Project layout
+1. **Device & OS**: phone model, SoC, Android version (e.g., POCO X3 NFC, Snapdragon 732G, Android 10/11+).
+2. **GPU & Vulkan Driver**: GPU name and exact driver (stock Qualcomm vs Mesa Turnip version).
+3. **Game Version & Execution Mode**: Native (`EL0`) vs Recompiled, plus whether Expansion/DLC content is loaded.
+4. **Configuration**: relevant values from `botwrecompandroid.ini` (`render_scale`, `shadow_scale`, `frame_gen`, `fast_depth`, `fp16_shaders`, `sync_lag`).
+5. **Logs & Telemetry**: capture logs via **Settings > Files > Save a log file** or `adb logcat` (note: internal logcat tag `BOTWRecompAndroid` is kept for compatibility), plus `gpuprof_last.txt` if reporting a rendering or GPU performance regression.
 
-- `tools/gen.py` - the recompiler: translates the game's executables into C (`generated/`, never committed).
-  `tools/patches.py` holds code patches applied during generation; every patch site checks the original instruction
-  word, so a wrong address fails loudly instead of silently.
-- `runtime/` - the host side:
-  - `kernel.c`, `loader.c`, `services/` - the Switch OS replacement
-  - `hle/` - host implementations of SDK functions (input, movies, display, fonts) and the game hooks (`game.c`)
-  - `nvn/` - the graphics layer: command recording (`cmdbuf.c`), the Vulkan (`vulkan/`) backend, the shader translator (`maxwell/translate.c`)
-  - `ui/` - the ImGui overlay menu and the start screen
-- `android/` - the Android app (Gradle), its dependencies and the game code build for the phone.
+---
 
-## Testing your change
+## Building & Testing
 
-- Build the Android APK. For rendering changes, report the device, Vulkan driver and scene used for testing.
-- Test in game, and look at the result: a fix isn't verified until you've seen it work.
-- Many debug hooks are documented where they're defined - grep for `getenv("LARECOMP_` (the engine's prefix, kept
-  from LAS Recomp). Give test runs a scratch save folder (`LARECOMP_SAVE_DIR`) so your own saves stay untouched.
-- State that belongs to one boot of the game must be reset when the game reboots in place: use an `RT_ON_RESET` hook
-  (see `runtime/hle.h`).
+Android (`arm64-v8a`, Vulkan) is the only application target.
 
-## Code style
+### Android APK Build
+With Android SDK/NDK installed and third-party libraries built in `android/deps/out` (see `android/deps/build_deps.sh`):
 
-- Match the surrounding code: its naming, structure and comment density. Comments explain *why* (what the game does,
-  what an address is, which bug showed the problem), not what the next line does.
-- Engine changes that aren't about BOTW should stay easy to bring back to LAS Recomp (and the other way round).
+```bash
+cd android/botwrecompandroid
+./gradlew assembleDebug     # Debug APK (gradlew.bat on Windows)
+./gradlew assembleRelease   # Release APK
+```
 
-## Pull requests
+> [!NOTE]
+> Legacy path and identifier names (`com.botwrecomp.android`, `android/botwrecompandroid/`, `botwrecompandroid.ini`, `LARECOMP_*`) are retained intentionally so existing user saves, INI configurations, and build wiring do not break.
 
-- Keep each pull request focused on one change; small is easier to review.
+### Host Regression & Shader Checks (Required Before PR)
+Run the Python architectural test suite, C unit tests, and `glslc` SPIR-V validation whenever touching runtime, Maxwell translation, or Vulkan code:
+
+```bash
+python3 companion/tests/test_ryza_fixes.py
+gcc -O2 -Iruntime companion/tests/test_ryza_fixes.c -o /tmp/test_ryza_fixes_c -lm && /tmp/test_ryza_fixes_c
+```
+
+For shader translator changes (`runtime/nvn/maxwell/translate.c`), also verify any new GLSL constructs compile cleanly with `/usr/bin/glslc --target-env=vulkan1.3`.
+
+### On-Device Verification Guidelines
+- Test on real Android hardware and inspect screenshots visually for rendering artifacts.
+- Verify zero shader/pipeline compile failures (`logcat`) and inspect `[vk]`, `[sub-diag]`, and on-demand per-pass `[gpuprof]` (`touch .../files/gpuprof_once` -> `gpuprof_last.txt`) metrics.
+- Document A/B toggles via `getenv("LARECOMP_...")` where defined, and keep test saves isolated using `LARECOMP_SAVE_DIR` when needed.
+- Any state scoped to a single guest boot must reset cleanly through `RT_ON_RESET` (`runtime/hle.h`).
+
+---
+
+## Project Layout
+
+| Path | Role |
+| :--- | :--- |
+| `runtime/` | Core runtime: loader, kernel/thread HLE (`kernel.c`, `loader.c`, `services/`) |
+| `runtime/hle/` | High-level Nintendo Switch SDK & KTGL game hooks (`game.c`, audio, input, display, fonts) |
+| `runtime/nvn/maxwell/` | Maxwell bytecode decoder and GLSL/SPIR-V translator (`translate.c`, `shader.h`) |
+| `runtime/nvn/vulkan/` | Vulkan backend, NVN command recording, memory mirrors, async queue, FrameGen, shader/pipeline caches |
+| `runtime/ui/` | ImGui configuration overlay, performance HUD, custom Vulkan driver picker, touch controls |
+| `android/botwrecompandroid/` | Android Gradle project, JNI entrypoints, CMake native build (`libmain.so`) |
+| `companion/tests/` | Host regression suites (`test_ryza_fixes.py`, `test_ryza_fixes.c`) |
+| `tools/` | Recompiler tooling and patch utilities (no game outputs committed) |
+
+---
+
+## Code Style & Pull Request Guidelines
+
+- **Keep PRs focused**: target one clear fix, optimization, or feature per pull request.
+- **Match surrounding style**: preserve existing C/C++/Objective-C++ formatting, naming, and concise comments explaining **why** (hardware quirks, KTGL behavior, synchronization invariants), not **what**.
+- **Scope cleanly**: keep generic NVN/Vulkan/HLE engine improvements modular so upstream fixes remain easy to trace and port.
+- **Verify before submitting**: include host test results and hardware test summary (device, Vulkan driver, `render_scale`/`shadow_scale`, FPS/GPU telemetry) in the PR description.

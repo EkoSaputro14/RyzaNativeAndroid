@@ -86,6 +86,9 @@ Active development on the `exp/mhrise-arch` branch focuses on Adreno/Turnip GPU 
 
 Settings are stored at `/sdcard/Android/data/com.botwrecomp.android/files/botwrecompandroid.ini` and can be adjusted live from the in-game menu (`F1`, `Esc`, or `Minus + Plus` on a controller).
 
+> [!NOTE]
+> **Legacy Identifier Compatibility:** This repository is dedicated to *Atelier Ryza* (**RyzaNativeAndroid**). Internal package/config identifiers such as `com.botwrecomp.android`, `android/botwrecompandroid/`, `botwrecompandroid.ini`, and `LARECOMP_*` env flags are intentionally kept unchanged for save-data and build compatibility with the upstream base.
+
 | Key | Recommended / Typical Value | Description |
 | :--- | :---: | :--- |
 | `render_scale` | `0.50` .. `1.00` | Internal 3D scene resolution scale (`0.50` / `0.68` recommended on mid-range Adreno) |
@@ -142,6 +145,12 @@ gcc -O2 -Iruntime companion/tests/test_ryza_fixes.c -o /tmp/test_ryza_fixes_c -l
 
 ---
 
+## Contributing
+
+Contributions, device test reports, and GPU profiling feedback are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request or issue (strict rule: never upload dumps, `exefs`/`romfs`, generated guest code, or game assets).
+
+---
+
 ## Credits & Upstream Attribution
 
 RyzaNativeAndroid stands on the shoulders of upstream recompilation and Android Vulkan engineering projects:
@@ -166,4 +175,4 @@ RyzaNativeAndroid stands on the shoulders of upstream recompilation and Android 
 
 Licensed under the [MIT License](LICENSE) for original runtime and recompiler code; bundled third-party submodules remain under their respective licenses.
 
-*Atelier Ryza: Ever Darkness & the Secret Hideout*, *KTGL*, and related trademarks belong to Koei Tecmo Games / Gust. *Nintendo Switch* and *The Legend of Zelda* belong to Nintendo Co., Ltd. This project is an independent, non-commercial technical effort and is not affiliated with or endorsed by Koei Tecmo Games, Gust, or Nintendo.
+*Atelier Ryza: Ever Darkness & the Secret Hideout*, *KTGL*, and related trademarks belong to Koei Tecmo Games / Gust. *Nintendo Switch* belongs to Nintendo Co., Ltd. This project is an independent, non-commercial technical effort and is not affiliated with or endorsed by Koei Tecmo Games, Gust, or Nintendo.
