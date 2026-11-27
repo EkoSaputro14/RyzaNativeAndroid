@@ -304,6 +304,8 @@ void vk_wait_seq(uint64_t seq) {
 #ifdef __ANDROID__
             gcopy_retire(cached);
 #endif
+        } else if (atomic_load_explicit(&wb_busy_count, memory_order_acquire) > 0) {
+            wb_apply(cached);
         }
         return;
     }
@@ -2599,6 +2601,34 @@ static void wb_apply(uint64_t done) {
         atomic_fetch_sub_explicit(&wb_busy_count, 1, memory_order_release);
     }
     pthread_mutex_unlock(&wb_lock);
+}
+
+uint32_t vk_wb_pending_count(void) {
+    return atomic_load_explicit(&wb_busy_count, memory_order_acquire);
+}
+
+void vk_wb_apply_done(uint64_t done) {
+    if (done) wb_apply(done);
+}
+
+bool vk_wb_has_range(uint64_t base, uint64_t size, uint64_t *max_seq_out) {
+    if (!size || atomic_load_explicit(&wb_busy_count, memory_order_acquire) == 0) return false;
+    uint64_t end = (base <= UINT64_MAX - size) ? base + size : UINT64_MAX;
+    bool hit = false;
+    uint64_t max_seq = 0;
+    pthread_mutex_lock(&wb_lock);
+    for (int i = 0; i < WB_SLOTS; i++) {
+        const WbEntry *e = &wb_ent[i];
+        if (!e->busy || !e->size) continue;
+        uint64_t e_end = (e->addr <= UINT64_MAX - (uint64_t)e->size) ? e->addr + (uint64_t)e->size : UINT64_MAX;
+        if (e->addr < end && base < e_end) {
+            hit = true;
+            if (e->seq > max_seq) max_seq = e->seq;
+        }
+    }
+    pthread_mutex_unlock(&wb_lock);
+    if (hit && max_seq_out) *max_seq_out = max_seq;
+    return hit;
 }
 
 static bool wb_queue_raw_copy(VkCommandBuffer cb, VkImage srcimg, const VkBufferImageCopy *c_in,

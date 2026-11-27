@@ -311,12 +311,36 @@ uint64_t vk_completed_seq(void);
 uint64_t vk_completed_seq_cached(void);
 uint64_t vk_poll_seq_upto(uint64_t max_seq);
 void renderer_wait_seq(uint64_t seq);
+extern uint32_t vk_wb_pending_count(void);
+extern void vk_wb_apply_done(uint64_t done);
+extern bool vk_wb_has_range(uint64_t base, uint64_t size, uint64_t *max_seq_out);
+extern uint64_t vk_last_writeback_seq(void);
 void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view);
 void vk_async_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc);
 void vk_async_tex_pool_fin(NvnDescPool *d);
 void vk_async_tex_destroy(NvnTexture *t);
 void kernel_blocking_begin(void);
 void kernel_blocking_end(void);
+static void nvn_drain_wb_range(uint64_t base, uint64_t size) {
+    if (!size || vk_wb_pending_count() == 0) return;
+    uint64_t wb_seq = 0;
+    if (!vk_wb_has_range(base, size, &wb_seq)) return;
+    if (wb_seq > vk_submitted_seq()) {
+        if (vk_async_on()) {
+            vk_async_drain();
+        } else if (vk_has_pending_commands()) {
+            vk_flush_pending_work();
+        }
+    }
+    if (wb_seq && vk_poll_seq_upto(wb_seq) < wb_seq) {
+        kernel_blocking_begin();
+        renderer_wait_seq(wb_seq);
+        kernel_blocking_end();
+    }
+    uint64_t done = vk_completed_seq_cached();
+    if (wb_seq > done) done = vk_poll_seq_upto(wb_seq);
+    if (done) vk_wb_apply_done(done);
+}
 void vk_sync_wait_enter(void);
 void vk_sync_wait_leave(void);
 NVN(nvnQueueFinish) {
@@ -327,6 +351,10 @@ NVN(nvnQueueFinish) {
     if (!vk_has_pending_commands() &&
         (!vk_async_on() || vk_async_queue_idle()) &&
         (!sub_seq_init || done_seq_init >= sub_seq_init)) {
+        if (vk_wb_pending_count() > 0) {
+            uint64_t d = done_seq_init ? done_seq_init : vk_poll_seq_upto(sub_seq_init);
+            if (d) vk_wb_apply_done(d);
+        }
         return;
     }
     uint64_t t0 = plat_now_ns();
@@ -344,7 +372,7 @@ NVN(nvnQueueFinish) {
     static uint64_t prev_finish_seq = 0;
     extern bool vk_gmem_placed(void);
     bool can_pipeline = vk_async_on() && finish_lag >= 1 && !vk_gmem_placed() &&
-                        g_settings.gpu_writeback == 0 && frame_id >= 30;
+                        g_settings.gpu_writeback == 0 && frame_id >= 30 && vk_wb_pending_count() == 0;
     bool use_lag = false;
     uint64_t lag_target = 0;
     if (can_pipeline) {
@@ -367,13 +395,30 @@ NVN(nvnQueueFinish) {
             vk_async_wait_id(qid);
             kernel_blocking_end();
         }
-        t1 = plat_now_ns();
-        uint64_t cur_sub = vk_submitted_seq();
-        pthread_mutex_lock(&finish_lag_lock);
-        if (cur_sub > prev_finish_seq) prev_finish_seq = cur_sub;
-        pthread_mutex_unlock(&finish_lag_lock);
-        if (lag_target > cur_sub) lag_target = cur_sub;
-        target_seq = lag_target;
+        if (vk_wb_pending_count() > 0) {
+            if (vk_async_on()) {
+                vk_async_drain();
+            } else if (vk_has_pending_commands()) {
+                vk_flush_pending_work();
+            }
+            t1 = plat_now_ns();
+            uint64_t sub_now = vk_submitted_seq();
+            uint64_t wb_seq = vk_last_writeback_seq();
+            if (wb_seq > sub_now) wb_seq = sub_now;
+            if (wb_seq > lag_target) lag_target = wb_seq;
+            pthread_mutex_lock(&finish_lag_lock);
+            if (sub_now > prev_finish_seq) prev_finish_seq = sub_now;
+            pthread_mutex_unlock(&finish_lag_lock);
+            target_seq = lag_target;
+        } else {
+            t1 = plat_now_ns();
+            uint64_t cur_sub = vk_submitted_seq();
+            pthread_mutex_lock(&finish_lag_lock);
+            if (cur_sub > prev_finish_seq) prev_finish_seq = cur_sub;
+            pthread_mutex_unlock(&finish_lag_lock);
+            if (lag_target > cur_sub) lag_target = cur_sub;
+            target_seq = lag_target;
+        }
     } else {
         // Drain queued async commands and flush any open batched command buffer before waiting on GPU.
         // Note: vk_async_drain() handles its own kernel_blocking_begin/end internally.
@@ -394,6 +439,11 @@ NVN(nvnQueueFinish) {
         kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
         renderer_wait_seq(target_seq);
         kernel_blocking_end();
+    }
+    if (vk_wb_pending_count() > 0) {
+        uint64_t done = vk_completed_seq_cached();
+        if (target_seq > done) done = vk_poll_seq_upto(target_seq);
+        if (done) vk_wb_apply_done(done);
     }
     uint64_t t_end = plat_now_ns();
     vk_sync_wait_leave();
@@ -728,6 +778,9 @@ NVN(nvnMemoryPoolInitialize) {
 NVN(nvnMemoryPoolFinalize) {
     NvnPool *p = HOST(NvnPool, A(0));
     if (p) {
+#ifdef __ANDROID__
+        nvn_drain_wb_range(p->storage, p->size);
+#endif
         pool_untrack(p);
         p->magic = 0;
         p->guest = 0;
@@ -802,7 +855,14 @@ NVN(nvnBufferInitialize) {
     G(uint64_t, A(0), 0x20) = next_debug_id++;
     RET(1);
 }
-NVN(nvnBufferFinalize) { (void)c; }
+NVN(nvnBufferFinalize) {
+#ifdef __ANDROID__
+    if (nvn_ptr_ok(A(0)))
+        nvn_drain_wb_range(G(uint64_t, A(0), 0), G(uint64_t, A(0), 0x18));
+#else
+    (void)c;
+#endif
+}
 NVN(nvnBufferSetDebugLabel) { (void)c; }
 NVN(nvnBufferMap) { RET(nvn_ptr_ok(A(0)) ? G(uint64_t, A(0), 0) : 0); }
 NVN(nvnBufferGetAddress) { RET(nvn_ptr_ok(A(0)) ? G(uint64_t, A(0), 0) : 0); }
