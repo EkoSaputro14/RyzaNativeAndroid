@@ -35,6 +35,7 @@ bool maxwell_struct_skips = true;  // (structure: forward jumps out of a region 
 bool maxwell_no_switch;
 bool maxwell_no_local_struct;
 bool maxwell_native_half;
+bool maxwell_vs_native_half;
 bool maxwell_fp16_half;
 bool maxwell_fast_minmax;
 bool maxwell_quad_butterfly;
@@ -372,7 +373,8 @@ static void attr_store(Ctx *c, int src, uint32_t addr) {
 // Swizzle: 0 H1_H0 (both halves), 1 F32 (one f32 used for both lanes), 2 H0_H0, 3 H1_H1.
 // Merge: 0 H1_H0 (pack both), 1 F32 (lane 0 as f32), 2 MRG_H0 (replace low half), 3 MRG_H1 (replace high half).
 static inline bool use_fp16_half(const Ctx *c) {
-    return c->glsl && maxwell_native_half && maxwell_fp16_half && c->stage == STAGE_FRAGMENT;
+    return c->glsl && maxwell_native_half && maxwell_fp16_half &&
+           (c->stage == STAGE_FRAGMENT || (c->stage == STAGE_VERTEX && maxwell_vs_native_half));
 }
 
 static const char *hsrc(Ctx *c, const char *v, int swz, bool neg, bool abs_, char *buf) {
@@ -383,7 +385,7 @@ static const char *hsrc(Ctx *c, const char *v, int swz, bool neg, bool abs_, cha
         else if (swz == 1) sprintf(t, "f16vec2(uintBitsToFloat(%s))", v);
         else if (swz == 2) sprintf(t, "unpackFloat2x16(%s).xx", v);
         else sprintf(t, "unpackFloat2x16(%s).yy", v);
-    } else if (c->glsl && maxwell_native_half && c->stage != STAGE_VERTEX) {
+    } else if (c->glsl && maxwell_native_half && (c->stage != STAGE_VERTEX || maxwell_vs_native_half)) {
         if (swz == 0) sprintf(t, "unpackHalf2x16(%s)", v);
         else if (swz == 1) sprintf(t, "vec2(uintBitsToFloat(%s))", v);
         else if (swz == 2) sprintf(t, "unpackHalf2x16(%s).xx", v);
@@ -3054,7 +3056,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n");
     sp(&s, "%s", glsl_prelude);
     if (maxwell_no_int64) sp(&s, "%s", glsl_int32_helpers);
-    if (maxwell_native_half && stage != STAGE_VERTEX) {
+    if (maxwell_native_half && (stage != STAGE_VERTEX || maxwell_vs_native_half)) {
         // (maxwell_native_half) halves by the GPU's own conversion outside vertex shaders: the bitwise h2f (kept for
         // the positions a depth pre-pass and its colour pass must agree on) is a dozen operations with branches per
         // half, and the overworld's lit pass converts ~300 of them, half inside its light loop. For the code after
@@ -3180,8 +3182,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         // shaded, the lit pass ~2x slower; with no discard, depth write or store of its own the shader's depth test
         // is early anyway - and with a discard too when the draw writes no depth / stencil: the alpha-tested lit
         // shaders, after the depth prepass)
-        if (GMISS_ON(stage) && info->uses_gmem_map && !c->uses_gmem_store && !c->omap_depth &&
-            (!info->uses_discard || (key && key->no_ds_write)))
+        bool want_early_z = !c->uses_gmem_store && !c->omap_depth &&
+                            ((GMISS_ON(stage) && info->uses_gmem_map && (!info->uses_discard || (key && key->no_ds_write))) ||
+                             (key && key->no_ds_write && info->uses_discard));
+        if (want_early_z)
             sp(&s, "layout(early_fragment_tests) in;\n");
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");

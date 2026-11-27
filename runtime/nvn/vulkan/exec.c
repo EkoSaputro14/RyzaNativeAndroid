@@ -3792,6 +3792,7 @@ static void translate_program(void *arg) {
     maxwell_no_switch = qcom_no_switch();
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_vs_native_half = !getenv("LARECOMP_VS_BITWISE_HALF");
     maxwell_fp16_half = g_vk.shader_float16 && !getenv("LARECOMP_NO_NATIVE_FP16_HALF");
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
     maxwell_quad_butterfly = g_vk.subgroup_quad && !getenv("LARECOMP_NO_QUAD_BUTTERFLY");
@@ -4539,7 +4540,13 @@ static void build_pipeline(void *arg) {
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor,
                                         .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth,
                                         .stencilAttachmentFormat = k->stencil};
-    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+    static int depth_only_vs = -1;
+    if (depth_only_vs < 0) depth_only_vs = !getenv("LARECOMP_NO_DEPTH_ONLY_VS");
+    uint32_t stage_count = (depth_only_vs && k->ncolor == 0 && !k->a2c && k->prog && k->prog->fi &&
+                            !k->prog->fi->uses_discard && !k->prog->fi->writes_depth && !k->prog->fi->uses_gmem_store)
+                           ? 1u
+                           : 2u;
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = stage_count,
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
@@ -4560,7 +4567,7 @@ static void build_pipeline(void *arg) {
 #ifdef __ANDROID__
     // Safe graphics pipeline fallback: if compilation fails while FP16 RelaxedPrecision is enabled,
     // retry once with an FP32 fragment shader before giving up.
-    if (r != VK_SUCCESS && g_settings.fp16_shaders != 0 && k->prog->fi && k->prog->fi->msl) {
+    if (stage_count == 2u && r != VK_SUCCESS && g_settings.fp16_shaders != 0 && k->prog->fi && k->prog->fi->msl) {
         size_t nf_safe = 0;
         uint32_t *sf_safe = vk_glsl_to_spirv_fp32(k->prog->fi->msl, STAGE_FRAGMENT, "fs_fp32", &nf_safe);
         if (sf_safe) {
@@ -8097,6 +8104,7 @@ static CsProg *compute_program(NvnProgram *np) {
     maxwell_no_switch = qcom_no_switch();
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_vs_native_half = false;
     maxwell_fp16_half = false;
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
 #endif
@@ -8387,8 +8395,15 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib && i < 32; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
 #ifdef __ANDROID__
-    if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
-        fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
+    {
+        static int early_z = -1;
+        if (early_z < 0) early_z = !getenv("LARECOMP_NO_EARLY_Z");
+        if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
+            fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
+        else if (early_z && st.rt.depth && st.ds[0] && !st.ds[1] &&
+                 !(st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)))
+            fkey.no_ds_write = true;
+    }
     {
         static int env_no_shadow = -1, env_no_shadow_bypass = -1;
         if (env_no_shadow < 0) {
@@ -8786,7 +8801,7 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t mesh = (st.vbuf[0].addr * 0x9E3779B97F4A7C15ull) ^ ib_addr;
         if (!mesh) mesh = 1ull;
         uint32_t slot_c = (uint32_t)((mesh ^ (mesh >> 32)) & (CUTOUT_TAB - 1));
-        if (pass_ncolor == 0 && dw && pr && pr->fi && pr->fi->msl && pr->fi->msl[0]) {
+        if (pass_ncolor == 0 && dw && pr && pr->fi && (pr->fi->uses_discard || pr->fi->writes_depth)) {
             cutout_meshes[slot_c] = mesh;
         } else if (pass_ncolor > 0 && dop == VK_COMPARE_OP_EQUAL && cutout_meshes[slot_c] != mesh) {
             dop = (g_last_depth_clear < 0.5f) ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;
