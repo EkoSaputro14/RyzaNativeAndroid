@@ -1789,7 +1789,15 @@ void backend_present(NvnTexture *t) {
     vk_debug_groups_reset();
     uint64_t present_t1 = plat_now_ns();
     extern void vk_ring_begin_frame(uint64_t frame_index);
+    uint64_t rb0 = plat_now_ns();
     vk_ring_begin_frame(total_frames + 1);
+    uint64_t rb1 = plat_now_ns();
+#ifdef __ANDROID__
+    {
+        extern void vk_async_note_ring_begin_ns(uint64_t ns);
+        vk_async_note_ring_begin_ns(rb1 >= rb0 ? rb1 - rb0 : 0);
+    }
+#endif
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, present_t1 >= t0 ? present_t1 - t0 : 0);
     frames++;
@@ -2085,6 +2093,13 @@ void backend_present(NvnTexture *t) {
         frames = 0;
         last_fps_time = now;
     }
+#ifdef __ANDROID__
+    {
+        extern void vk_async_note_post_present_ns(uint64_t ns);
+        uint64_t post_t1 = plat_now_ns();
+        vk_async_note_post_present_ns(post_t1 >= rb1 ? post_t1 - rb1 : 0);
+    }
+#endif
 }
 
 // ================================================================== UI thread

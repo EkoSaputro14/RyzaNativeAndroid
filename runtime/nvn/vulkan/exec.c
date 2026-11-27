@@ -1435,10 +1435,42 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     return s;
 }
 
+static inline uint64_t hash_words_fast(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h0 = h ^ 0x9E3779B97F4A7C15ull;
+    uint64_t h1 = h ^ 0xC2B2AE3D27D4EB4Full;
+    uint64_t h2 = h ^ 0x165667B19E3779F9ull;
+    uint64_t h3 = h ^ 0x85EBCA77C2B2AE63ull;
+    for (; n >= 32; n -= 32, b += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, b, 8);
+        memcpy(&w1, b + 8, 8);
+        memcpy(&w2, b + 16, 8);
+        memcpy(&w3, b + 24, 8);
+        h0 = (h0 ^ w0) * 0x9E3779B97F4A7C15ull; h0 ^= h0 >> 29;
+        h1 = (h1 ^ w1) * 0xC2B2AE3D27D4EB4Full; h1 ^= h1 >> 31;
+        h2 = (h2 ^ w2) * 0x100000001B3ull;       h2 ^= h2 >> 29;
+        h3 = (h3 ^ w3) * 0xFF51AFD7ED558CCDull;  h3 ^= h3 >> 33;
+    }
+    uint64_t res = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ h3;
+    for (; n >= 8; n -= 8, b += 8) {
+        uint64_t w;
+        memcpy(&w, b, 8);
+        res = (res ^ w) * 0x9E3779B97F4A7C15ull;
+        res ^= res >> 29;
+    }
+    for (; n; n--, b++) {
+        res = (res ^ *b) * 0x100000001B3ull;
+    }
+    return res ^ (res >> 32);
+}
+
 // Guest memory copied and coalesced per submission: draws across batched lists binding an unchanged range share the copy.
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
 int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
-#define GCOPY_TAB 4096
+#define GCOPY_SETS 2048
+#define GCOPY_WAYS 2
+#define GCOPY_TAB (GCOPY_SETS * GCOPY_WAYS)
 static struct { uint64_t addr, size, seq, sub_seq, gen, hash; uint32_t pt_gen; VkSpan span; } gcopy[GCOPY_TAB];
 static uint16_t gcopy_active[GCOPY_TAB];
 static int gcopy_nactive;
@@ -1463,34 +1495,53 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     uint64_t seq = vk_pending_seq() + ((gcopy_gen + desc_epoch) << 40);
     uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     if (gcopy_active_seq != sub_seq) { gcopy_active_seq = sub_seq; gcopy_nactive = 0; }
-    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].sub_seq == sub_seq && gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
-        if (gcopy[slot].gen == gcopy_gen) {
-            stat_gcopy_hits++;
-            return gcopy[slot].span;
-        }
-        uint64_t cur_h = size <= 4096 ? hmix(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size) : 0;
-        uint32_t now_pt = 0;
-        int chg = size > 4096 ? vk_pages_changed(addr, size, gcopy[slot].pt_gen, &now_pt) : -1;
-        if ((size <= 4096 && cur_h == gcopy[slot].hash) || (size > 4096 && chg == 0)) {
-            gcopy[slot].gen = gcopy_gen;
-            gcopy[slot].seq = seq;
-            if (now_pt) gcopy[slot].pt_gen = now_pt;
-            stat_gcopy_hits++;
-            return gcopy[slot].span;
+    uint32_t set = (uint32_t)(h ^ (h >> 32)) & (GCOPY_SETS - 1);
+    uint32_t base = set * GCOPY_WAYS;
+    bool have_cur_h = false;
+    uint64_t cur_h = 0;
+    uint32_t empty_slot = UINT32_MAX;
+    for (uint32_t w = 0; w < GCOPY_WAYS; w++) {
+        uint32_t slot = base + w;
+        if (gcopy[slot].sub_seq == sub_seq) {
+            if (gcopy[slot].addr == addr && gcopy[slot].size == size && gcopy[slot].span.ptr) {
+                if (gcopy[slot].gen == gcopy_gen) {
+                    stat_gcopy_hits++;
+                    return gcopy[slot].span;
+                }
+                if (!have_cur_h && size <= 4096) {
+                    cur_h = hash_words_fast(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size);
+                    have_cur_h = true;
+                }
+                uint32_t now_pt = 0;
+                int chg = size > 4096 ? vk_pages_changed(addr, size, gcopy[slot].pt_gen, &now_pt) : -1;
+                if ((size <= 4096 && cur_h == gcopy[slot].hash) || (size > 4096 && chg == 0)) {
+                    gcopy[slot].gen = gcopy_gen;
+                    gcopy[slot].seq = seq;
+                    if (now_pt) gcopy[slot].pt_gen = now_pt;
+                    stat_gcopy_hits++;
+                    return gcopy[slot].span;
+                }
+                empty_slot = slot;
+                break;
+            }
+        } else if (empty_slot == UINT32_MAX) {
+            empty_slot = slot;
         }
     }
+    uint32_t slot = empty_slot != UINT32_MAX ? empty_slot : base + ((set ^ (uint32_t)stat_gcopy_calls) & 1u);
     if (gcopy[slot].sub_seq != sub_seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     stat_cb_copied += size;
     uint32_t now_pt = 0;
     if (size > 4096) (void)vk_pages_changed(addr, size, 0, &now_pt);
+    if (!have_cur_h && size <= 4096)
+        cur_h = hash_words_fast(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size);
     gcopy[slot].addr = addr;
     gcopy[slot].size = size;
     gcopy[slot].seq = seq;
     gcopy[slot].sub_seq = sub_seq;
     gcopy[slot].gen = gcopy_gen;
-    gcopy[slot].hash = size <= 4096 ? hmix(1469598103934665603ull, (const void *)(uintptr_t)addr, (size_t)size) : 0;
+    gcopy[slot].hash = size <= 4096 ? cur_h : 0;
     gcopy[slot].pt_gen = now_pt;
     gcopy[slot].span = s;
     return s;
@@ -4999,6 +5050,18 @@ static void panefix_log(const char *why, const float *f) {
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
+        uint64_t size = si->cbuf_size[0] > 0x800 ? 0x800 : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
+        if (size < 0x500 && stage == 5) size = 0x500;
+        bool any_sbuf = (stage == 5);
+        if (!any_sbuf) {
+            for (int i = 0; i < 16; i++) {
+                if (st.sbuf[stage][i].addr || st.sbuf[stage][i].size) { any_sbuf = true; break; }
+            }
+        }
+        if (!any_sbuf) {
+            static const uint8_t zero_drv[0x800];
+            return ubo_span(copy_dedupe(stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, zero_drv, size, 256), size);
+        }
         uint32_t drv[0x800 / 4] = {0};
         if (stage == 5) {
             drv[0x200 / 4] = gx; drv[0x204 / 4] = gy; drv[0x208 / 4] = gz;
@@ -5017,8 +5080,6 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
         }
-        uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
-        if (size < 0x500 && stage == 5) size = 0x500;
         return ubo_span(copy_dedupe(stage == 5 ? DEDUPE_DRV_C : stage == 1 ? DEDUPE_DRV_F : DEDUPE_DRV_V, drv, size, 256), size);
     }
     if (k == 1) {  // compiler constants stored after the shader code
@@ -7598,17 +7659,33 @@ static VkDescriptorSet stage_set(VkCommandBuffer cb, VkPipelineBindPoint bp, Pro
 #endif
         } else if (b->binding == 18) {
 #ifdef __ANDROID__
-            float (*rs)[4] = rs_buf[sg];
+            static struct { uint64_t seq; float row0[4]; float mirror_w; int ntex; float sc[64][2]; VkSpan span; } rs_cache[2];
             int ntex = si->ntex < 64 ? si->ntex : 64;
-            rs[0][0] = rs[0][1] = 1;
-            rs[0][2] = rs[0][3] = 0;  // ([65]: mirror mode, renderer.m)
-            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
-            rs[65][0] = g_mirror_w;
-            for (int t = 0; t < ntex; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
-            if (ntex < rs_prev_ntex[sg])
-                memset(&rs[1 + ntex], 0, (size_t)(rs_prev_ntex[sg] - ntex) * sizeof rs_buf[0][0]);
-            rs_prev_ntex[sg] = ntex;
-            bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs_buf[sg], sizeof rs_buf[sg], 256), sizeof rs_buf[sg]);
+            uint64_t rs_seq = vk_pending_seq() ^ (desc_epoch << 40);
+            float r0[4] = {1, 1, 0, 0};
+            if (rscale_row0) memcpy(r0, rscale_row0, 16);
+            if (rs_cache[sg].seq == rs_seq && rs_cache[sg].ntex == ntex &&
+                rs_cache[sg].mirror_w == g_mirror_w &&
+                memcmp(rs_cache[sg].row0, r0, 16) == 0 &&
+                (!ntex || memcmp(rs_cache[sg].sc, tex_sc[sg], (size_t)ntex * sizeof(float[2])) == 0)) {
+                bi[n] = ubo_span(rs_cache[sg].span, sizeof rs_buf[sg]);
+            } else {
+                float (*rs)[4] = rs_buf[sg];
+                memcpy(rs[0], r0, 16);
+                rs[65][0] = g_mirror_w;
+                for (int t = 0; t < ntex; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
+                if (ntex < rs_prev_ntex[sg])
+                    memset(&rs[1 + ntex], 0, (size_t)(rs_prev_ntex[sg] - ntex) * sizeof rs_buf[0][0]);
+                rs_prev_ntex[sg] = ntex;
+                VkSpan sp = copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs_buf[sg], sizeof rs_buf[sg], 256);
+                rs_cache[sg].seq = rs_seq;
+                memcpy(rs_cache[sg].row0, r0, 16);
+                rs_cache[sg].mirror_w = g_mirror_w;
+                rs_cache[sg].ntex = ntex;
+                if (ntex) memcpy(rs_cache[sg].sc, tex_sc[sg], (size_t)ntex * sizeof(float[2]));
+                rs_cache[sg].span = sp;
+                bi[n] = ubo_span(sp, sizeof rs_buf[sg]);
+            }
 #else
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
@@ -10916,8 +10993,11 @@ void vk_execute_list_batch(uint64_t handle, bool force_submit) {
                          (batch_lists >= 128) ||
                          (batch_up_bytes >= (24ull << 20));
     if (should_submit) {
+        extern void vk_async_note_exec_submit_ns(uint64_t ns);
+        uint64_t sub_t0 = plat_now_ns();
         if (sync_submit) renderer_flush();
         else renderer_submit();
+        vk_async_note_exec_submit_ns(plat_now_ns() - sub_t0);
         batch_lists = 0;
         batch_start_draws = stat_draws;
         batch_start_upload_bytes = stat_upload_bytes;

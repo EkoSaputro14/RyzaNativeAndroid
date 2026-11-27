@@ -76,7 +76,9 @@ static int ahead = 1;
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;
 static uint64_t frame_idle_ns, frame_coalesce_ns;
 static uint64_t frame_spin_ns, frame_other_req_ns, frame_pre_present_ns;
+static uint64_t frame_exec_req_ns, frame_pres_req_ns, frame_exec_submit_ns, frame_ring_begin_ns, frame_post_present_ns;
 static uint64_t last_frame_other_req_ns, last_frame_pre_present_ns;
+static uint64_t last_frame_exec_req_ns, last_frame_pres_req_ns, last_frame_exec_submit_ns, last_frame_ring_begin_ns, last_frame_post_present_ns;
 static int active_req_type = -1;
 static uint64_t active_req_start_ns;
 uint64_t vk_async_frame_work_ns(void) { return __atomic_load_n(&last_frame_work, __ATOMIC_RELAXED); }
@@ -87,6 +89,9 @@ uint64_t vk_async_take_idle_ns(void) {
 }
 uint64_t vk_async_take_coalesce_ns(void) { return __atomic_exchange_n(&frame_coalesce_ns, 0, __ATOMIC_RELAXED); }
 void vk_async_note_pre_present_ns(uint64_t ns) { __atomic_fetch_add(&frame_pre_present_ns, ns, __ATOMIC_RELAXED); }
+void vk_async_note_exec_submit_ns(uint64_t ns) { __atomic_fetch_add(&frame_exec_submit_ns, ns, __ATOMIC_RELAXED); }
+void vk_async_note_ring_begin_ns(uint64_t ns) { __atomic_fetch_add(&frame_ring_begin_ns, ns, __ATOMIC_RELAXED); }
+void vk_async_note_post_present_ns(uint64_t ns) { __atomic_fetch_add(&frame_post_present_ns, ns, __ATOMIC_RELAXED); }
 int vk_async_render_tid(void) { return __atomic_load_n(&g_vk_render_tid, __ATOMIC_RELAXED); }
 
 void kernel_blocking_begin(void);        // kernel.c: core 0 to the game's other threads while a guest thread waits here
@@ -321,19 +326,33 @@ static void *render_main(void *arg) {
             vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
         uint64_t elapsed = plat_now_ns() - t0;
         __atomic_store_n(&active_req_type, -1, __ATOMIC_RELEASE);
-        if (r.type != REQ_EXEC && r.type != REQ_PRESENT) {
+        if (r.type == REQ_EXEC) {
+            __atomic_fetch_add(&frame_exec_req_ns, elapsed, __ATOMIC_RELAXED);
+        } else if (r.type == REQ_PRESENT) {
+            __atomic_fetch_add(&frame_pres_req_ns, elapsed, __ATOMIC_RELAXED);
+        } else {
             __atomic_fetch_add(&frame_other_req_ns, elapsed, __ATOMIC_RELAXED);
         }
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
         frame_work += elapsed;
         if (r.type == REQ_PRESENT) {
+            uint64_t exec_ns = __atomic_load_n(&frame_exec_req_ns, __ATOMIC_RELAXED);
+            uint64_t pres_ns = __atomic_load_n(&frame_pres_req_ns, __ATOMIC_RELAXED);
             uint64_t other_ns = __atomic_load_n(&frame_other_req_ns, __ATOMIC_RELAXED);
             uint64_t prep_ns = __atomic_load_n(&frame_pre_present_ns, __ATOMIC_RELAXED);
+            uint64_t sub_ns = __atomic_load_n(&frame_exec_submit_ns, __ATOMIC_RELAXED);
+            uint64_t ring_ns = __atomic_load_n(&frame_ring_begin_ns, __ATOMIC_RELAXED);
+            uint64_t post_ns = __atomic_load_n(&frame_post_present_ns, __ATOMIC_RELAXED);
             __atomic_store_n(&last_frame_work, frame_work, __ATOMIC_RELAXED);
             extern void plat_render_work(uint64_t work_ns, uint64_t target_ns);
             __atomic_store_n(&last_frame_cpu, frame_cpu, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_exec_req_ns, exec_ns, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_pres_req_ns, pres_ns, __ATOMIC_RELAXED);
             __atomic_store_n(&last_frame_other_req_ns, other_ns, __ATOMIC_RELAXED);
             __atomic_store_n(&last_frame_pre_present_ns, prep_ns, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_exec_submit_ns, sub_ns, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_ring_begin_ns, ring_ns, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_post_present_ns, post_ns, __ATOMIC_RELAXED);
             {
                 static uint64_t last_log_ns;
                 uint64_t now_ns = plat_now_ns();
@@ -343,16 +362,23 @@ static void *render_main(void *arg) {
                     uint64_t tot = __atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED);
                     uint64_t dedup = __atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED);
                     double pct = tot ? (100.0 * (double)dedup / (double)tot) : 0.0;
-                    LOG("[tex-reg] total=%llu dedup=%llu (%.1f%%) frame_cpu=%.1fms other_req=%.1fms pre_present=%.1fms\n",
+                    LOG("[tex-reg] total=%llu dedup=%llu (%.1f%%) frame_cpu=%.1fms exec_req=%.1fms(submit=%.1fms) pres_req=%.1fms(pre=%.1fms ring=%.1fms post=%.1fms) other_req=%.1fms\n",
                         (unsigned long long)tot, (unsigned long long)dedup, pct,
-                        frame_cpu / 1e6, other_ns / 1e6, prep_ns / 1e6);
+                        frame_cpu / 1e6, exec_ns / 1e6, sub_ns / 1e6,
+                        pres_ns / 1e6, prep_ns / 1e6, ring_ns / 1e6, post_ns / 1e6,
+                        other_ns / 1e6);
                 }
             }
             uint64_t report_ns = frame_work > frame_cpu ? frame_work : frame_cpu;
             plat_render_work(report_ns, 16666667ull);  // (ADPF: clocks for 60 fps on this thread too)
             frame_work = frame_cpu = 0;
+            __atomic_store_n(&frame_exec_req_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&frame_pres_req_ns, 0, __ATOMIC_RELAXED);
             __atomic_store_n(&frame_other_req_ns, 0, __ATOMIC_RELAXED);
             __atomic_store_n(&frame_pre_present_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&frame_exec_submit_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&frame_ring_begin_ns, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&frame_post_present_ns, 0, __ATOMIC_RELAXED);
         }
         pthread_mutex_lock(&q_lock);
         q_head += (uint64_t)(tex_batch_n > 0 ? tex_batch_n : 1);
@@ -578,12 +604,18 @@ void vk_async_drain(void) {
             uint64_t last_prep = __atomic_load_n(&last_frame_pre_present_ns, __ATOMIC_RELAXED);
             uint64_t other_ns = cur_other > last_other ? cur_other : last_other;
             uint64_t prep_ns = cur_prep > last_prep ? cur_prep : last_prep;
+            uint64_t exec_ns = __atomic_load_n(&last_frame_exec_req_ns, __ATOMIC_RELAXED);
+            uint64_t pres_ns = __atomic_load_n(&last_frame_pres_req_ns, __ATOMIC_RELAXED);
+            uint64_t sub_ns = __atomic_load_n(&last_frame_exec_submit_ns, __ATOMIC_RELAXED);
+            uint64_t ring_ns = __atomic_load_n(&last_frame_ring_begin_ns, __ATOMIC_RELAXED);
+            uint64_t post_ns = __atomic_load_n(&last_frame_post_present_ns, __ATOMIC_RELAXED);
             double act_ms = (act_type0 >= 0 && w0 >= act_t0) ? (double)(w0 - act_t0) / 1e6 : 0.0;
-            LOG("[async-diag] drain_ms=%.1f q_depth=%llu active_req=%d(elapsed=%.1fms) spin_ms=%.1f other_req_ms=%.1f pre_present_ms=%.1f render_cpu_ms=%.1f tex_reg=%llu(dedup=%llu) frame=%llu tid=%d\n",
+            LOG("[async-diag] drain_ms=%.1f q_depth=%llu active_req=%d(elapsed=%.1fms) spin_ms=%.1f other_req_ms=%.1f pre_present_ms=%.1f render_cpu_ms=%.1f exec=%.1f(sub=%.1f) pres=%.1f(ring=%.1f,post=%.1f) tex_reg=%llu(dedup=%llu) frame=%llu tid=%d\n",
                 wdt / 1e6, (unsigned long long)q_depth0, act_type0, act_ms,
                 __atomic_load_n(&frame_spin_ns, __ATOMIC_RELAXED) / 1e6,
                 other_ns / 1e6, prep_ns / 1e6,
                 __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED) / 1e6,
+                exec_ns / 1e6, sub_ns / 1e6, pres_ns / 1e6, ring_ns / 1e6, post_ns / 1e6,
                 (unsigned long long)__atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED),
                 (unsigned long long)__atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED),
                 (unsigned long long)renderer_present_count(),

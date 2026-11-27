@@ -256,11 +256,66 @@ static void test_retired_min_frame_and_canonical_view(void) {
     printf("  -> PASS: retired min_frame gating & NvnTextureView canonicalization verified.\n");
 }
 
+static inline uint64_t test_hash_words_fast(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h0 = h ^ 0x9E3779B97F4A7C15ull;
+    uint64_t h1 = h ^ 0xC2B2AE3D27D4EB4Full;
+    uint64_t h2 = h ^ 0x165667B19E3779F9ull;
+    uint64_t h3 = h ^ 0x85EBCA77C2B2AE63ull;
+    for (; n >= 32; n -= 32, b += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, b, 8);
+        memcpy(&w1, b + 8, 8);
+        memcpy(&w2, b + 16, 8);
+        memcpy(&w3, b + 24, 8);
+        h0 = (h0 ^ w0) * 0x9E3779B97F4A7C15ull; h0 ^= h0 >> 29;
+        h1 = (h1 ^ w1) * 0xC2B2AE3D27D4EB4Full; h1 ^= h1 >> 31;
+        h2 = (h2 ^ w2) * 0x100000001B3ull;       h2 ^= h2 >> 29;
+        h3 = (h3 ^ w3) * 0xFF51AFD7ED558CCDull;  h3 ^= h3 >> 33;
+    }
+    uint64_t res = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ h3;
+    for (; n >= 8; n -= 8, b += 8) {
+        uint64_t w;
+        memcpy(&w, b, 8);
+        res = (res ^ w) * 0x9E3779B97F4A7C15ull;
+        res ^= res >> 29;
+    }
+    for (; n; n--, b++) {
+        res = (res ^ *b) * 0x100000001B3ull;
+    }
+    return res ^ (res >> 32);
+}
+
+static void test_hash_words_fast_sensitivity(void) {
+    printf("[C-TEST 5/5] Testing 4-way hash_words_fast sensitivity across sizes 0..4096...\n");
+    uint8_t buf[4096];
+    for (size_t i = 0; i < sizeof(buf); i++) buf[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+
+    size_t sizes[] = {0, 1, 7, 8, 15, 31, 32, 33, 63, 64, 95, 256, 1024, 4096};
+    for (size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
+        size_t sz = sizes[si];
+        uint64_t base = test_hash_words_fast(1469598103934665603ull, buf, sz);
+        assert(base == test_hash_words_fast(1469598103934665603ull, buf, sz));
+        if (sz > 0) {
+            size_t probe_offsets[] = {0, sz / 2, sz - 1};
+            for (size_t pi = 0; pi < 3; pi++) {
+                size_t off = probe_offsets[pi];
+                buf[off] ^= 0x01u;
+                uint64_t mod = test_hash_words_fast(1469598103934665603ull, buf, sz);
+                buf[off] ^= 0x01u;
+                assert(mod != base);
+            }
+        }
+    }
+    printf("  -> PASS: hash_words_fast determinism & single-bit sensitivity verified.\n");
+}
+
 int main(void) {
     test_barrier_bits_classification();
     test_precompute_pipe_state_persistence();
     test_precompute_bounds_and_dedup();
     test_retired_min_frame_and_canonical_view();
+    test_hash_words_fast_sensitivity();
     printf("\n[SUCCESS] All Phase 1 Quick Win C tests passed!\n");
     return 0;
 }

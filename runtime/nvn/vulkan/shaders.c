@@ -264,7 +264,7 @@ static uint32_t *vk_glsl_to_spirv_ex(const char *src, int stage, const char *nam
 #ifdef __ANDROID__
     bool fp16_frag = (!force_fp32 && stage == STAGE_FRAGMENT && g_settings.fp16_shaders != 0);
     uint64_t h = vk_shader_source_hash(src, stage, optimized);
-    if (fp16_frag) h ^= 0x517cc1b727220a95ull;
+    if (fp16_frag) h ^= 0x517cc1b727220a96ull;  // v2: exclude OpFDiv, OpExtInst, OpVariable from RelaxedPrecision
     if (unreachable_fix) h ^= 0x9e3779b97f4a7c15ull;
     uint32_t api = g_vk.api ? g_vk.api : VK_API_VERSION_1_3;  // (0: no device yet - as 1.3)
     if (api < VK_API_VERSION_1_3) h ^= (uint64_t)api << 32;  // (older SPIR-V for a device below 1.3, below)
