@@ -151,11 +151,28 @@ uint64_t vk_submitted_seq(void) {
     return __atomic_load_n(&submit_seq, __ATOMIC_ACQUIRE);
 }
 
+static _Atomic uint64_t s_sem_val_ns, s_sem_val_calls;
+static _Atomic uint64_t s_sub_endp_ns, s_sub_slot_ns, s_sub_vc_ns, s_sub_endcb_ns, s_sub_qsub_ns, s_sub_retire_ns;
+
 uint64_t vk_completed_seq(void) {
     if (!g_vk.timeline) return 0;
     uint64_t v = 0;
+    uint64_t st0 = plat_now_ns();
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    atomic_fetch_add_explicit(&s_sem_val_ns, plat_now_ns() - st0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_sem_val_calls, 1, memory_order_relaxed);
     return v;
+}
+
+void vk_take_submit_breakdown(uint64_t out[8]) {
+    out[0] = atomic_exchange_explicit(&s_sub_endp_ns, 0, memory_order_relaxed);
+    out[1] = atomic_exchange_explicit(&s_sub_slot_ns, 0, memory_order_relaxed);
+    out[2] = atomic_exchange_explicit(&s_sub_vc_ns, 0, memory_order_relaxed);
+    out[3] = atomic_exchange_explicit(&s_sub_endcb_ns, 0, memory_order_relaxed);
+    out[4] = atomic_exchange_explicit(&s_sub_qsub_ns, 0, memory_order_relaxed);
+    out[5] = atomic_exchange_explicit(&s_sub_retire_ns, 0, memory_order_relaxed);
+    out[6] = atomic_exchange_explicit(&s_sem_val_ns, 0, memory_order_relaxed);
+    out[7] = atomic_exchange_explicit(&s_sem_val_calls, 0, memory_order_relaxed);
 }
 
 // (LARECOMP_VK_PROF) waits on the GPU by cause: the caller names it in wait_why just before waiting
@@ -1025,8 +1042,13 @@ void vk_gpuprof_report(void) {
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
+    uint64_t sb0 = plat_now_ns();
     vk_end_pass();
+    uint64_t sb1 = plat_now_ns();
     Sub *s = sub();
+    uint64_t sb2 = plat_now_ns();
+    atomic_fetch_add_explicit(&s_sub_endp_ns, sb1 - sb0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_sub_slot_ns, sb2 - sb1, memory_order_relaxed);
     if (!s->main_begun && !s->upload_begun && !wait && !signal) return;
     VkCommandBufferSubmitInfo cbs[2];
     int n = 0;
@@ -1034,6 +1056,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #ifdef __ANDROID__
     ga_flush_dirty();  // (the arena's CPU writes, before the GPU reads them)
 #endif
+    uint64_t sb3 = plat_now_ns();
     if (s->upload_begun) {
         vk_full_barrier(s->upload);  // uploads complete before anything in the main buffer reads them
         VK_CHECK(vkEndCommandBuffer(s->upload));
@@ -1051,6 +1074,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #endif
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
+    uint64_t sb4 = plat_now_ns();
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
                                      .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -1079,6 +1103,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         VK_CHECK(sr);
         if (prof) prof_submit += sub_dt;
     }
+    uint64_t sb5 = plat_now_ns();
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
 #ifdef __ANDROID__
@@ -1098,6 +1123,11 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     cum_submits++;
     ring_retire();
     vk_collect_dead();
+    uint64_t sb6 = plat_now_ns();
+    atomic_fetch_add_explicit(&s_sub_vc_ns, sb3 - sb2, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_sub_endcb_ns, sb4 - sb3, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_sub_qsub_ns, sb5 - sb4, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_sub_retire_ns, sb6 - sb5, memory_order_relaxed);
 }
 
 static bool list_had_fence;
@@ -1292,6 +1322,13 @@ void vk_ring_begin_frame(uint64_t frame_index) {
 }
 
 static void vk_transient_trim(bool aggressive) {
+    if (!aggressive) {
+        bool any_ovf = false;
+        for (int i = 0; i < RING_SLOTS; i++) {
+            if (i != g_ring.slot && g_ring.novf[i] > 0) { any_ovf = true; break; }
+        }
+        if (!any_ovf) return;
+    }
     uint64_t done = vk_completed_seq();
     for (int i = 0; i < RING_SLOTS; i++) {
         if (i == g_ring.slot) continue;

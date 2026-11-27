@@ -204,6 +204,7 @@ void vk_rp_forget_view(VkImageView v) {
 }
 
 // The framebuffers dropped with a full table, destroyed once the GPU is past them (textures.c vk_collect_dead)
+bool vk_rp_has_late(void) { return !g_vk.dyn_render && nlate > 0; }
 void vk_rp_collect(uint64_t done) {
     if (g_vk.dyn_render || !nlate) return;
     pthread_mutex_lock(&lock);

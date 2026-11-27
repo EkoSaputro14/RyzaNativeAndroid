@@ -413,7 +413,14 @@ bool vk_view_is_dead(VkImageView v) {
     return r;
 }
 
+extern bool vk_rp_has_late(void);
 void vk_collect_dead(void) {
+    DEAD_LOCK();
+    if (!ndead && !vk_rp_has_late()) {
+        DEAD_UNLOCK();
+        return;
+    }
+    DEAD_UNLOCK();
     uint64_t done = vk_completed_seq();
     DEAD_LOCK();
     int k = 0;

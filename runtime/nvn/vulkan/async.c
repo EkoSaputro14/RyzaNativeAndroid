@@ -354,19 +354,29 @@ static void *render_main(void *arg) {
             __atomic_store_n(&last_frame_ring_begin_ns, ring_ns, __ATOMIC_RELAXED);
             __atomic_store_n(&last_frame_post_present_ns, post_ns, __ATOMIC_RELAXED);
             {
-                static uint64_t last_log_ns;
+                static uint64_t last_log_ns, sub_diag_frames;
+                sub_diag_frames++;
                 uint64_t now_ns = plat_now_ns();
                 if (!last_log_ns || now_ns - last_log_ns >= 5000000000ull) {
                     last_log_ns = now_ns;
                     extern uint64_t g_tex_stat_reg, g_tex_stat_reg_dedup;
+                    extern void vk_take_submit_breakdown(uint64_t out[8]);
                     uint64_t tot = __atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED);
                     uint64_t dedup = __atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED);
                     double pct = tot ? (100.0 * (double)dedup / (double)tot) : 0.0;
+                    uint64_t sb[8] = {0};
+                    vk_take_submit_breakdown(sb);
+                    double fdiv = sub_diag_frames ? (double)sub_diag_frames : 1.0;
+                    sub_diag_frames = 0;
                     LOG("[tex-reg] total=%llu dedup=%llu (%.1f%%) frame_cpu=%.1fms exec_req=%.1fms(submit=%.1fms) pres_req=%.1fms(pre=%.1fms ring=%.1fms post=%.1fms) other_req=%.1fms\n",
                         (unsigned long long)tot, (unsigned long long)dedup, pct,
                         frame_cpu / 1e6, exec_ns / 1e6, sub_ns / 1e6,
                         pres_ns / 1e6, prep_ns / 1e6, ring_ns / 1e6, post_ns / 1e6,
                         other_ns / 1e6);
+                    LOG("[sub-diag] per_frame(n=%.0f): endp=%.1fms slot=%.1fms vc=%.1fms endcb=%.1fms qsub=%.1fms retire=%.1fms sem_val=%.1fms(%.1f calls)\n",
+                        fdiv, sb[0] / 1e6 / fdiv, sb[1] / 1e6 / fdiv, sb[2] / 1e6 / fdiv,
+                        sb[3] / 1e6 / fdiv, sb[4] / 1e6 / fdiv, sb[5] / 1e6 / fdiv,
+                        sb[6] / 1e6 / fdiv, sb[7] / fdiv);
                 }
             }
             uint64_t report_ns = frame_work > frame_cpu ? frame_work : frame_cpu;

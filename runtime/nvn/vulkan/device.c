@@ -1850,6 +1850,16 @@ void backend_present(NvnTexture *t) {
             if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
             if (*p == ',') p++; else break;
         }
+#ifdef __ANDROID__
+        if (!g_gpuprof_frame && (total_frames % 30) == 0) {
+            char trig[1100];
+            snprintf(trig, sizeof trig, "%s/gpuprof_once", rt_data_root());
+            if (access(trig, F_OK) == 0) {
+                unlink(trig);
+                g_gpuprof_frame = true;
+            }
+        }
+#endif
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
     {   // LARECOMP_CAM_PROJ=<hex address> (a widescreen test): a sead::PerspectiveProjection there (1.8.2's main camera
