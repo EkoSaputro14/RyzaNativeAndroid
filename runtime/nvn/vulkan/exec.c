@@ -151,6 +151,7 @@ static int naliases;
 
 static _Atomic uint64_t done_seq_cache;
 static _Atomic uint64_t cq_resolved_seq;
+static _Atomic uint32_t wb_busy_count;
 static pthread_mutex_t fence_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t fence_done_seq;
 
@@ -182,18 +183,25 @@ void vk_note_present_khr_ns(uint64_t ns) {
     atomic_fetch_add_explicit(&s_pres_khr_ns, ns, memory_order_relaxed);
 }
 
-// Poll per-submission VkFence completion with vkGetFenceStatus (non-blocking) instead of Turnip's blocking vkGetSemaphoreCounterValue.
-uint64_t vk_completed_seq(void) {
+uint64_t vk_completed_seq_cached(void) {
+    return atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+}
+
+uint64_t vk_poll_seq_upto(uint64_t max_seq) {
     if (!g_vk.timeline) return 0;
+    uint64_t cached = atomic_load_explicit(&done_seq_cache, memory_order_acquire);
+    if (!max_seq || cached >= max_seq) return cached;
     uint64_t st0 = plat_now_ns();
-    uint64_t v = 0;
+    uint64_t v = cached;
     if (g_vk.dev) {
         pthread_mutex_lock(&fence_lock);
-        for (;;) {
+        while (fence_done_seq < max_seq) {
             int best = -1;
             uint64_t min_seq = UINT64_MAX;
             for (int i = 0; i < SUBS; i++) {
-                if (subs[i].fence_state == FENCE_SUBMITTED && subs[i].fence_seq < min_seq) {
+                if (subs[i].fence_state == FENCE_SUBMITTED &&
+                    subs[i].fence_seq <= max_seq &&
+                    subs[i].fence_seq < min_seq) {
                     min_seq = subs[i].fence_seq;
                     best = i;
                 }
@@ -223,6 +231,20 @@ uint64_t vk_completed_seq(void) {
 #endif
     atomic_fetch_add_explicit(&s_sem_val_calls, 1, memory_order_relaxed);
     return v;
+}
+
+// Poll per-submission VkFence completion safely (capped below in-flight submissions on async Android).
+uint64_t vk_completed_seq(void) {
+    if (!g_vk.timeline) return 0;
+#ifdef __ANDROID__
+    extern bool vk_async_on(void);
+    if (vk_async_on()) {
+        uint64_t sub_cur = vk_submitted_seq();
+        uint64_t cap = sub_cur > 2 ? sub_cur - 2 : 0;
+        return vk_poll_seq_upto(cap);
+    }
+#endif
+    return vk_poll_seq_upto(vk_submitted_seq());
 }
 
 void vk_take_submit_breakdown(uint64_t out[8]) {
@@ -285,7 +307,7 @@ void vk_wait_seq(uint64_t seq) {
         }
         return;
     }
-    uint64_t cur = vk_completed_seq();
+    uint64_t cur = vk_poll_seq_upto(seq);
     if (seq <= cur) {
         wait_why = NULL;
         cq_resolve_done(cur);
@@ -443,7 +465,7 @@ double vk_frame_gpu_ms(void) {
 }
 
 void vk_pace_frame(void) {
-    {   // (write-backs of passes the GPU has finished since: the game may read them this frame)
+    if (atomic_load_explicit(&wb_busy_count, memory_order_acquire) > 0) {
         uint64_t v = vk_completed_seq();
         if (v) wb_apply(v);
     }
@@ -2365,7 +2387,7 @@ static uint64_t wb_max(void) {  // (LARECOMP_WRITEBACK_MAX=<bytes>: a larger lim
 #define WB_SMALL 128
 #define WB_BIG 32
 #define WB_SLOTS (WB_SMALL + WB_BIG)
-typedef struct { uint64_t seq, addr, pitch, off, order; uint32_t wb, hb, bpb, bh, fmt, size; bool busy; } WbEntry;  // (pitch: linear rows, 0: block-linear; off, size: its slot in wb_buf; order: when queued)
+typedef struct { uint64_t seq, addr, pitch, off, order; uint32_t wb, hb, bpb, bh, fmt, size; bool busy, raw_copy; } WbEntry;  // (pitch: linear rows, 0: block-linear; off, size: its slot in wb_buf; order: when queued)
 static WbEntry wb_ent[WB_SLOTS];
 static int wb_next_small, wb_next_big;
 static uint64_t wb_order;
@@ -2477,7 +2499,8 @@ static void wb_queue(NvnTexture *t) {
     *e = (WbEntry){.seq = submit_seq + 1, .addr = t->addr, .wb = l.wb, .hb = l.hb, .bpb = fi->bpb,
                    .pitch = (t->flags & 0x10) ? t->stride : (t->flags & 0x40) ? nvn_linear_rt_pitch((uint64_t)l.wb * fi->bpb) : 0,
                    .bh = l.block_height_log2, .fmt = t->format, .off = off, .size = small ? WB_MAX : WB_SLOT,
-                   .order = ++wb_order, .busy = true};
+                   .order = ++wb_order, .busy = true, .raw_copy = false};
+    atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
     atomic_store(&g_wb_seq, e->seq);
     pthread_mutex_unlock(&wb_lock);
     {   // LARECOMP_LOG_WB_FRAME=<n>: every write-back of every n-th frame - size, format, flags, submission (the frame's
@@ -2512,7 +2535,7 @@ static void wb_queue(NvnTexture *t) {
 }
 
 static void wb_apply(uint64_t done) {
-    if (!wb_ptr) return;
+    if (!wb_ptr || atomic_load_explicit(&wb_busy_count, memory_order_acquire) == 0) return;
     pthread_mutex_lock(&wb_lock);
     // In the order they were queued, not the slots': once the 128 small slots wrapped, a target written back twice
     // (a frame's and the next one's, both landed) took the older texels last - the water turned white and Link's feet
@@ -2528,7 +2551,9 @@ static void wb_apply(uint64_t done) {
     for (int r = 0; r < nready; r++) {
         WbEntry *e = &wb_ent[ready[r]];
         vmaInvalidateAllocation(g_vk.vma, wb_mem, (VkDeviceSize)e->off, e->size);
-        if (e->pitch)
+        if (e->raw_copy)
+            memcpy((uint8_t *)(uintptr_t)e->addr, wb_ptr + (size_t)e->off, e->size);
+        else if (e->pitch)
             for (uint32_t y = 0; y < e->hb; y++)
                 memcpy((uint8_t *)(uintptr_t)(e->addr + y * e->pitch), wb_ptr + (size_t)e->off + (size_t)y * e->wb * e->bpb, (size_t)e->wb * e->bpb);
         else tegra_swizzle(wb_ptr + (size_t)e->off, (uint8_t *)(uintptr_t)e->addr, e->wb, e->hb, 1, e->bpb, e->bh, 0);
@@ -2538,7 +2563,7 @@ static void wb_apply(uint64_t done) {
             if (on < 0) on = getenv("LARECOMP_LOG_WB_NAN") != NULL;
             static float p12[12][3], p1[3];
             const uint8_t *px = wb_ptr + (size_t)e->off;
-            if (on && e->fmt == 0x3f && e->hb == 1 && (e->wb == 12 || e->wb == 1)) {  // R11G11B10F
+            if (on && !e->raw_copy && e->fmt == 0x3f && e->hb == 1 && (e->wb == 12 || e->wb == 1)) {  // R11G11B10F
                 for (uint32_t k = 0; k < e->wb; k++) {
                     uint32_t v = ((const uint32_t *)px)[k];
                     uint32_t m[3] = {v & 63, (v >> 11) & 63, (v >> 22) & 31}, x[3] = {(v >> 6) & 31, (v >> 17) & 31, (v >> 27) & 31};
@@ -2557,7 +2582,7 @@ static void wb_apply(uint64_t done) {
                     }
                 }
             }
-            if (on && e->fmt == 0x5 && e->wb == 2 && e->hb == 2) {  // R16F: the previous image's luminance
+            if (on && !e->raw_copy && e->fmt == 0x5 && e->wb == 2 && e->hb == 2) {  // R16F: the previous image's luminance
                 const _Float16 *h = (const _Float16 *)px;
                 float avg = ((float)h[0] + (float)h[1] + (float)h[2] + (float)h[3]) / 4;
                 static uint64_t last;
@@ -2571,8 +2596,72 @@ static void wb_apply(uint64_t done) {
             }
         }
         e->busy = false;
+        atomic_fetch_sub_explicit(&wb_busy_count, 1, memory_order_release);
     }
     pthread_mutex_unlock(&wb_lock);
+}
+
+static bool wb_queue_raw_copy(VkCommandBuffer cb, VkImage srcimg, const VkBufferImageCopy *c_in,
+                              uint64_t dst, uint64_t total, const NvnTexture *t) {
+    if (!total || total > 65536 || total > WB_SLOT) return false;
+    pthread_mutex_lock(&wb_lock);
+    if (!wb_buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                 .size = (VkDeviceSize)WB_MAX * WB_SMALL + (VkDeviceSize)WB_SLOT * WB_BIG,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &wb_buf, &wb_mem, &info));
+        wb_ptr = info.pMappedData;
+    }
+    bool small = total <= WB_MAX;
+    int *next = small ? &wb_next_small : &wb_next_big;
+    int base = small ? 0 : WB_SMALL, count = small ? WB_SMALL : WB_BIG;
+    WbEntry *e = &wb_ent[base + *next];
+    if (e->busy) {
+        uint64_t seq = e->seq;
+        if (seq >= vk_pending_seq()) {
+            pthread_mutex_unlock(&wb_lock);
+            return false;
+        }
+        pthread_mutex_unlock(&wb_lock);
+        wait_why = "write-back slots full";
+        vk_wait_seq(seq);
+        wb_apply(seq);
+        pthread_mutex_lock(&wb_lock);
+        e = &wb_ent[base + *next];
+        if (e->busy) {
+            pthread_mutex_unlock(&wb_lock);
+            return false;
+        }
+    }
+    int slot = *next;
+    *next = (*next + 1) % count;
+    uint64_t off = small ? (uint64_t)slot * WB_MAX : (uint64_t)WB_MAX * WB_SMALL + (uint64_t)slot * WB_SLOT;
+    *e = (WbEntry){.seq = submit_seq + 1, .addr = dst, .off = off, .size = (uint32_t)total,
+                   .fmt = t ? t->format : 0, .order = ++wb_order, .busy = true, .raw_copy = true};
+    atomic_store(&g_wb_seq, e->seq);
+    atomic_fetch_add_explicit(&wb_busy_count, 1, memory_order_release);
+    pthread_mutex_unlock(&wb_lock);
+
+    VkBufferImageCopy c = *c_in;
+    c.bufferOffset = (VkDeviceSize)off;
+    vkCmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, wb_buf, 1, &c);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    static int nraw;
+    if (nraw++ < 5) {
+        LOG("[vk] async tex->buf readback %ux%u f%#x %llu bytes -> %llx (seq %llu)\n",
+            t ? t->width : 0, t ? t->height : 0, t ? t->format : 0,
+            (unsigned long long)total, (unsigned long long)dst, (unsigned long long)e->seq);
+    }
+    return true;
 }
 
 TexBackend *g_dump_sampled;  // (LARECOMP_DUMP_SAMPLED: the texture to dump after the pass)
@@ -7629,6 +7718,7 @@ void vk_exec_reset(void) {
 #endif
     pthread_mutex_lock(&wb_lock);
     for (int i = 0; i < WB_SLOTS; i++) wb_ent[i].busy = false;
+    atomic_store_explicit(&wb_busy_count, 0, memory_order_release);
     pthread_mutex_unlock(&wb_lock);
     pthread_mutex_lock(&cq_lock);
     for (int i = 0; i < SUBS; i++) { cq[i].n = 0; cq[i].ts = false; }
@@ -10033,6 +10123,24 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     bool array = b->layers > 1 && b->depth == 1;
     uint32_t nz = (uint32_t)rg[5];
     uint64_t total = img * nz;
+#ifdef __ANDROID__
+    static int sync_rb = -1;
+    if (sync_rb < 0) sync_rb = getenv("LARECOMP_SYNC_READBACK") != NULL ? 1 : 0;
+    if (!sync_rb && !small_mem && g_settings.sync_lag >= 1 && total > 0 && total <= 65536) {
+        VkBufferImageCopy c = {.bufferOffset = 0, .bufferRowLength = (uint32_t)(row / fi->bpb) * fi->bw,
+                               .bufferImageHeight = (uint32_t)(img / row) * fi->bh,
+                               .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect,
+                                                    (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
+                               .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
+                               .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
+        if (wb_queue_raw_copy(cb, srcimg, &c, dst, total, t)) return;
+    }
+    static int nsync_rb;
+    if (nsync_rb++ < 5) {
+        LOG("[vk] sync tex->buf readback %ux%u f%#x %llu bytes (scaled=%d)\n",
+            t->width, t->height, t->format, (unsigned long long)total, small_mem != NULL);
+    }
+#endif
     VkSpan out = vk_readback(total);
     VkBufferImageCopy c = {.bufferOffset = out.off, .bufferRowLength = (uint32_t)(row / fi->bpb) * fi->bw,
                            .bufferImageHeight = (uint32_t)(img / row) * fi->bh,

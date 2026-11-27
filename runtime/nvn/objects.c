@@ -308,6 +308,8 @@ uint64_t vk_async_last_queued_id(void);
 int vk_async_render_tid(void);
 uint64_t vk_submitted_seq(void);
 uint64_t vk_completed_seq(void);
+uint64_t vk_completed_seq_cached(void);
+uint64_t vk_poll_seq_upto(uint64_t max_seq);
 void renderer_wait_seq(uint64_t seq);
 void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view);
 void vk_async_smp_reg(NvnDescPool *d, int id, const NvnSamplerDesc *desc);
@@ -319,7 +321,7 @@ void vk_sync_wait_enter(void);
 void vk_sync_wait_leave(void);
 NVN(nvnQueueFinish) {
     uint64_t sub_seq_init = vk_submitted_seq();
-    uint64_t done_seq_init = vk_completed_seq();
+    uint64_t done_seq_init = vk_completed_seq_cached();
     // Fast path: only return immediately (0 ms) when there are NO unsubmitted commands,
     // NO queued async render requests, AND all submitted GPU work is already complete.
     if (!vk_has_pending_commands() &&
@@ -331,18 +333,66 @@ NVN(nvnQueueFinish) {
     vk_sync_wait_enter();
     extern uint64_t renderer_present_count(void);
     uint64_t frame_id = renderer_present_count();
-    // Drain queued async commands and flush any open batched command buffer before waiting on GPU.
-    // Note: vk_async_drain() handles its own kernel_blocking_begin/end internally.
-    if (vk_async_on()) {
-        vk_async_drain();
-    } else if (vk_has_pending_commands()) {
-        vk_flush_pending_work();
+    static int env_finish_lag = -2;
+    if (env_finish_lag == -2) {
+        const char *e = getenv("LARECOMP_FINISH_LAG");
+        env_finish_lag = e ? atoi(e) : -1;
     }
-    uint64_t t1 = plat_now_ns();
-    uint64_t sub_seq = vk_submitted_seq();
-    if (sub_seq && vk_completed_seq() < sub_seq) {
+    int finish_lag = env_finish_lag >= 0 ? env_finish_lag : g_settings.sync_lag;
+    static pthread_mutex_t finish_lag_lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t prev_finish_frame = ~0ull;
+    static uint64_t prev_finish_seq = 0;
+    extern bool vk_gmem_placed(void);
+    bool can_pipeline = vk_async_on() && finish_lag >= 1 && !vk_gmem_placed() &&
+                        g_settings.gpu_writeback == 0 && frame_id >= 30;
+    bool use_lag = false;
+    uint64_t lag_target = 0;
+    if (can_pipeline) {
+        pthread_mutex_lock(&finish_lag_lock);
+        if (frame_id != prev_finish_frame && prev_finish_seq > 0) {
+            prev_finish_frame = frame_id;
+            lag_target = prev_finish_seq;
+            use_lag = true;
+        } else if (frame_id != prev_finish_frame) {
+            prev_finish_frame = frame_id;
+        }
+        pthread_mutex_unlock(&finish_lag_lock);
+    }
+    uint64_t t1 = 0;
+    uint64_t target_seq = 0;
+    if (use_lag) {
+        uint64_t qid = vk_async_last_queued_id();
+        if (qid && !vk_async_is_done(qid)) {
+            kernel_blocking_begin();
+            vk_async_wait_id(qid);
+            kernel_blocking_end();
+        }
+        t1 = plat_now_ns();
+        uint64_t cur_sub = vk_submitted_seq();
+        pthread_mutex_lock(&finish_lag_lock);
+        if (cur_sub > prev_finish_seq) prev_finish_seq = cur_sub;
+        pthread_mutex_unlock(&finish_lag_lock);
+        if (lag_target > cur_sub) lag_target = cur_sub;
+        target_seq = lag_target;
+    } else {
+        // Drain queued async commands and flush any open batched command buffer before waiting on GPU.
+        // Note: vk_async_drain() handles its own kernel_blocking_begin/end internally.
+        if (vk_async_on()) {
+            vk_async_drain();
+        } else if (vk_has_pending_commands()) {
+            vk_flush_pending_work();
+        }
+        t1 = plat_now_ns();
+        target_seq = vk_submitted_seq();
+        if (target_seq) {
+            pthread_mutex_lock(&finish_lag_lock);
+            if (target_seq > prev_finish_seq) prev_finish_seq = target_seq;
+            pthread_mutex_unlock(&finish_lag_lock);
+        }
+    }
+    if (target_seq && vk_poll_seq_upto(target_seq) < target_seq) {
         kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
-        renderer_wait_seq(sub_seq);
+        renderer_wait_seq(target_seq);
         kernel_blocking_end();
     }
     uint64_t t_end = plat_now_ns();
@@ -351,7 +401,7 @@ NVN(nvnQueueFinish) {
     uint64_t dt = t_end - t0;
     vk_record_nvn_sync_wait(dt);
     stall_record_nvn_sync_call("nvnQueueFinish", frame_id, t0, t1, t_end,
-                               c ? c->x[30] : 0, -1, 0, sub_seq, sub_seq, vk_completed_seq());
+                               c ? c->x[30] : 0, -1, 0, target_seq, vk_submitted_seq(), vk_completed_seq_cached());
     if (dt >= 5000000ull) {
         stall_record_wait_event(frame_id, t0, t_end, "nvn", "nvnQueueFinish",
                                 vk_async_render_tid(), "vk-render", NULL);
@@ -419,13 +469,16 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         if (vk_async_on()) {
             if (vk_async_is_done(s->lseq)) {
                 uint64_t sseq = s->seq;
-                if (!sseq || vk_completed_seq() >= sseq) signaled = true;
+                uint64_t done = (timeout_ns == 0 && sseq >= vk_submitted_seq())
+                                    ? vk_completed_seq_cached()
+                                    : vk_poll_seq_upto(sseq);
+                if (!sseq || done >= sseq) signaled = true;
             }
         } else
 #endif
         {
             uint64_t sseq = s->seq;
-            if (!sseq || vk_completed_seq() >= sseq) signaled = true;
+            if (!sseq || vk_poll_seq_upto(sseq) >= sseq) signaled = true;
         }
 
         if (signaled) {
@@ -600,7 +653,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
                                    frame_id, t0, t1, t_end_sync,
                                    c ? c->x[30] : 0, (int64_t)A(1),
                                    so ? so->lseq : 0, so ? so->seq : 0,
-                                   vk_submitted_seq(), vk_completed_seq());
+                                   vk_submitted_seq(), vk_completed_seq_cached());
         if (sync_dt >= 5000000ull) {
             stall_record_wait_event(frame_id, t0, t_end_sync, "nvn",
                                     (flush || whole) ? "nvnSyncWait_drain" : "nvnSyncWait",
