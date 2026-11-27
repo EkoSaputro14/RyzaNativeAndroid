@@ -53,10 +53,13 @@ typedef struct {
 
 #define QN 4096  // requests in flight (a frame has a few dozen)
 static Req q[QN];
+static AsyncTexReg q_tex[QN];
 static uint64_t q_head, q_tail;   // q_tail: next id to queue (ids start at 1), q_head: next to run
 static uint64_t q_done;           // the last id the render thread finished
 static int q_presents;            // PRESENT requests queued and not finished (the game's lead)
-static int q_waiters;             // number of guest threads currently waiting in vk_async_wait_id / vk_async_drain
+static int q_waiters;             // number of guest threads currently waiting in vk_async_wait_id
+static int q_push_waiters;        // number of guest threads waiting on ring space / ahead cap in push_inner
+static bool q_render_sleeping;    // true only while render_main sleeps in pthread_cond_wait(&q_more, &q_lock)
 static pthread_mutex_t q_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_more = PTHREAD_COND_INITIALIZER, q_less = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t p_lock = PTHREAD_MUTEX_INITIALIZER;  // producers: an id, its list's fences and its push together
@@ -73,6 +76,7 @@ static int ahead = 1;
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;
 static uint64_t frame_idle_ns, frame_coalesce_ns;
 static uint64_t frame_spin_ns, frame_other_req_ns, frame_pre_present_ns;
+static uint64_t last_frame_other_req_ns, last_frame_pre_present_ns;
 static int active_req_type = -1;
 static uint64_t active_req_start_ns;
 uint64_t vk_async_frame_work_ns(void) { return __atomic_load_n(&last_frame_work, __ATOMIC_RELAXED); }
@@ -234,7 +238,9 @@ static void *render_main(void *arg) {
                 if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) continue;
             }
             uint64_t w0 = plat_now_ns();
+            q_render_sleeping = true;
             pthread_cond_wait(&q_more, &q_lock);
+            q_render_sleeping = false;
             uint64_t w1 = plat_now_ns();
             __atomic_fetch_add(&frame_idle_ns, w1 - w0, __ATOMIC_RELAXED);
             if (w1 - w0 >= 5000000ull) {
@@ -243,6 +249,9 @@ static void *render_main(void *arg) {
             }
         }
         Req r = q[q_head % QN];
+        AsyncTexReg tex_batch[64];
+        int tex_batch_n = 0;
+        uint64_t batch_last_id = r.id;
         bool next_needs_submit = false;
         if (r.type == REQ_EXEC) {
             for (uint64_t scan = q_head + 1; scan < q_tail; scan++) {
@@ -250,6 +259,15 @@ static void *render_main(void *arg) {
                 if (nt == REQ_TEX_REG || nt == REQ_SMP_REG || nt == REQ_FENCE) continue;
                 next_needs_submit = (nt == REQ_PRESENT) || (nt == REQ_FLUSH && q[scan % QN].a == 0);
                 break;
+            }
+        } else if (r.type == REQ_TEX_REG) {
+            uint64_t avail = q_tail - q_head;
+            if (avail > 64) avail = 64;
+            for (uint64_t i = 0; i < avail; i++) {
+                const Req *qi = &q[(q_head + i) % QN];
+                if (qi->type != REQ_TEX_REG) break;
+                tex_batch[tex_batch_n++] = q_tex[(q_head + i) % QN];
+                batch_last_id = qi->id;
             }
         }
         pthread_mutex_unlock(&q_lock);
@@ -284,10 +302,9 @@ static void *render_main(void *arg) {
             if (!fseq) fseq = vk_submitted_seq();
             nvn_sync_set_seq(r.a, fseq);
         } else if (r.type == REQ_TEX_REG) {
-            AsyncTexReg *tr = (AsyncTexReg *)r.p;
-            if (tr) {
+            for (int i = 0; i < tex_batch_n; i++) {
+                const AsyncTexReg *tr = &tex_batch[i];
                 nvn_async_apply_tex_reg(tr->pool, tr->id, tr->tex, &tr->view, tr->has_view);
-                free(tr);
             }
         } else if (r.type == REQ_SMP_REG) {
             AsyncSmpReg *sr = (AsyncSmpReg *)r.p;
@@ -310,9 +327,27 @@ static void *render_main(void *arg) {
         frame_cpu += cpu_timing ? render_cpu_ns() - cpu0 : elapsed;
         frame_work += elapsed;
         if (r.type == REQ_PRESENT) {
+            uint64_t other_ns = __atomic_load_n(&frame_other_req_ns, __ATOMIC_RELAXED);
+            uint64_t prep_ns = __atomic_load_n(&frame_pre_present_ns, __ATOMIC_RELAXED);
             __atomic_store_n(&last_frame_work, frame_work, __ATOMIC_RELAXED);
             extern void plat_render_work(uint64_t work_ns, uint64_t target_ns);
             __atomic_store_n(&last_frame_cpu, frame_cpu, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_other_req_ns, other_ns, __ATOMIC_RELAXED);
+            __atomic_store_n(&last_frame_pre_present_ns, prep_ns, __ATOMIC_RELAXED);
+            {
+                static uint64_t last_log_ns;
+                uint64_t now_ns = plat_now_ns();
+                if (!last_log_ns || now_ns - last_log_ns >= 5000000000ull) {
+                    last_log_ns = now_ns;
+                    extern uint64_t g_tex_stat_reg, g_tex_stat_reg_dedup;
+                    uint64_t tot = __atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED);
+                    uint64_t dedup = __atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED);
+                    double pct = tot ? (100.0 * (double)dedup / (double)tot) : 0.0;
+                    LOG("[tex-reg] total=%llu dedup=%llu (%.1f%%) frame_cpu=%.1fms other_req=%.1fms pre_present=%.1fms\n",
+                        (unsigned long long)tot, (unsigned long long)dedup, pct,
+                        frame_cpu / 1e6, other_ns / 1e6, prep_ns / 1e6);
+                }
+            }
             uint64_t report_ns = frame_work > frame_cpu ? frame_work : frame_cpu;
             plat_render_work(report_ns, 16666667ull);  // (ADPF: clocks for 60 fps on this thread too)
             frame_work = frame_cpu = 0;
@@ -320,15 +355,18 @@ static void *render_main(void *arg) {
             __atomic_store_n(&frame_pre_present_ns, 0, __ATOMIC_RELAXED);
         }
         pthread_mutex_lock(&q_lock);
-        q_head++;
+        q_head += (uint64_t)(tex_batch_n > 0 ? tex_batch_n : 1);
+        if (tex_batch_n > 0) r.id = batch_last_id;
         __atomic_store_n(&q_done, r.id, __ATOMIC_RELEASE);
         if (r.type == REQ_PRESENT) q_presents--;
-        pthread_cond_broadcast(&q_less);
+        if (__atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0 || q_push_waiters > 0) {
+            pthread_cond_broadcast(&q_less);
+        }
     }
     return NULL;
 }
 
-static uint64_t push(int type, uint64_t a, void *p) {
+static uint64_t push_inner(int type, uint64_t a, void *p, const AsyncTexReg *tr) {
     pthread_mutex_lock(&q_lock);
     if (!g_vk_render_started) {
         g_vk_render_started = true;
@@ -341,7 +379,9 @@ static uint64_t push(int type, uint64_t a, void *p) {
         uint64_t w0 = plat_now_ns();
         kernel_blocking_begin();
         pthread_mutex_lock(&q_lock);
+        q_push_waiters++;
         while (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= max_ahead)) pthread_cond_wait(&q_less, &q_lock);
+        q_push_waiters--;
         pthread_mutex_unlock(&q_lock);
         kernel_blocking_end();
         uint64_t w1 = plat_now_ns();
@@ -357,12 +397,18 @@ static uint64_t push(int type, uint64_t a, void *p) {
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);
         vk_tl(type == REQ_EXEC ? "game: list sent" : type == REQ_PRESENT ? "game: present sent" : "game: fence sent", id, 0);
     }
-    q[(id - 1) % QN] = (Req){type, a, p, id};
+    uint64_t slot = (id - 1) % QN;
+    q[slot] = (Req){type, a, p, id};
+    if (tr) q_tex[slot] = *tr;
     __atomic_store_n(&q_tail, id, __ATOMIC_RELEASE);
     if (type == REQ_PRESENT) q_presents++;
-    pthread_cond_signal(&q_more);
+    if (q_render_sleeping) pthread_cond_signal(&q_more);
     pthread_mutex_unlock(&q_lock);
     return id;
+}
+
+static uint64_t push(int type, uint64_t a, void *p) {
+    return push_inner(type, a, p, NULL);
 }
 
 // Until the render thread has finished request `id` (0: nothing to wait for).
@@ -525,13 +571,21 @@ void vk_async_drain(void) {
     if (wdt >= 50000000ull) {
         static uint64_t drain_logs;
         if (drain_logs++ < 60 || (drain_logs & 15u) == 0) {
+            extern uint64_t g_tex_stat_reg, g_tex_stat_reg_dedup;
+            uint64_t cur_other = __atomic_load_n(&frame_other_req_ns, __ATOMIC_RELAXED);
+            uint64_t last_other = __atomic_load_n(&last_frame_other_req_ns, __ATOMIC_RELAXED);
+            uint64_t cur_prep = __atomic_load_n(&frame_pre_present_ns, __ATOMIC_RELAXED);
+            uint64_t last_prep = __atomic_load_n(&last_frame_pre_present_ns, __ATOMIC_RELAXED);
+            uint64_t other_ns = cur_other > last_other ? cur_other : last_other;
+            uint64_t prep_ns = cur_prep > last_prep ? cur_prep : last_prep;
             double act_ms = (act_type0 >= 0 && w0 >= act_t0) ? (double)(w0 - act_t0) / 1e6 : 0.0;
-            LOG("[async-diag] drain_ms=%.1f q_depth=%llu active_req=%d(elapsed=%.1fms) spin_ms=%.1f other_req_ms=%.1f pre_present_ms=%.1f render_cpu_ms=%.1f frame=%llu tid=%d\n",
+            LOG("[async-diag] drain_ms=%.1f q_depth=%llu active_req=%d(elapsed=%.1fms) spin_ms=%.1f other_req_ms=%.1f pre_present_ms=%.1f render_cpu_ms=%.1f tex_reg=%llu(dedup=%llu) frame=%llu tid=%d\n",
                 wdt / 1e6, (unsigned long long)q_depth0, act_type0, act_ms,
                 __atomic_load_n(&frame_spin_ns, __ATOMIC_RELAXED) / 1e6,
-                __atomic_load_n(&frame_other_req_ns, __ATOMIC_RELAXED) / 1e6,
-                __atomic_load_n(&frame_pre_present_ns, __ATOMIC_RELAXED) / 1e6,
+                other_ns / 1e6, prep_ns / 1e6,
                 __atomic_load_n(&last_frame_cpu, __ATOMIC_RELAXED) / 1e6,
+                (unsigned long long)__atomic_load_n(&g_tex_stat_reg, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&g_tex_stat_reg_dedup, __ATOMIC_RELAXED),
                 (unsigned long long)renderer_present_count(),
                 stall_thread_tid());
         }
@@ -635,16 +689,15 @@ uint64_t vk_async_fence(uint64_t guest_sync) {
 }
 
 void vk_async_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTextureView *view, bool has_view) {
-    AsyncTexReg *tr = malloc(sizeof *tr);
-    if (!tr) FATAL("vk: out of memory for async tex reg\n");
-    tr->pool = d;
-    tr->id = id;
-    tr->tex = t;
-    tr->has_view = has_view;
-    if (has_view && view) tr->view = *view;
-    else memset(&tr->view, 0, sizeof tr->view);
+    AsyncTexReg tr;
+    tr.pool = d;
+    tr.id = id;
+    tr.tex = t;
+    tr.has_view = has_view;
+    if (has_view && view) tr.view = *view;
+    else memset(&tr.view, 0, sizeof tr.view);
     pthread_mutex_lock(&p_lock);
-    push(REQ_TEX_REG, 0, tr);
+    push_inner(REQ_TEX_REG, 0, NULL, &tr);
     pthread_mutex_unlock(&p_lock);
 }
 

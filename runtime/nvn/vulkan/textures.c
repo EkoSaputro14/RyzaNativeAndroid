@@ -641,7 +641,7 @@ int vk_texture_count(void) {
     static int log_diag = -1;
     if (log_diag < 0) log_diag = getenv("LARECOMP_LOG_TEXDIAG") ? 1 : 0;
     if (log_diag) {
-        extern uint64_t g_tex_stat_init, g_tex_stat_reinit, g_tex_stat_reused, g_tex_stat_fin_owner, g_tex_stat_fin_copy, g_tex_stat_reg;
+        extern uint64_t g_tex_stat_init, g_tex_stat_reinit, g_tex_stat_reused, g_tex_stat_fin_owner, g_tex_stat_fin_copy, g_tex_stat_reg, g_tex_stat_reg_dedup;
         int fin_held = 0, dup_addr = 0, gpu_own = 0, upl = 0;
         for (int i = 0; i < g_nlive; i++) {
             NvnTexture *t = g_live[i];
@@ -653,11 +653,11 @@ int vk_texture_count(void) {
                 if (g_live[j]->addr && g_live[j]->addr == t->addr) { dup_addr++; break; }
             }
         }
-        LOG("[tex-diag] live_vk=%d (fin_held=%d dup_addr=%d gpu_own=%d upl=%d) init=%llu reused=%llu reinit=%llu fin_own=%llu fin_copy=%llu reg=%llu\n",
+        LOG("[tex-diag] live_vk=%d (fin_held=%d dup_addr=%d gpu_own=%d upl=%d) init=%llu reused=%llu reinit=%llu fin_own=%llu fin_copy=%llu reg=%llu dedup=%llu\n",
             g_nlive, fin_held, dup_addr, gpu_own, upl,
             (unsigned long long)g_tex_stat_init, (unsigned long long)g_tex_stat_reused, (unsigned long long)g_tex_stat_reinit,
             (unsigned long long)g_tex_stat_fin_owner, (unsigned long long)g_tex_stat_fin_copy,
-            (unsigned long long)g_tex_stat_reg);
+            (unsigned long long)g_tex_stat_reg, (unsigned long long)g_tex_stat_reg_dedup);
         extern uint64_t g_tex_drain_ns, g_tex_drains;
         LOG("[tex-diag] slot replacements waited for the render thread: %llu, %.1f ms in all\n",
             (unsigned long long)__atomic_exchange_n(&g_tex_drains, 0, __ATOMIC_RELAXED),

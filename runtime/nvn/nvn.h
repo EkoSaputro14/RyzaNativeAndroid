@@ -1,6 +1,7 @@
 // NVN implemented on the host. Guest NVN objects hold a pointer to a host object at offset 0;
 // builders and small state objects store their fields directly in guest memory.
 #pragma once
+#include <pthread.h>
 #include "../hle.h"
 #include "tegra.h"
 
@@ -72,8 +73,10 @@ typedef struct {
 typedef struct NvnDescPool {
     uint64_t addr;
     int count;
-    void *entries;     // NvnTexEntry[] or NvnSamplerDesc[] (render-thread owned when async)
-    void *shadow_smp;  // NvnSamplerDesc[] guest-side dedup shadow for sampler pools
+    void *entries;         // NvnTexEntry[] or NvnSamplerDesc[] (render-thread owned when async)
+    void *shadow_smp;      // NvnSamplerDesc[] guest-side dedup shadow for sampler pools
+    void *shadow_tex;      // NvnTexEntry[] guest-side dedup shadow for texture pools
+    pthread_mutex_t lock;  // serializes shadow_tex updates with async enqueue
     struct NvnDescPool *next;  // all descriptor allocations of this boot
 } NvnDescPool;
 

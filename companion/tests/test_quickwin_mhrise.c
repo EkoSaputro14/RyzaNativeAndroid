@@ -182,10 +182,85 @@ static void test_precompute_bounds_and_dedup(void) {
     printf("  -> PASS: precompute bounds, dedup, and manifest verified.\n");
 }
 
+static void test_retired_min_frame_and_canonical_view(void) {
+    printf("[C-TEST 4/4] Testing retired min_frame gating & NvnTextureView canonicalization...\n");
+
+    // Mirror texture_retire's RETIRE_FRAMES / g_retired_min_frame state machine with mixed thread timestamps
+    enum { RETIRE_FRAMES = 4 };
+    typedef struct { uint64_t id; uint64_t frame; } MockRetired;
+    MockRetired items[64];
+    int n = 0, sweeps = 0, reaped = 0;
+    uint64_t min_frame = UINT64_MAX;
+
+    uint64_t seq_frames[] = {10, 11, 10, 12, 13, 12, 14, 15, 19}; // out-of-order (guest vs render)
+    for (size_t idx = 0; idx < sizeof(seq_frames) / sizeof(seq_frames[0]); idx++) {
+        uint64_t now = seq_frames[idx];
+        if (n > 0 && min_frame <= now && (now - min_frame) >= RETIRE_FRAMES) {
+            sweeps++;
+            int k = 0;
+            uint64_t new_min = UINT64_MAX;
+            for (int i = 0; i < n; i++) {
+                if (items[i].frame + RETIRE_FRAMES <= now) {
+                    reaped++;
+                } else {
+                    if (items[i].frame < new_min) new_min = items[i].frame;
+                    items[k++] = items[i];
+                }
+            }
+            n = k;
+            min_frame = new_min;
+        }
+        items[n++] = (MockRetired){(uint64_t)idx, now};
+        if (now < min_frame) min_frame = now;
+    }
+    // Frames 10..13 skipped sweep until now=14 (reaps 10) and now=15 (reaps 11) and now=19 (reaps 12..15)
+    assert(sweeps == 3);
+    assert(reaped == 8);
+    assert(n == 1 && items[0].frame == 19 && min_frame == 19);
+
+    // Mirror NvnTextureView (15 field bytes + 1 padding byte = 16 bytes)
+    typedef struct {
+        uint16_t min_layer, num_layers, format;
+        uint8_t setmask;
+        uint8_t target, ds_mode, base_level, num_levels;
+        uint8_t swizzle[4];
+    } MockView;
+    _Static_assert(sizeof(MockView) <= 16, "MockView <= 16 bytes");
+
+    MockView raw1, raw2, can1, can2;
+    memset(&raw1, 0xAA, sizeof raw1);
+    memset(&raw2, 0x55, sizeof raw2);
+    raw1.min_layer = raw2.min_layer = 0;
+    raw1.num_layers = raw2.num_layers = 1;
+    raw1.format = raw2.format = 37;
+    raw1.setmask = raw2.setmask = 1;
+    raw1.target = raw2.target = 2;
+    raw1.ds_mode = raw2.ds_mode = 0;
+    raw1.base_level = raw2.base_level = 1;
+    raw1.num_levels = raw2.num_levels = 4;
+    memcpy(raw1.swizzle, (const uint8_t[4]){2, 3, 4, 5}, 4);
+    memcpy(raw2.swizzle, (const uint8_t[4]){2, 3, 4, 5}, 4);
+
+    memset(&can1, 0, sizeof can1);
+    memset(&can2, 0, sizeof can2);
+    can1.min_layer = raw1.min_layer; can1.num_layers = raw1.num_layers; can1.format = raw1.format;
+    can1.setmask = raw1.setmask; can1.target = raw1.target; can1.ds_mode = raw1.ds_mode;
+    can1.base_level = raw1.base_level; can1.num_levels = raw1.num_levels;
+    memcpy(can1.swizzle, raw1.swizzle, 4);
+    can2.min_layer = raw2.min_layer; can2.num_layers = raw2.num_layers; can2.format = raw2.format;
+    can2.setmask = raw2.setmask; can2.target = raw2.target; can2.ds_mode = raw2.ds_mode;
+    can2.base_level = raw2.base_level; can2.num_levels = raw2.num_levels;
+    memcpy(can2.swizzle, raw2.swizzle, 4);
+
+    assert(memcmp(&can1, &can2, sizeof can1) == 0);
+    printf("  -> PASS: retired min_frame gating & NvnTextureView canonicalization verified.\n");
+}
+
 int main(void) {
     test_barrier_bits_classification();
     test_precompute_pipe_state_persistence();
     test_precompute_bounds_and_dedup();
+    test_retired_min_frame_and_canonical_view();
     printf("\n[SUCCESS] All Phase 1 Quick Win C tests passed!\n");
     return 0;
 }

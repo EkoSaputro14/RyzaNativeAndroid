@@ -912,7 +912,7 @@ static int g_owner_used, g_owner_gone;
 static NvnTexture *g_desc_hash[DESC_BUCKETS];
 static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
 static NvnTexture *g_all_tex;
-uint64_t g_tex_stat_init, g_tex_stat_reinit, g_tex_stat_reused, g_tex_stat_fin_owner, g_tex_stat_fin_copy, g_tex_stat_reg;
+uint64_t g_tex_stat_init, g_tex_stat_reinit, g_tex_stat_reused, g_tex_stat_fin_owner, g_tex_stat_fin_copy, g_tex_stat_reg, g_tex_stat_reg_dedup;
 uint64_t g_tex_drain_ns, g_tex_drains;
 
 static uint32_t owner_hash(uint64_t g) { return (uint32_t)((g >> 3) * 0x9E3779B97F4A7C15ull >> 46) & (OWNER_SLOTS - 1); }
@@ -1016,6 +1016,7 @@ enum { RETIRE_FRAMES = 4 };
 typedef struct { NvnTexture *t; uint64_t frame; } RetiredTexture;
 static RetiredTexture *g_retired;
 static int g_nretired, g_cap_retired;
+static uint64_t g_retired_min_frame = UINT64_MAX;
 static bool texture_unlink_if_zero(NvnTexture *t) {  // g_live_lock held
     if (--t->refs) return false;
     if (t->prev) t->prev->next = t->next;
@@ -1048,35 +1049,40 @@ static void texture_retire(NvnTexture *t) {
     NvnTexture **async_extra = NULL;
     int nasync = 0, cap_extra = 0;
     pthread_mutex_lock(&g_live_lock);
-    int k = 0;
-    for (int i = 0; i < g_nretired; i++) {
-        if (g_retired[i].frame + RETIRE_FRAMES <= now) {
-            NvnTexture *dead_t = g_retired[i].t;
-            if (!defer_async) {
-                texture_release(dead_t);
-            } else if (texture_unlink_if_zero(dead_t)) {
-                if (dead_t->backend) {
-                    if (nasync < 64) {
-                        async_dead[nasync++] = dead_t;
-                    } else {
-                        int ei = nasync - 64;
-                        if (ei == cap_extra) {
-                            cap_extra = cap_extra ? cap_extra * 2 : 64;
-                            async_extra = realloc(async_extra, (size_t)cap_extra * sizeof *async_extra);
-                            if (!async_extra) FATAL("nvn: out of memory deferring textures\n");
+    if (g_nretired > 0 && g_retired_min_frame <= now && (now - g_retired_min_frame) >= RETIRE_FRAMES) {
+        int k = 0;
+        uint64_t new_min = UINT64_MAX;
+        for (int i = 0; i < g_nretired; i++) {
+            if (g_retired[i].frame + RETIRE_FRAMES <= now) {
+                NvnTexture *dead_t = g_retired[i].t;
+                if (!defer_async) {
+                    texture_release(dead_t);
+                } else if (texture_unlink_if_zero(dead_t)) {
+                    if (dead_t->backend) {
+                        if (nasync < 64) {
+                            async_dead[nasync++] = dead_t;
+                        } else {
+                            int ei = nasync - 64;
+                            if (ei == cap_extra) {
+                                cap_extra = cap_extra ? cap_extra * 2 : 64;
+                                async_extra = realloc(async_extra, (size_t)cap_extra * sizeof *async_extra);
+                                if (!async_extra) FATAL("nvn: out of memory deferring textures\n");
+                            }
+                            async_extra[ei] = dead_t;
+                            nasync++;
                         }
-                        async_extra[ei] = dead_t;
-                        nasync++;
+                    } else {
+                        free(dead_t);
                     }
-                } else {
-                    free(dead_t);
                 }
+            } else {
+                if (g_retired[i].frame < new_min) new_min = g_retired[i].frame;
+                g_retired[k++] = g_retired[i];
             }
-        } else {
-            g_retired[k++] = g_retired[i];
         }
+        g_nretired = k;
+        g_retired_min_frame = new_min;
     }
-    g_nretired = k;
     if (g_nretired == g_cap_retired) {
         g_cap_retired = g_cap_retired ? g_cap_retired * 2 : 256;
         g_retired = realloc(g_retired, g_cap_retired * sizeof *g_retired);
@@ -1084,6 +1090,7 @@ static void texture_retire(NvnTexture *t) {
     }
     g_retired[g_nretired].t = t, g_retired[g_nretired].frame = now;
     g_nretired++;
+    if (now < g_retired_min_frame) g_retired_min_frame = now;
     pthread_mutex_unlock(&g_live_lock);
 #ifdef __ANDROID__
     for (int i = 0; i < nasync; i++) {
@@ -1112,6 +1119,7 @@ RT_ON_RESET(textures_reset) {
     free(g_retired);
     g_retired = NULL;
     g_nretired = g_cap_retired = 0;
+    g_retired_min_frame = UINT64_MAX;
 }
 
 // (debugging, runtime/hle/movie.c) the live textures whose storage overlaps [lo, hi): how the game reads a buffer
@@ -1466,6 +1474,8 @@ RT_ON_RESET(desc_pools_reset) {
         NvnDescPool *next = g_all_desc_pools->next;
         free(g_all_desc_pools->entries);
         free(g_all_desc_pools->shadow_smp);
+        free(g_all_desc_pools->shadow_tex);
+        pthread_mutex_destroy(&g_all_desc_pools->lock);
         free(g_all_desc_pools);
         g_all_desc_pools = next;
     }
@@ -1477,10 +1487,12 @@ static NvnDescPool *desc_pool_init(uint64_t guest, uint64_t pool, uint64_t off, 
     NvnPool *p = HOST(NvnPool, pool);
     if (!nvn_guest_range(guest, 28) || !p || count < 0) return NULL;
     NvnDescPool *d = calloc(1, sizeof *d);
+    pthread_mutex_init(&d->lock, NULL);
     d->addr = p->storage + off;
     d->count = count;
     d->entries = calloc(count ? count : 1, entry);
     if (reg == g_sampler_pools) d->shadow_smp = calloc(count ? count : 1, entry);
+    if (reg == g_texture_pools) d->shadow_tex = calloc(count ? count : 1, entry);
     pthread_mutex_lock(&g_live_lock);
     d->next = g_all_desc_pools;
     g_all_desc_pools = d;
@@ -1515,13 +1527,18 @@ NVN(nvnTexturePoolFinalize) {
     pthread_mutex_unlock(&g_live_lock);
     // Keep the empty descriptor array until reset: recorded state may still refer to the old pool object.
     SET_HOST(A(0), 0);
+    pthread_mutex_lock(&d->lock);
+    if (d->shadow_tex && d->count > 0)
+        memset(d->shadow_tex, 0, (size_t)d->count * sizeof(NvnTexEntry));
 #ifdef __ANDROID__
     if (vk_async_on() && !vk_async_is_render_thread()) {
         vk_async_tex_pool_fin(d);
+        pthread_mutex_unlock(&d->lock);
         return;
     }
 #endif
     nvn_async_apply_tex_pool_fin(d);
+    pthread_mutex_unlock(&d->lock);
 }
 NVN(nvnTexturePoolSetDebugLabel) { (void)c; }
 NVN(nvnTexturePoolGetMemoryPool) { RET(nvn_ptr_ok(A(0)) ? G(uint64_t, A(0), 8) : 0); }
@@ -1544,23 +1561,48 @@ void nvn_async_apply_tex_reg(NvnDescPool *d, int id, NvnTexture *t, const NvnTex
     e->has_view = has_view;
     if (has_view && view) e->view = *view;
 }
-static void register_texture(Cpu *c) {
-    NvnDescPool *d = HOST(NvnDescPool, A(0));
-    int id = (int)A(1);
+static inline void tex_view_copy_canonical(NvnTextureView *dst, const void *src) {
+    memset(dst, 0, sizeof *dst);
+    const NvnTextureView *s = (const NvnTextureView *)src;
+    dst->min_layer = s->min_layer;
+    dst->num_layers = s->num_layers;
+    dst->format = s->format;
+    dst->setmask = s->setmask;
+    dst->target = s->target;
+    dst->ds_mode = s->ds_mode;
+    dst->base_level = s->base_level;
+    dst->num_levels = s->num_levels;
+    memcpy(dst->swizzle, s->swizzle, 4);
+}
+static void register_texture_impl(uint64_t pool_g, int id, uint64_t tex_g, uint64_t view_g, uint64_t lr) {
+    NvnDescPool *d = HOST(NvnDescPool, pool_g);
     if (!d || id < 0 || id >= d->count) return;
-    g_tex_stat_reg++;
-    NvnTexture *t = HOST(NvnTexture, A(2));
+    __atomic_fetch_add(&g_tex_stat_reg, 1, __ATOMIC_RELAXED);
+    NvnTexture *t = HOST(NvnTexture, tex_g);
     NvnTextureView view = {0};
-    bool has_view = A(3) != 0;
-    if (has_view) memcpy(&view, AP(3), sizeof view);
+    bool has_view = view_g != 0 && nvn_ptr_ok(view_g);
+    if (has_view) tex_view_copy_canonical(&view, (const void *)(uintptr_t)view_g);
     {   // the object's own swizzle, where it shares its texture with an object of another (texture_same_storage)
-        const uint8_t *sw = t ? obj_swizzle(A(2)) : NULL;
+        const uint8_t *sw = t ? obj_swizzle(tex_g) : NULL;
         if (sw && memcmp(sw, t->swizzle, 4) && !(has_view && (view.setmask & 8))) {
             if (!has_view) memset(&view, 0, sizeof view);
             has_view = true;
             view.setmask |= 8;
             memcpy(view.swizzle, sw, 4);
         }
+    }
+    pthread_mutex_lock(&d->lock);
+    if (d->shadow_tex) {
+        NvnTexEntry *sh = &((NvnTexEntry *)d->shadow_tex)[id];
+        if (sh->tex == t && sh->has_view == has_view &&
+            (!has_view || memcmp(&sh->view, &view, sizeof view) == 0)) {
+            __atomic_fetch_add(&g_tex_stat_reg_dedup, 1, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&d->lock);
+            goto out_watch;
+        }
+        sh->tex = t;
+        sh->has_view = has_view;
+        sh->view = view;
     }
     if (t) {
         pthread_mutex_lock(&g_live_lock);
@@ -1576,15 +1618,24 @@ static void register_texture(Cpu *c) {
 #else
     nvn_async_apply_tex_reg(d, id, t, &view, has_view);
 #endif
+    pthread_mutex_unlock(&d->lock);
+out_watch:;
     static int watch_id = -2;  // LARECOMP_WATCH_TEXID=<hex id>: its registrations (texture, view)
-    if (watch_id == -2) watch_id = getenv("LARECOMP_WATCH_TEXID") ? (int)strtol(getenv("LARECOMP_WATCH_TEXID"), NULL, 16) : -1;
-    if (id == watch_id || (watch_id == 0x7fffffff && t && t->width == 320 && t->height == 180 && t->levels == 5))  // (7fffffff: the bloom chain)
+    if (__builtin_expect(watch_id == -2, 0))
+        watch_id = getenv("LARECOMP_WATCH_TEXID") ? (int)strtol(getenv("LARECOMP_WATCH_TEXID"), NULL, 16) : -1;
+    if (__builtin_expect(watch_id != -1, 0) &&
+        (id == watch_id || (watch_id == 0x7fffffff && t && t->width == 320 && t->height == 180 && t->levels == 5)))  // (7fffffff: the bloom chain)
         LOG("[watch] texture id %#x <- %p %ux%u levels %u view %d setmask %#x levels %u+%u (lr %llx)\n", id, (void *)t,
             t ? t->width : 0, t ? t->height : 0, t ? t->levels : 0, has_view, has_view ? view.setmask : 0,
-            view.base_level, view.num_levels, (unsigned long long)c->x[30]);
+            view.base_level, view.num_levels, (unsigned long long)lr);
 }
-NVN(nvnTexturePoolRegisterTexture) { register_texture(c); }
-NVN(nvnTexturePoolRegisterImage) { register_texture(c); }
+NVN(nvnTexturePoolRegisterTexture) { register_texture_impl(A(0), (int)A(1), A(2), A(3), c->x[30]); }
+NVN(nvnTexturePoolRegisterImage) { register_texture_impl(A(0), (int)A(1), A(2), A(3), c->x[30]); }
+static void fast_nvnTexturePoolRegisterTexture(uint64_t pool, uint64_t id, uint64_t tex, uint64_t view) {
+    register_texture_impl(pool, (int)id, tex, view, 0);
+}
+HLE_FAST_FUNC("nvnTexturePoolRegisterTexture", fast_nvnTexturePoolRegisterTexture);
+HLE_FAST_FUNC("nvnTexturePoolRegisterImage", fast_nvnTexturePoolRegisterTexture);
 
 NVN(nvnSamplerPoolInitialize) {
     RET(desc_pool_init(A(0), A(1), A(2), (int)A(3), sizeof(NvnSamplerDesc), g_sampler_pools) != NULL);
