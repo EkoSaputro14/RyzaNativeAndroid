@@ -217,10 +217,12 @@ static void *render_main(void *arg) {
     const char *timing = getenv("LARECOMP_ADPF_CPU_TIME");
     bool cpu_timing = timing && atoi(timing) != 0;
     const int spin_us = async_spin_us();
+    const bool flush_on_empty_waiter = getenv("LARECOMP_FLUSH_ON_EMPTY_WAITER") != NULL;
     pthread_mutex_lock(&q_lock);
     for (;;) {
         while (q_head == q_tail) {
-            if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) {
+            if (flush_on_empty_waiter && vk_has_pending_commands() &&
+                __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) {
                 pthread_mutex_unlock(&q_lock);
                 vk_flush_pending_work();
                 pthread_mutex_lock(&q_lock);
@@ -233,14 +235,16 @@ static void *render_main(void *arg) {
                 uint64_t spin_limit = (uint64_t)spin_us * 1000ull;
                 uint32_t iter = 0;
                 while (__atomic_load_n(&q_tail, __ATOMIC_ACQUIRE) == head_snap) {
-                    if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) break;
+                    if (flush_on_empty_waiter && vk_has_pending_commands() &&
+                        __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) break;
                     if (plat_now_ns() - spin_t0 >= spin_limit) break;
                     cpu_spin_yield(++iter);
                 }
                 __atomic_fetch_add(&frame_spin_ns, plat_now_ns() - spin_t0, __ATOMIC_RELAXED);
                 pthread_mutex_lock(&q_lock);
                 if (q_head != q_tail) break;
-                if (vk_has_pending_commands() && __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) continue;
+                if (flush_on_empty_waiter && vk_has_pending_commands() &&
+                    __atomic_load_n(&q_waiters, __ATOMIC_RELAXED) > 0) continue;
             }
             uint64_t w0 = plat_now_ns();
             q_render_sleeping = true;

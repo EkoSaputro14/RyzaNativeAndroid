@@ -35,6 +35,7 @@ bool maxwell_struct_skips = true;  // (structure: forward jumps out of a region 
 bool maxwell_no_switch;
 bool maxwell_no_local_struct;
 bool maxwell_native_half;
+bool maxwell_fp16_half;
 bool maxwell_fast_minmax;
 bool maxwell_quad_butterfly;
 bool maxwell_cb_window;
@@ -92,6 +93,7 @@ typedef struct {
     int ipa_mul;   // its multiplier register (mode 1: the result is the "pass" value attr/w times this register)
     // GLSL (fields kept last: the MSL path's layout, including its out-of-range reg_used writes, is unchanged)
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
+    bool uses_fp16_half;     // fragment shader uses explicit float16_t / f16vec2 for Maxwell H*2 ops
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     bool uses_shared;        // LDS / STS present: workgroup shared memory array
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
@@ -369,9 +371,19 @@ static void attr_store(Ctx *c, int src, uint32_t addr) {
 // ------------------------------------------------------------------ half precision (SM53)
 // Swizzle: 0 H1_H0 (both halves), 1 F32 (one f32 used for both lanes), 2 H0_H0, 3 H1_H1.
 // Merge: 0 H1_H0 (pack both), 1 F32 (lane 0 as f32), 2 MRG_H0 (replace low half), 3 MRG_H1 (replace high half).
+static inline bool use_fp16_half(const Ctx *c) {
+    return c->glsl && maxwell_native_half && maxwell_fp16_half && c->stage == STAGE_FRAGMENT;
+}
+
 static const char *hsrc(Ctx *c, const char *v, int swz, bool neg, bool abs_, char *buf) {
     char t[300];
-    if (c->glsl && maxwell_native_half && c->stage != STAGE_VERTEX) {
+    if (use_fp16_half(c)) {
+        c->uses_fp16_half = true;
+        if (swz == 0) sprintf(t, "unpackFloat2x16(%s)", v);
+        else if (swz == 1) sprintf(t, "f16vec2(uintBitsToFloat(%s))", v);
+        else if (swz == 2) sprintf(t, "unpackFloat2x16(%s).xx", v);
+        else sprintf(t, "unpackFloat2x16(%s).yy", v);
+    } else if (c->glsl && maxwell_native_half && c->stage != STAGE_VERTEX) {
         if (swz == 0) sprintf(t, "unpackHalf2x16(%s)", v);
         else if (swz == 1) sprintf(t, "vec2(uintBitsToFloat(%s))", v);
         else if (swz == 2) sprintf(t, "unpackHalf2x16(%s).xx", v);
@@ -389,10 +401,20 @@ static const char *hsrc(Ctx *c, const char *v, int swz, bool neg, bool abs_, cha
 
 static void hstore(Ctx *c, int d, const char *expr, int merge, bool sat) {
     char t[2048], e[1700];
-    if (sat) sprintf(e, "saturate(%s)", expr); else strcpy(e, expr);
+    if (use_fp16_half(c)) {
+        c->uses_fp16_half = true;
+        if (sat) sprintf(e, "hsat16(%s)", expr); else strcpy(e, expr);
+    } else {
+        if (sat) sprintf(e, "saturate(%s)", expr); else strcpy(e, expr);
+    }
     if (d == RZ) return;
     c->reg_used[d] = 1;
-    if (c->glsl) {
+    if (use_fp16_half(c)) {
+        if (merge == 0) sprintf(t, "packFloat2x16(%s)", e);
+        else if (merge == 1) sprintf(t, "floatBitsToUint(float((%s).x))", e);
+        else if (merge == 2) sprintf(t, "hpack_lo16(%s, r%d)", e, d);
+        else sprintf(t, "hpack_hi16(%s, r%d)", e, d);
+    } else if (c->glsl) {
         if (merge == 0) sprintf(t, "packHalf2x16(%s)", e);
         else if (merge == 1) sprintf(t, "floatBitsToUint((%s).x)", e);
         else if (merge == 2) sprintf(t, "hpack_lo(%s, r%d)", e, d);
@@ -538,7 +560,7 @@ static bool emit_half(Ctx *c, uint64_t w) {
         const char *y = HS(bv, swb, negb, absb);
         const char *pp = P((int)bits(w, 39, 3), bits(w, 42, 1));
         char lx[512], ly[512];
-        sp(&c->body, "    { float2 hx_ = %s, hy_ = %s; bool pp = %s;\n", x, y, pp);
+        sp(&c->body, "    { %s hx_ = %s, hy_ = %s; bool pp = %s;\n", use_fp16_half(c) ? "f16vec2" : "float2", x, y, pp);
         fcmp_expr(lx, cop, "hx_.x", "hy_.x");
         fcmp_expr(ly, cop, "hx_.y", "hy_.y");
         sp(&c->body, "      bool cl = (%s) %s pp, ch = (%s) %s pp;\n", lx, bool_op(bop), ly, bool_op(bop));
@@ -3009,6 +3031,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     Str s = {0};
     sp(&s, "#version 460\n");
     if (!maxwell_no_int64) sp(&s, "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n");
+    if (c->uses_fp16_half)
+        sp(&s, "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n");
     sp(&s, "%s", glsl_prelude);
     if (maxwell_no_int64) sp(&s, "%s", glsl_int32_helpers);
     if (maxwell_native_half && stage != STAGE_VERTEX) {
@@ -3027,6 +3051,14 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         // the helpers spell out with NaN tests (two tests and selects per fmin / fmax, ~40 in the lit pass's light
         // loop). For the code after here only.
         sp(&s, "#define fmin min\n#define fmax max\n#define saturate(x) clamp((x), 0.0f, 1.0f)\n");
+    }
+    if (c->uses_fp16_half) {
+        sp(&s, "uint hpack_lo16(f16vec2 r, uint old) { return (old & 0xFFFF0000u) | (packFloat2x16(f16vec2(r.x, float16_t(0.0))) & 0xFFFFu); }\n"
+               "uint hpack_hi16(f16vec2 r, uint old) { return (old & 0xFFFFu) | (packFloat2x16(f16vec2(float16_t(0.0), r.y)) & 0xFFFF0000u); }\n");
+        if (maxwell_fast_minmax)
+            sp(&s, "f16vec2 hsat16(f16vec2 x) { return clamp(x, float16_t(0.0), float16_t(1.0)); }\n");
+        else
+            sp(&s, "f16vec2 hsat16(f16vec2 x) { return f16vec2(isnan(x.x) ? float16_t(0.0) : clamp(x.x, float16_t(0.0), float16_t(1.0)), isnan(x.y) ? float16_t(0.0) : clamp(x.y, float16_t(0.0), float16_t(1.0))); }\n");
     }
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;

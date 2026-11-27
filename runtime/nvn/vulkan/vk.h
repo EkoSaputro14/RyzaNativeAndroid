@@ -69,6 +69,7 @@ typedef struct {
     uint64_t placed_align;
     bool exec_stats;              // (Android, LARECOMP_SHADER_STATS=1) the compiler's statistics of each pipeline, logged
     bool fp16_supported;          // SPIR-V RelaxedPrecision / shaderFloat16 support for fragment shaders
+    bool shader_float16;          // VkPhysicalDeviceVulkan12Features.shaderFloat16 == VK_TRUE (explicit float16_t)
     bool subgroup_quad;           // VK_SUBGROUP_FEATURE_QUAD_BIT: safe subgroupQuadSwap* for fragment SHFL.BFLY
     bool store_op_none;           // VK_KHR/EXT_load_store_op_none or VK_QCOM_render_pass_store_ops (mhrise-arch)
     bool robust_buffer_access;    // false on Adreno for max shader throughput (mhrise-arch), true on Mali

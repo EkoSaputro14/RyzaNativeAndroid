@@ -3792,6 +3792,7 @@ static void translate_program(void *arg) {
     maxwell_no_switch = qcom_no_switch();
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_fp16_half = g_vk.shader_float16 && !getenv("LARECOMP_NO_NATIVE_FP16_HALF");
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
     maxwell_quad_butterfly = g_vk.subgroup_quad && !getenv("LARECOMP_NO_QUAD_BUTTERFLY");
     maxwell_cb_window = cbwin_wanted();
@@ -8096,6 +8097,7 @@ static CsProg *compute_program(NvnProgram *np) {
     maxwell_no_switch = qcom_no_switch();
     maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
     maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
+    maxwell_fp16_half = false;
     maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
 #endif
     ShaderKey k = {0};

@@ -125,6 +125,8 @@ extern bool maxwell_no_local_struct;
 // (GLSL) fragment and compute shaders convert halves with unpackHalf2x16 instead of the bitwise h2f (vertex shaders
 // keep it: NVIDIA ran math after unpacked halves in fp16, and depth passes disagreed). Set by the Android backend.
 extern bool maxwell_native_half;
+// (GLSL) fragment shaders lower Maxwell's native H*2 operations (HADD2/HMUL2/HFMA2/HSET2/HSETP2) directly to f16vec2.
+extern bool maxwell_fp16_half;
 // (GLSL vertex / fragment) the game cbufs indexed with a register (3..16) read up to 64 of their 16-byte rows from a
 // patch buffer when the draw says so - `uniform CBP { uvec4 cbp_m; uvec4 cbp[64]; };` at CBPATCH_BUFFER_INDEX: cbp_m.x
 // the cbuf (index + 1, 0: none), .y its first row there, .z how many. The runtime binds such a buffer in place and

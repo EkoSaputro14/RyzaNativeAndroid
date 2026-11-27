@@ -793,6 +793,7 @@ static void create_device(void) {
     {   // Adreno has no uniformAndStorageBuffer8BitAccess, and no shader uses 8-bit uniform buffers
         // (docs/las/ANDROID-PORT.md, Fase 0): the 8-bit features only when the driver has them
         f12.shaderFloat16 = h12.shaderFloat16;
+        g_vk.shader_float16 = (h12.shaderFloat16 == VK_TRUE);
         f12.shaderInt8 = h12.shaderInt8;
         f12.uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess;
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
